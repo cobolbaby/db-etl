@@ -2,13 +2,13 @@ package main
 
 import (
 	"log"
+	"runtime"
 	"sync"
 
 	"db-etl/config"
 	"db-etl/pipeline"
 	"db-etl/reader"
 	"db-etl/transform"
-	"db-etl/util"
 	"db-etl/writer"
 )
 
@@ -24,8 +24,7 @@ func main() {
 	}
 	close(tableCh)
 
-	// workers := runtime.NumCPU()
-	workers := 1
+	workers := runtime.NumCPU()
 	var wg sync.WaitGroup
 	for i := 0; i < workers; i++ {
 		wg.Add(1)
@@ -38,12 +37,8 @@ func main() {
 				r := reader.NewReader(cfg.Source.Type, cfg.Source.DSN(), tbl.Src, cfg.BatchSize)
 				w := writer.NewWriter(cfg.Target.Type, cfg.Target.DSN(), tbl.Dst)
 
-				// 获取列类型并生成 transformer
-				colTypes, _ := r.GetColumnTypes()
-				handlers := make([]util.ColHandler, len(colTypes))
-				for i, ct := range colTypes {
-					handlers[i] = util.GetColHandler(ct.DatabaseTypeName())
-				}
+				// 根据数据源类型生成 transformer
+				handlers := r.GetColumnHandlers()
 				tTransformer := &transform.DefaultTransformer{Handlers: handlers}
 
 				if err := pipeline.RunPipeline(r, tTransformer, w); err != nil {

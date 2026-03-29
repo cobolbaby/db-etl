@@ -13,6 +13,7 @@ import (
 
 type MSSQLReader struct {
 	DB        *sql.DB
+	SQL       string
 	Table     string
 	BatchSize int
 }
@@ -21,7 +22,16 @@ func (r *MSSQLReader) ReadBatch() <-chan RowBatch {
 	out := make(chan RowBatch, 8)
 	go func() {
 		defer close(out)
-		rows, err := r.DB.Query("SELECT * FROM " + r.Table + " WITH (NOLOCK)")
+
+		var rows *sql.Rows
+		var err error
+
+		if r.SQL != "" {
+			rows, err = r.DB.Query(r.SQL)
+		} else if r.Table != "" {
+			rows, err = r.DB.Query("SELECT * FROM " + r.Table + " WITH (NOLOCK)")
+		}
+
 		if err != nil {
 			log.Fatal(err)
 		}
@@ -57,8 +67,16 @@ func (r *MSSQLReader) GetColumnHandlers() []ColHandler {
 }
 
 func (r *MSSQLReader) getColumnTypes() ([]*sql.ColumnType, error) {
-	// 只获取列信息，不返回数据
-	rows, err := r.DB.Query("SELECT * FROM " + r.Table + " WHERE 1=0")
+
+	var rows *sql.Rows
+	var err error
+
+	if r.SQL != "" {
+		rows, err = r.DB.Query(r.SQL + " WHERE 1=0")
+	} else if r.Table != "" {
+		rows, err = r.DB.Query("SELECT * FROM " + r.Table + " WHERE 1=0")
+	}
+
 	if err != nil {
 		return nil, err
 	}

@@ -2,19 +2,20 @@ package writer
 
 import (
 	"context"
+	"db-etl/config"
 	"log"
 
 	"github.com/jackc/pgx/v5"
 )
 
-func NewWriter(dbType string, connStr string, table string) Writer {
+func NewWriter(dbType config.DBType, connStr string, table string, mode config.ModeType) Writer {
 	switch dbType {
-	case "pg":
+	case config.DBTypePG:
 		pgConn, err := pgx.Connect(context.Background(), connStr)
 		if err != nil {
 			log.Fatalf("PG connect failed: %v", err)
 		}
-		return &PGWriter{Conn: pgConn, Table: table}
+		return &PGWriter{Conn: pgConn, Table: table, Mode: mode}
 	default:
 		log.Fatalf("unsupported target db type: %s", dbType)
 	}

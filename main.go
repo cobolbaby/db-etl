@@ -1,6 +1,7 @@
 package main
 
 import (
+	"fmt"
 	"log"
 	"runtime"
 	"sync"
@@ -13,43 +14,124 @@ import (
 )
 
 func main() {
+
 	cfg, err := config.LoadConfig("config.yaml")
 	if err != nil {
 		log.Fatal(err)
 	}
 
-	tableCh := make(chan config.TableMap, len(cfg.Tables))
-	for _, t := range cfg.Tables {
-		tableCh <- t
+	log.Printf("TaskName: %s", cfg.TaskName)
+
+	// --------------------------------
+	// 1. 构建 DB Registry
+	// --------------------------------
+
+	dbRegistry := map[string]config.DBConfig{}
+	for _, db := range cfg.Databases {
+		dbRegistry[db.Name] = db
 	}
-	close(tableCh)
+
+	// --------------------------------
+	// 2. Task Channel
+	// --------------------------------
+
+	taskCh := make(chan config.TaskConfig, len(cfg.Tasks))
+	for _, t := range cfg.Tasks {
+		taskCh <- t
+	}
+	close(taskCh)
+
+	// --------------------------------
+	// 3. Worker Pool
+	// --------------------------------
 
 	workers := runtime.NumCPU()
 	var wg sync.WaitGroup
 	for i := 0; i < workers; i++ {
 		wg.Add(1)
-		go func() {
+		go func(workerID int) {
 			defer wg.Done()
-			for tbl := range tableCh {
-				log.Printf("Migrating %s -> %s", tbl.Src, tbl.Dst)
-
-				// 动态创建 Reader / Writer
-				r := reader.NewReader(cfg.Source.Type, cfg.Source.DSN(), tbl.Src, cfg.BatchSize)
-				w := writer.NewWriter(cfg.Target.Type, cfg.Target.DSN(), tbl.Dst)
-
-				// 根据数据源类型生成 transformer
-				handlers := r.GetColumnHandlers()
-				tTransformer := &transform.DefaultTransformer{Handlers: handlers}
-
-				if err := pipeline.RunPipeline(r, tTransformer, w); err != nil {
-					log.Fatalf("Failed to migrate table %s: %v", tbl.Src, err)
+			for task := range taskCh {
+				log.Printf("[Worker %d] start task", workerID)
+				if err := runTask(cfg, task, dbRegistry); err != nil {
+					log.Printf("task failed: %v", err)
+					if cfg.ErrorPolicy == "abort" {
+						log.Fatal(err)
+					}
 				}
-
-				log.Printf("Finished %s -> %s", tbl.Src, tbl.Dst)
+				log.Printf("[Worker %d] finish task", workerID)
 			}
-		}()
+		}(i)
 	}
 
 	wg.Wait()
-	log.Printf("All tables migrated!")
+	log.Println("All tasks finished")
+
+}
+
+func runTask(cfg *config.Config, task config.TaskConfig, dbRegistry map[string]config.DBConfig) error {
+
+	for _, src := range task.Sources {
+
+		srcDB, ok := dbRegistry[src.DB]
+		if !ok {
+			return fmt.Errorf("source db not found: %s", src.DB)
+		}
+
+		dstDB, ok := dbRegistry[task.Downstream.DB]
+		if !ok {
+			return fmt.Errorf("downstream db not found: %s", task.Downstream.DB)
+		}
+
+		log.Printf("Source DB: %s", src.DB)
+		log.Printf("Target DB: %s", task.Downstream.DB)
+
+		// -----------------------------
+		// Reader
+		// -----------------------------
+
+		r := reader.NewReader(
+			srcDB.Type,
+			srcDB.DSN(),
+			src.SQL,
+			src.Table,
+			cfg.BatchSize,
+		)
+
+		// -----------------------------
+		// Writer
+		// -----------------------------
+
+		w := writer.NewWriter(
+			dstDB.Type,
+			dstDB.DSN(),
+			task.Downstream.Table,
+			task.Downstream.Mode,
+		)
+
+		// -----------------------------
+		// Transformer
+		// -----------------------------
+
+		handlers := r.GetColumnHandlers()
+
+		t := &transform.DefaultTransformer{
+			Handlers: handlers,
+		}
+
+		// -----------------------------
+		// Pipeline
+		// -----------------------------
+
+		err := pipeline.RunPipeline(r, t, w)
+		if err != nil {
+			return err
+		}
+
+		log.Printf("finished source %s -> %s",
+			src.DB,
+			task.Downstream.DB)
+	}
+
+	return nil
 }

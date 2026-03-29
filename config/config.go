@@ -8,26 +8,65 @@ import (
 )
 
 type Config struct {
-	Source    DBConfig   `yaml:"source"`
-	Target    DBConfig   `yaml:"target"`
-	Tables    []TableMap `yaml:"tables"`
-	BatchSize int        `yaml:"batch_size"`
-	Parallel  int        `yaml:"parallel"`
-}
-
-type TableMap struct {
-	Src string `yaml:"src"`
-	Dst string `yaml:"dst"`
+	TaskName    string       `yaml:"task_name"`
+	ErrorPolicy string       `yaml:"error_policy"`
+	BatchSize   int          `yaml:"batch_size"`
+	Databases   []DBConfig   `yaml:"databases"`
+	Tasks       []TaskConfig `yaml:"tasks"`
 }
 
 type DBConfig struct {
-	Type     string `yaml:"type"` // mssql / pg
+	Name     string `yaml:"name"`
+	Type     DBType `yaml:"type"` // mssql / pg
 	Host     string `yaml:"host"`
 	Port     int    `yaml:"port"`
 	User     string `yaml:"user"`
 	Password string `yaml:"password"`
 	Database string `yaml:"database"`
 }
+
+type DBType string
+
+const (
+	DBTypeMSSQL DBType = "mssql"
+	DBTypePG    DBType = "postgres"
+)
+
+type TaskConfig struct {
+	Type TaskType `yaml:"type"`
+
+	Sources []SourceConfig `yaml:"sources"`
+
+	Downstream *DownstreamConfig `yaml:"downstream"`
+}
+
+type TaskType string
+
+const (
+	TaskTypeSQL   TaskType = "query"
+	TaskTypeTable TaskType = "exec"
+)
+
+type SourceConfig struct {
+	DB    string `yaml:"db"`
+	SQL   string `yaml:"sql"`
+	Table string `yaml:"table"`
+}
+
+type DownstreamConfig struct {
+	DB    string   `yaml:"db"`
+	Table string   `yaml:"table"`
+	Mode  ModeType `yaml:"mode"`
+}
+
+type ModeType string
+
+const (
+	ModeTypeCopy   ModeType = "copy"
+	ModeTypeFull   ModeType = "full"
+	ModeTypeAppend ModeType = "append"
+	ModeTypeUpsert ModeType = "upsert"
+)
 
 /*
 LoadConfig
@@ -50,10 +89,6 @@ func LoadConfig(path string) (*Config, error) {
 		cfg.BatchSize = 20000
 	}
 
-	if cfg.Parallel == 0 {
-		cfg.Parallel = 4
-	}
-
 	if err := cfg.Validate(); err != nil {
 		return nil, err
 	}
@@ -67,21 +102,24 @@ Validate
 */
 func (c *Config) Validate() error {
 
-	if c.Source.Type == "" {
-		return fmt.Errorf("source.type required")
+	for _, db := range c.Databases {
+		if db.Name == "" {
+			return fmt.Errorf("database name required")
+		}
+		if db.Type == "" {
+			return fmt.Errorf("database type required for %s", db.Name)
+		}
 	}
 
-	if c.Target.Type == "" {
-		return fmt.Errorf("target.type required")
+	if len(c.Tasks) == 0 {
+		return fmt.Errorf("tasks cannot be empty")
 	}
 
-	if len(c.Tables) == 0 {
-		return fmt.Errorf("tables cannot be empty")
-	}
-
-	for _, t := range c.Tables {
-		if t.Src == "" || t.Dst == "" {
-			return fmt.Errorf("invalid table mapping: %+v", t)
+	for _, t := range c.Tasks {
+		for _, v := range t.Sources {
+			if v.SQL == "" && v.Table == "" {
+				return fmt.Errorf("task SQL or table required")
+			}
 		}
 	}
 
@@ -96,7 +134,7 @@ func (db *DBConfig) DSN() string {
 
 	switch db.Type {
 
-	case "mssql":
+	case DBTypeMSSQL:
 
 		return fmt.Sprintf(
 			"server=%s;user id=%s;password=%s;port=%d;database=%s",
@@ -107,7 +145,7 @@ func (db *DBConfig) DSN() string {
 			db.Database,
 		)
 
-	case "pg":
+	case DBTypePG:
 
 		return fmt.Sprintf(
 			"postgresql://%s:%s@%s:%d/%s",

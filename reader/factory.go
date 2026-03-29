@@ -2,19 +2,20 @@ package reader
 
 import (
 	"database/sql"
+	"db-etl/config"
 	"log"
 
 	_ "github.com/microsoft/go-mssqldb"
 )
 
-func NewReader(dbType string, connStr string, table string, batchSize int) Reader {
+func NewReader(dbType config.DBType, connStr string, rawsql string, table string, batchSize int) Reader {
 	switch dbType {
-	case "mssql":
+	case config.DBTypeMSSQL:
 		db, err := sql.Open("sqlserver", connStr)
 		if err != nil {
 			log.Fatalf("MSSQL connect failed: %v", err)
 		}
-		return &MSSQLReader{DB: db, Table: table, BatchSize: batchSize}
+		return &MSSQLReader{DB: db, SQL: rawsql, Table: table, BatchSize: batchSize}
 
 	default:
 		log.Fatalf("unsupported source db type: %s", dbType)

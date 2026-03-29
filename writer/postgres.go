@@ -3,6 +3,7 @@ package writer
 import (
 	"bytes"
 	"context"
+	"db-etl/config"
 	"db-etl/transform"
 	"io"
 	"log"
@@ -13,37 +14,42 @@ import (
 type PGWriter struct {
 	Conn  *pgx.Conn
 	Table string
+	Mode  config.ModeType
 }
 
 func (w *PGWriter) WriteBatch(in <-chan transform.CSVBatch) error {
-	pr, pw := io.Pipe()
-	copySQL := "COPY " + w.Table + " FROM STDIN WITH (FORMAT CSV, DELIMITER ',', QUOTE '\"', ESCAPE '\"', NULL '')"
 
-	go func() {
-		if _, err := w.Conn.PgConn().CopyFrom(context.Background(), pr, copySQL); err != nil {
-			log.Fatal(err)
-		}
-	}()
+	if w.Mode == config.ModeTypeCopy {
+		pr, pw := io.Pipe()
 
-	buf := bytes.NewBuffer(make([]byte, 0, 4*1024*1024))
-	for batch := range in {
-		for _, row := range batch.Rows {
-			for i, col := range row {
-				if i > 0 {
-					buf.WriteByte(',')
+		go func() {
+			copySQL := "COPY " + w.Table + " FROM STDIN WITH (FORMAT CSV, DELIMITER ',', QUOTE '\"', ESCAPE '\"', NULL '')"
+			if _, err := w.Conn.PgConn().CopyFrom(context.Background(), pr, copySQL); err != nil {
+				log.Fatal(err)
+			}
+		}()
+
+		buf := bytes.NewBuffer(make([]byte, 0, 4*1024*1024))
+		for batch := range in {
+			for _, row := range batch.Rows {
+				for i, col := range row {
+					if i > 0 {
+						buf.WriteByte(',')
+					}
+					buf.WriteString(col) // 简化版 CSV
 				}
-				buf.WriteString(col) // 简化版 CSV
-			}
-			buf.WriteByte('\n')
-			if buf.Len() > 3*1024*1024 {
-				pw.Write(buf.Bytes())
-				buf.Reset()
+				buf.WriteByte('\n')
+				if buf.Len() > 3*1024*1024 {
+					pw.Write(buf.Bytes())
+					buf.Reset()
+				}
 			}
 		}
+		if buf.Len() > 0 {
+			pw.Write(buf.Bytes())
+		}
+		pw.Close()
 	}
-	if buf.Len() > 0 {
-		pw.Write(buf.Bytes())
-	}
-	pw.Close()
+
 	return nil
 }

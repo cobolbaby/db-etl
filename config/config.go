@@ -48,13 +48,13 @@ const (
 )
 
 type SourceConfig struct {
-	DB    string `yaml:"db"`
+	Name  string `yaml:"name"`
 	SQL   string `yaml:"sql"`
 	Table string `yaml:"table"`
 }
 
 type DownstreamConfig struct {
-	DB    string   `yaml:"db"`
+	Name  string   `yaml:"name"`
 	Table string   `yaml:"table"`
 	Mode  ModeType `yaml:"mode"`
 }
@@ -116,9 +116,13 @@ func (c *Config) Validate() error {
 	}
 
 	for _, t := range c.Tasks {
-		for _, v := range t.Sources {
-			if v.SQL == "" && v.Table == "" {
-				return fmt.Errorf("task SQL or table required")
+		for _, s := range t.Sources {
+			if s.SQL == "" && s.Table == "" {
+				return fmt.Errorf("sql or table must be specified")
+			}
+
+			if s.SQL != "" && s.Table != "" {
+				return fmt.Errorf("sql and table cannot both be specified")
 			}
 		}
 	}

@@ -7,18 +7,16 @@ import (
 	"log"
 	"strings"
 	"time"
-
-	"github.com/google/uuid"
 )
 
-type MSSQLReader struct {
+type PGReader struct {
 	DB        *sql.DB
 	SQL       string
 	Table     string
 	BatchSize int
 }
 
-func (r *MSSQLReader) ReadBatch() <-chan RowBatch {
+func (r *PGReader) ReadBatch() <-chan RowBatch {
 	out := make(chan RowBatch, 8)
 	go func() {
 		defer close(out)
@@ -55,7 +53,7 @@ func (r *MSSQLReader) ReadBatch() <-chan RowBatch {
 	return out
 }
 
-func (r *MSSQLReader) GetColumnHandlers() []ColHandler {
+func (r *PGReader) GetColumnHandlers() []ColHandler {
 	colTypes, _ := r.getColumnTypes()
 	handlers := make([]ColHandler, len(colTypes))
 	for i, ct := range colTypes {
@@ -64,7 +62,7 @@ func (r *MSSQLReader) GetColumnHandlers() []ColHandler {
 	return handlers
 }
 
-func (r *MSSQLReader) getColumnTypes() ([]*sql.ColumnType, error) {
+func (r *PGReader) getColumnTypes() ([]*sql.ColumnType, error) {
 
 	var query string
 	if r.SQL != "" {
@@ -81,20 +79,9 @@ func (r *MSSQLReader) getColumnTypes() ([]*sql.ColumnType, error) {
 	return rows.ColumnTypes()
 }
 
-func (r *MSSQLReader) getColumnHandler(dbType string) ColHandler {
+func (r *PGReader) getColumnHandler(dbType string) ColHandler {
 	switch strings.ToUpper(dbType) {
-	case "UNIQUEIDENTIFIER":
-		return func(v any) string {
-			switch t := v.(type) {
-			case []byte:
-				s, _ := MSSQLUUIDToString(t)
-				return s
-			case string:
-				return strings.ToUpper(t)
-			default:
-				return ""
-			}
-		}
+
 	case "DATETIME", "DATETIME2", "DATE", "TIME":
 		return func(v any) string {
 			if t, ok := v.(time.Time); ok && !t.IsZero() {
@@ -117,19 +104,4 @@ func (r *MSSQLReader) getColumnHandler(dbType string) ColHandler {
 			}
 		}
 	}
-}
-
-func MSSQLUUIDToString(b []byte) (string, error) {
-	if len(b) != 16 {
-		return "", fmt.Errorf("invalid uuid length")
-	}
-	u := []byte{
-		b[3], b[2], b[1], b[0],
-		b[5], b[4],
-		b[7], b[6],
-		b[8], b[9],
-		b[10], b[11], b[12], b[13], b[14], b[15],
-	}
-	id, _ := uuid.FromBytes(u)
-	return strings.ToUpper(id.String()), nil
 }

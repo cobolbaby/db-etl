@@ -73,18 +73,18 @@ func runTask(cfg *config.Config, task config.TaskConfig, dbRegistry map[string]c
 
 	for _, src := range task.Sources {
 
-		srcDB, ok := dbRegistry[src.DB]
+		srcDB, ok := dbRegistry[src.Name]
 		if !ok {
-			return fmt.Errorf("source db not found: %s", src.DB)
+			return fmt.Errorf("source db not found: %s", src.Name)
 		}
 
-		dstDB, ok := dbRegistry[task.Downstream.DB]
+		dstDB, ok := dbRegistry[task.Downstream.Name]
 		if !ok {
-			return fmt.Errorf("downstream db not found: %s", task.Downstream.DB)
+			return fmt.Errorf("downstream db not found: %s", task.Downstream.Name)
 		}
 
-		log.Printf("Source DB: %s", src.DB)
-		log.Printf("Target DB: %s", task.Downstream.DB)
+		log.Printf("Source DB: %s", src.Name)
+		log.Printf("Target DB: %s", task.Downstream.Name)
 
 		// -----------------------------
 		// Reader
@@ -129,8 +129,8 @@ func runTask(cfg *config.Config, task config.TaskConfig, dbRegistry map[string]c
 		}
 
 		log.Printf("finished source %s -> %s",
-			src.DB,
-			task.Downstream.DB)
+			src.Name,
+			task.Downstream.Name)
 	}
 
 	return nil

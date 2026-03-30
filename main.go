@@ -45,7 +45,7 @@ func main() {
 	// 3. Worker Pool
 	// --------------------------------
 
-	workers := runtime.NumCPU()
+	workers := min(runtime.NumCPU(), 4) // 4 is an empirical value, can be tuned
 	var wg sync.WaitGroup
 	for i := 0; i < workers; i++ {
 		wg.Add(1)
@@ -90,31 +90,21 @@ func runTask(cfg *config.Config, task config.TaskConfig, dbRegistry map[string]c
 		// Reader
 		// -----------------------------
 
-		r := reader.NewReader(
-			srcDB.Type,
-			srcDB.DSN(),
-			src.SQL,
-			src.Table,
-			cfg.BatchSize,
-		)
+		r := reader.NewReader(srcDB.Type, srcDB.DSN(), src.SQL, src.Table,
+			cfg.BatchSize)
 
 		// -----------------------------
 		// Writer
 		// -----------------------------
 
-		w := writer.NewWriter(
-			dstDB.Type,
-			dstDB.DSN(),
-			task.Downstream.Table,
-			task.Downstream.Mode,
-		)
+		w := writer.NewWriter(dstDB.Type, dstDB.DSN(), task.Downstream.Table,
+			task.Downstream.Mode, task.Downstream.DstPK)
 
 		// -----------------------------
 		// Transformer
 		// -----------------------------
 
 		handlers := r.GetColumnHandlers()
-
 		t := &transform.DefaultTransformer{
 			Handlers: handlers,
 		}

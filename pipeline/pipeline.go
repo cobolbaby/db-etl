@@ -13,7 +13,7 @@ func RunPipeline(r reader.Reader, t transform.Transformer, w writer.Writer) erro
 	csvChan := make(chan transform.CSVBatch, 8)
 
 	var wg sync.WaitGroup
-	workers := runtime.NumCPU() * 2
+	workers := min(runtime.NumCPU(), 2) // 4 is an empirical value, can be tuned
 	for i := 0; i < workers; i++ {
 		wg.Add(1)
 		go func() {

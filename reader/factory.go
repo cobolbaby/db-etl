@@ -5,6 +5,7 @@ import (
 	"db-etl/config"
 	"log"
 
+	_ "github.com/jackc/pgx/v5/stdlib"
 	_ "github.com/microsoft/go-mssqldb"
 )
 
@@ -17,13 +18,12 @@ func NewReader(dbType config.DBType, connStr string, rawsql string, table string
 		}
 		return &MSSQLReader{DB: db, SQL: rawsql, Table: table, BatchSize: batchSize}
 
-	case config.DBTypePG:
-		db, err := sql.Open("postgres", connStr)
+	case config.DBTypePG, config.DBTypeGP:
+		db, err := sql.Open("pgx", connStr)
 		if err != nil {
 			log.Fatalf("PG connect failed: %v", err)
 		}
 		return &PGReader{DB: db, SQL: rawsql, Table: table, BatchSize: batchSize}
-
 	default:
 		log.Fatalf("unsupported source db type: %s", dbType)
 	}

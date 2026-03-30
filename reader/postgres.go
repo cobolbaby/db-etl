@@ -67,7 +67,7 @@ func (r *PGReader) getColumnTypes() ([]*sql.ColumnType, error) {
 	var query string
 	if r.SQL != "" {
 		query = fmt.Sprintf("SELECT * FROM (%s) t WHERE 1=0", r.SQL)
-	} else {
+	} else if r.Table != "" {
 		query = fmt.Sprintf("SELECT * FROM %s WHERE 1=0", r.Table)
 	}
 	rows, err := r.DB.Query(query)
@@ -82,7 +82,7 @@ func (r *PGReader) getColumnTypes() ([]*sql.ColumnType, error) {
 func (r *PGReader) getColumnHandler(dbType string) ColHandler {
 	switch strings.ToUpper(dbType) {
 
-	case "DATETIME", "DATETIME2", "DATE", "TIME":
+	case "DATETIME", "DATE", "TIME":
 		return func(v any) string {
 			if t, ok := v.(time.Time); ok && !t.IsZero() {
 				return t.Format("2006-01-02 15:04:05")

@@ -30,6 +30,7 @@ type DBType string
 const (
 	DBTypeMSSQL DBType = "mssql"
 	DBTypePG    DBType = "postgres"
+	DBTypeGP    DBType = "greenplum"
 )
 
 type TaskConfig struct {
@@ -57,6 +58,7 @@ type DownstreamConfig struct {
 	Name  string   `yaml:"name"`
 	Table string   `yaml:"table"`
 	Mode  ModeType `yaml:"mode"`
+	DstPK string   `yaml:"dst_pk"`
 }
 
 type ModeType string
@@ -65,7 +67,7 @@ const (
 	ModeTypeCopy   ModeType = "copy"
 	ModeTypeFull   ModeType = "full"
 	ModeTypeAppend ModeType = "append"
-	ModeTypeUpsert ModeType = "upsert"
+	ModeTypeMerge  ModeType = "merge"
 )
 
 /*
@@ -149,10 +151,10 @@ func (db *DBConfig) DSN() string {
 			db.Database,
 		)
 
-	case DBTypePG:
+	case DBTypePG, DBTypeGP:
 
 		return fmt.Sprintf(
-			"postgresql://%s:%s@%s:%d/%s",
+			"postgresql://%s:%s@%s:%d/%s?sslmode=disable",
 			db.User,
 			db.Password,
 			db.Host,
@@ -162,5 +164,6 @@ func (db *DBConfig) DSN() string {
 
 	default:
 		panic("unsupported db type: " + db.Type)
+
 	}
 }

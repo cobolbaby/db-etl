@@ -69,7 +69,7 @@ func (r *MSSQLReader) getColumnTypes() ([]*sql.ColumnType, error) {
 	var query string
 	if r.SQL != "" {
 		query = fmt.Sprintf("SELECT * FROM (%s) t WHERE 1=0", r.SQL)
-	} else {
+	} else if r.Table != "" {
 		query = fmt.Sprintf("SELECT * FROM %s WHERE 1=0", r.Table)
 	}
 	rows, err := r.DB.Query(query)

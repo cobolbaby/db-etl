@@ -9,23 +9,23 @@ import (
 	_ "github.com/microsoft/go-mssqldb"
 )
 
-func NewReader(dbType config.DBType, connStr string, rawsql string, table string, batchSize int) Reader {
-	switch dbType {
+func NewReader(db config.DBConfig, src *config.SourceConfig, batchSize int) Reader {
+	switch db.Type {
 	case config.DBTypeMSSQL:
-		db, err := sql.Open("sqlserver", connStr)
+		db, err := sql.Open("sqlserver", db.DSN())
 		if err != nil {
 			log.Fatalf("MSSQL connect failed: %v", err)
 		}
-		return &MSSQLReader{DB: db, SQL: rawsql, Table: table, BatchSize: batchSize}
+		return &MSSQLReader{DB: db, Src: src, BatchSize: batchSize}
 
 	case config.DBTypePG, config.DBTypeGP:
-		db, err := sql.Open("pgx", connStr)
+		db, err := sql.Open("pgx", db.DSN())
 		if err != nil {
 			log.Fatalf("PG connect failed: %v", err)
 		}
-		return &PGReader{DB: db, SQL: rawsql, Table: table, BatchSize: batchSize}
+		return &PGReader{DB: db, Src: src, BatchSize: batchSize}
 	default:
-		log.Fatalf("unsupported source db type: %s", dbType)
+		log.Fatalf("unsupported source db type: %s", db.Type)
 	}
 	return nil
 }

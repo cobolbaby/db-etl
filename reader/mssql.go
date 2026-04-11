@@ -2,6 +2,7 @@ package reader
 
 import (
 	"database/sql"
+	"db-etl/config"
 	"db-etl/util"
 	"fmt"
 	"log"
@@ -13,8 +14,7 @@ import (
 
 type MSSQLReader struct {
 	DB        *sql.DB
-	SQL       string
-	Table     string
+	Src       *config.SourceConfig
 	BatchSize int
 }
 
@@ -24,11 +24,17 @@ func (r *MSSQLReader) ReadBatch() <-chan RowBatch {
 		defer close(out)
 
 		var query string
-		if r.SQL != "" {
-			query = r.SQL
-		} else if r.Table != "" {
-			query = "SELECT * FROM " + r.Table
+		if r.Src.SQL != "" {
+			query = r.Src.SQL
+		} else if r.Src.Table != "" {
+			query = "SELECT * FROM " + r.Src.Table + " WHERE 1=1"
 		}
+
+		// 如果是增量抽取，替换掉 SQL 中的占位符
+		if r.Src.Mode != config.ModeTypeFull && r.Src.IncrField != "" {
+			query = query + fmt.Sprintf(" AND %s > %s", r.Src.IncrField, r.Src.IncrPoint)
+		}
+
 		rows, err := r.DB.Query(query)
 		if err != nil {
 			log.Fatal(err)
@@ -67,10 +73,10 @@ func (r *MSSQLReader) GetColumnHandlers() []ColHandler {
 func (r *MSSQLReader) getColumnTypes() ([]*sql.ColumnType, error) {
 
 	var query string
-	if r.SQL != "" {
-		query = fmt.Sprintf("SELECT * FROM (%s) t WHERE 1=0", r.SQL)
-	} else if r.Table != "" {
-		query = fmt.Sprintf("SELECT * FROM %s WHERE 1=0", r.Table)
+	if r.Src.SQL != "" {
+		query = fmt.Sprintf("SELECT * FROM (%s) t WHERE 1=0", r.Src.SQL)
+	} else if r.Src.Table != "" {
+		query = fmt.Sprintf("SELECT * FROM %s WHERE 1=0", r.Src.Table)
 	}
 	rows, err := r.DB.Query(query)
 	if err != nil {

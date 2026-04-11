@@ -8,7 +8,6 @@ import (
 )
 
 type Config struct {
-	TaskName    string       `yaml:"task_name"`
 	ErrorPolicy string       `yaml:"error_policy"`
 	BatchSize   int          `yaml:"batch_size"`
 	Databases   []DBConfig   `yaml:"databases"`
@@ -34,10 +33,10 @@ const (
 )
 
 type TaskConfig struct {
-	Type TaskType `yaml:"type"`
-
-	Sources []SourceConfig `yaml:"sources"`
-
+	Name       string            `yaml:"name"`
+	Type       TaskType          `yaml:"type"`
+	Comment    string            `yaml:"comment"`
+	Sources    []*SourceConfig   `yaml:"sources"`
 	Downstream *DownstreamConfig `yaml:"downstream"`
 }
 
@@ -49,16 +48,19 @@ const (
 )
 
 type SourceConfig struct {
-	Name  string `yaml:"name"`
-	SQL   string `yaml:"sql"`
-	Table string `yaml:"table"`
+	Name      string   `yaml:"name"`
+	SQL       string   `yaml:"sql"`
+	Table     string   `yaml:"table"` // SQL 和 Table 至少要指定一个，SQL 优先级更高
+	Mode      ModeType `yaml:"mode"`
+	IncrField string   `yaml:"src_incr_field"` // 用于增量抽取，指定一个日期/时间字段，配合 Watermark 实现增量抽取
+	IncrPoint string   `yaml:"incr_point"`     // 增量抽取的起点, 可以是一个具体的日期/时间值，也可以是一个占位符，如 ${WATERMARK}，表示从上次抽取的 Watermark 位置开始抽取
 }
 
 type DownstreamConfig struct {
 	Name  string   `yaml:"name"`
 	Table string   `yaml:"table"`
 	Mode  ModeType `yaml:"mode"`
-	DstPK string   `yaml:"dst_pk"`
+	PK    string   `yaml:"dst_pk"`
 }
 
 type ModeType string

@@ -20,8 +20,6 @@ func main() {
 		log.Fatal(err)
 	}
 
-	log.Printf("TaskName: %s", cfg.TaskName)
-
 	// --------------------------------
 	// 1. 构建 DB Registry
 	// --------------------------------
@@ -87,18 +85,31 @@ func runTask(cfg *config.Config, task config.TaskConfig, dbRegistry map[string]c
 		log.Printf("Target DB: %s", task.Downstream.Name)
 
 		// -----------------------------
-		// Reader
-		// -----------------------------
-
-		r := reader.NewReader(srcDB.Type, srcDB.DSN(), src.SQL, src.Table,
-			cfg.BatchSize)
-
-		// -----------------------------
 		// Writer
 		// -----------------------------
 
-		w := writer.NewWriter(dstDB.Type, dstDB.DSN(), task.Downstream.Table,
-			task.Downstream.Mode, task.Downstream.DstPK)
+		w := writer.NewWriter(dstDB, task.Downstream)
+
+		// 同步方式定义在 Writer 端，但又会影响 Reader 端的抽取逻辑（增量抽取需要从目标端获取上次抽取的 Watermark 位置），
+		// 所以在这里把 Mode 同步到 SourceConfig 里，Reader 和 Writer 都可以访问到
+		src.Mode = task.Downstream.Mode
+
+		// 增量抽取需要知道上次抽取的 Watermark 位置，这个位置存在目标数据库里
+		if src.Mode != config.ModeTypeFull && src.IncrField != "" {
+
+			incrPoint, err := w.GetWatermark(src)
+			if err != nil {
+				return fmt.Errorf("failed to get incr point: %v", err)
+			}
+			src.IncrPoint = incrPoint
+			log.Printf("Incr extraction mode, field: %s, point: %s", src.IncrField, src.IncrPoint)
+		}
+
+		// -----------------------------
+		// Reader
+		// -----------------------------
+
+		r := reader.NewReader(srcDB, src, cfg.BatchSize)
 
 		// -----------------------------
 		// Transformer

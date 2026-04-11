@@ -15,29 +15,25 @@ import (
 )
 
 type PGWriter struct {
-	Conn  *pgx.Conn
-	Table string
-	Mode  config.ModeType
-	DstPK string
+	Conn *pgx.Conn
+	Dst  *config.DownstreamConfig
 }
 
 func (w *PGWriter) WriteBatch(in <-chan transform.CSVBatch) error {
 
-	switch w.Mode {
+	switch w.Dst.Mode {
 
 	case config.ModeTypeCopy:
-		return w.copyToTable(in, w.Table)
+		return w.copyToTable(in, w.Dst.Table)
 
 	case config.ModeTypeMerge:
-
-		if w.DstPK == "" {
+		if w.Dst.PK == "" {
 			return fmt.Errorf("dst_pk is required for merge mode")
 		}
-
 		return w.copyAndMerge(in)
 
 	default:
-		return fmt.Errorf("unsupported mode: %s", w.Mode)
+		return fmt.Errorf("unsupported mode: %s", w.Dst.Mode)
 	}
 }
 
@@ -88,50 +84,123 @@ func (w *PGWriter) copyToTable(in <-chan transform.CSVBatch, table string) error
 func (w *PGWriter) copyAndMerge(in <-chan transform.CSVBatch) error {
 
 	ctx := context.Background()
+
 	tx, err := w.Conn.Begin(ctx)
 	if err != nil {
 		return err
 	}
 	defer tx.Rollback(ctx)
 
-	staging := buildTempTableName(w.Table)
-	createSQL := fmt.Sprintf(
-		"CREATE TEMP TABLE %s (LIKE %s INCLUDING DEFAULTS) ON COMMIT DROP;",
-		staging, w.Table,
-	)
-	if _, err := tx.Exec(ctx, createSQL); err != nil {
+	staging := buildTempTableName(w.Dst.Table)
+
+	if err := w.createTempTable(ctx, tx, staging); err != nil {
 		return err
 	}
-
-	// COPY 数据到 staging
-	oldConn := w.Conn
-	w.Conn = tx.Conn()
 
 	if err := w.copyToTable(in, staging); err != nil {
 		return err
 	}
 
-	w.Conn = oldConn
-
-	// NOTICE: Greenplum 不支持 Merge/Upsert
-	deleteSQL := fmt.Sprintf(
-		`DELETE FROM %s t USING %s s WHERE %s`,
-		w.Table, staging,
-		buildJoinCondition("t", "s", w.DstPK),
-	)
-	if _, err := tx.Exec(ctx, deleteSQL); err != nil {
+	deleted, err := w.deleteTarget(ctx, tx, staging)
+	if err != nil {
 		return err
 	}
 
-	insertSQL := fmt.Sprintf(
-		`INSERT INTO %s SELECT * FROM %s`,
-		w.Table, staging,
-	)
-	if _, err := tx.Exec(ctx, insertSQL); err != nil {
+	inserted, err := w.insertTarget(ctx, tx, staging)
+	if err != nil {
 		return err
 	}
+
+	maxWM, err := w.computeWatermark(ctx, tx, staging)
+	if err != nil {
+		return err
+	}
+
+	if err := w.updateWatermark(ctx, tx, maxWM); err != nil {
+		return err
+	}
+
+	fmt.Printf(
+		"table=%s deleted=%d inserted=%d watermark=%d\n",
+		w.Dst.Table, deleted, inserted, maxWM,
+	)
 
 	return tx.Commit(ctx)
+}
+
+func (w *PGWriter) createTempTable(ctx context.Context, tx pgx.Tx, staging string) error {
+
+	sql := fmt.Sprintf(
+		`CREATE TEMP TABLE %s
+		 (LIKE %s INCLUDING DEFAULTS)
+		 ON COMMIT DROP`,
+		staging, w.Dst.Table,
+	)
+
+	_, err := tx.Exec(ctx, sql)
+
+	return err
+}
+
+func (w *PGWriter) deleteTarget(
+	ctx context.Context,
+	tx pgx.Tx,
+	staging string,
+) (int64, error) {
+
+	sql := fmt.Sprintf(
+		`DELETE FROM %s t USING %s s WHERE %s`,
+		w.Dst.Table,
+		staging,
+		buildJoinCondition("t", "s", w.Dst.PK),
+	)
+
+	tag, err := tx.Exec(ctx, sql)
+	if err != nil {
+		return 0, err
+	}
+
+	return tag.RowsAffected(), nil
+}
+
+func (w *PGWriter) insertTarget(ctx context.Context, tx pgx.Tx, staging string) (int64, error) {
+
+	sql := fmt.Sprintf(
+		`INSERT INTO %s SELECT * FROM %s`,
+		w.Dst.Table,
+		staging,
+	)
+
+	tag, err := tx.Exec(ctx, sql)
+	if err != nil {
+		return 0, err
+	}
+
+	return tag.RowsAffected(), nil
+}
+
+func (w *PGWriter) computeWatermark(ctx context.Context, tx pgx.Tx, staging string) (int64, error) {
+
+	sql := fmt.Sprintf(
+		`SELECT COALESCE(MAX(%s),0) FROM %s`,
+		w.Dst.PK, // 应该换成 src_incr_field，但目前 config.yaml 里还没有这个字段，先用 dstpk 代替，后续改进时再统一替换掉
+		staging,
+	)
+
+	var wm int64
+
+	err := tx.QueryRow(ctx, sql).Scan(&wm)
+
+	return wm, err
+}
+
+func (w *PGWriter) updateWatermark(ctx context.Context, tx pgx.Tx, wm int64) error {
+
+	return nil
+}
+
+func (w *PGWriter) GetWatermark(src *config.SourceConfig) (string, error) {
+	return "", nil
 }
 
 func buildTempTableName(fullTable string) string {

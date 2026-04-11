@@ -1,2 +1,3 @@
 *.yaml
 bin
+__debug*

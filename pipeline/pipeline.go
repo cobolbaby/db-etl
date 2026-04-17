@@ -1,6 +1,7 @@
 package pipeline
 
 import (
+	"db-etl/config"
 	"db-etl/reader"
 	"db-etl/transform"
 	"db-etl/writer"
@@ -8,7 +9,7 @@ import (
 	"sync"
 )
 
-func RunPipeline(r reader.Reader, t transform.Transformer, w writer.Writer) error {
+func RunPipeline(source *config.SourceConfig, r reader.Reader, t transform.Transformer, w writer.BatchWriter) error {
 	rowChan := r.ReadBatch()
 	csvChan := make(chan transform.CSVBatch, 8)
 
@@ -29,5 +30,5 @@ func RunPipeline(r reader.Reader, t transform.Transformer, w writer.Writer) erro
 		close(csvChan)
 	}()
 
-	return w.WriteBatch(csvChan)
+	return w.WriteBatch(source, csvChan)
 }

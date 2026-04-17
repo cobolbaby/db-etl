@@ -15,41 +15,45 @@ import (
 )
 
 type PGWriter struct {
-	Conn *pgx.Conn
-	Dst  *config.DownstreamConfig
+	*BaseWriter
 }
 
-func (w *PGWriter) WriteBatch(in <-chan transform.CSVBatch) error {
+type pgWriterDialect struct {
+	conn *pgx.Conn
+}
 
-	switch w.Dst.Mode {
-
-	case config.ModeTypeCopy:
-		return w.copyToTable(in, w.Dst.Table)
-
-	case config.ModeTypeMerge:
-		if w.Dst.PK == "" {
-			return fmt.Errorf("dst_pk is required for merge mode")
-		}
-		return w.copyAndMerge(in)
-
-	default:
-		return fmt.Errorf("unsupported mode: %s", w.Dst.Mode)
+func NewPGWriter(conn *pgx.Conn, target *config.TargetConfig, jobName string) Writer {
+	base := &BaseWriter{
+		Target:  target,
+		JobName: jobName,
 	}
+
+	base.dialect = &pgWriterDialect{conn: conn}
+
+	return &PGWriter{BaseWriter: base}
 }
 
-func (w *PGWriter) copyToTable(in <-chan transform.CSVBatch, table string) error {
+func (d *pgWriterDialect) writeCopy(in <-chan transform.CSVBatch, table string) error {
+	return d.writeCopyWithFirstBatch(transform.CSVBatch{}, in, table)
+}
+
+func (d *pgWriterDialect) writeCopyWithFirstBatch(firstBatch transform.CSVBatch, in <-chan transform.CSVBatch, table string) error {
 	pr, pw := io.Pipe()
 
 	errCh := make(chan error, 1)
 
 	go func() {
 		copySQL := "COPY " + table + " FROM STDIN WITH (FORMAT CSV, DELIMITER ',', QUOTE '\"', ESCAPE '\"', NULL '')"
-		_, err := w.Conn.PgConn().CopyFrom(context.Background(), pr, copySQL)
+		_, err := d.conn.PgConn().CopyFrom(context.Background(), pr, copySQL)
 		errCh <- err
 	}()
 
 	buf := bytes.NewBuffer(make([]byte, 0, 4*1024*1024))
-	for batch := range in {
+	writeBatch := func(batch transform.CSVBatch) {
+		if len(batch.Rows) == 0 {
+			return
+		}
+
 		for _, row := range batch.Rows {
 			for i, col := range row {
 				if i > 0 {
@@ -63,6 +67,11 @@ func (w *PGWriter) copyToTable(in <-chan transform.CSVBatch, table string) error
 				buf.Reset()
 			}
 		}
+	}
+
+	writeBatch(firstBatch)
+	for batch := range in {
+		writeBatch(batch)
 	}
 	if buf.Len() > 0 {
 		pw.Write(buf.Bytes())
@@ -81,60 +90,77 @@ func (w *PGWriter) copyToTable(in <-chan transform.CSVBatch, table string) error
 	return nil
 }
 
-func (w *PGWriter) copyAndMerge(in <-chan transform.CSVBatch) error {
+func (d *pgWriterDialect) writeMerge(in <-chan transform.CSVBatch, target *config.TargetConfig, source *config.SourceConfig, jobName string) error {
+	var firstBatch transform.CSVBatch
+	foundRows := false
+	for batch := range in {
+		if len(batch.Rows) == 0 {
+			continue
+		}
+		firstBatch = batch
+		foundRows = true
+		break
+	}
+
+	if !foundRows {
+		log.Printf("table=%s no incremental rows, skip merge", target.Table)
+		return nil
+	}
 
 	ctx := context.Background()
 
-	tx, err := w.Conn.Begin(ctx)
+	tx, err := d.conn.Begin(ctx)
 	if err != nil {
 		return err
 	}
 	defer tx.Rollback(ctx)
 
-	staging := buildTempTableName(w.Dst.Table)
+	staging := buildTempTableName(target.Table)
 
-	if err := w.createTempTable(ctx, tx, staging); err != nil {
+	if err := d.createTempTable(ctx, tx, staging, target); err != nil {
 		return err
 	}
 
-	if err := w.copyToTable(in, staging); err != nil {
+	if err := d.writeCopyWithFirstBatch(firstBatch, in, staging); err != nil {
 		return err
 	}
 
-	deleted, err := w.deleteTarget(ctx, tx, staging)
+	deleted, err := d.deleteTarget(ctx, tx, staging, target)
 	if err != nil {
 		return err
 	}
 
-	inserted, err := w.insertTarget(ctx, tx, staging)
+	inserted, err := d.insertTarget(ctx, tx, staging, target)
 	if err != nil {
 		return err
 	}
 
-	maxWM, err := w.computeWatermark(ctx, tx, staging)
-	if err != nil {
-		return err
-	}
+	if source != nil && source.IncrField != "" {
+		maxWM, err := d.computeWatermark(ctx, tx, staging, source)
+		if err != nil {
+			return err
+		}
 
-	if err := w.updateWatermark(ctx, tx, maxWM); err != nil {
-		return err
+		if err := d.updateWatermark(ctx, tx, maxWM, target, source, jobName); err != nil {
+			return err
+		}
 	}
 
 	fmt.Printf(
-		"table=%s deleted=%d inserted=%d watermark=%d\n",
-		w.Dst.Table, deleted, inserted, maxWM,
+		"table=%s deleted=%d inserted=%d\n",
+		target.Table, deleted, inserted,
 	)
 
 	return tx.Commit(ctx)
 }
 
-func (w *PGWriter) createTempTable(ctx context.Context, tx pgx.Tx, staging string) error {
+func (d *pgWriterDialect) createTempTable(ctx context.Context, tx pgx.Tx, staging string, target *config.TargetConfig) error {
 
 	sql := fmt.Sprintf(
 		`CREATE TEMP TABLE %s
 		 (LIKE %s INCLUDING DEFAULTS)
 		 ON COMMIT DROP`,
-		staging, w.Dst.Table,
+		staging, target.Table,
 	)
 
 	_, err := tx.Exec(ctx, sql)
@@ -142,17 +168,18 @@ func (w *PGWriter) createTempTable(ctx context.Context, tx pgx.Tx, staging strin
 	return err
 }
 
-func (w *PGWriter) deleteTarget(
+func (d *pgWriterDialect) deleteTarget(
 	ctx context.Context,
 	tx pgx.Tx,
 	staging string,
+	target *config.TargetConfig,
 ) (int64, error) {
 
 	sql := fmt.Sprintf(
 		`DELETE FROM %s t USING %s s WHERE %s`,
-		w.Dst.Table,
+		target.Table,
 		staging,
-		buildJoinCondition("t", "s", w.Dst.PK),
+		buildJoinCondition("t", "s", target.PK),
 	)
 
 	tag, err := tx.Exec(ctx, sql)
@@ -163,11 +190,11 @@ func (w *PGWriter) deleteTarget(
 	return tag.RowsAffected(), nil
 }
 
-func (w *PGWriter) insertTarget(ctx context.Context, tx pgx.Tx, staging string) (int64, error) {
+func (d *pgWriterDialect) insertTarget(ctx context.Context, tx pgx.Tx, staging string, target *config.TargetConfig) (int64, error) {
 
 	sql := fmt.Sprintf(
 		`INSERT INTO %s SELECT * FROM %s`,
-		w.Dst.Table,
+		target.Table,
 		staging,
 	)
 
@@ -179,28 +206,104 @@ func (w *PGWriter) insertTarget(ctx context.Context, tx pgx.Tx, staging string) 
 	return tag.RowsAffected(), nil
 }
 
-func (w *PGWriter) computeWatermark(ctx context.Context, tx pgx.Tx, staging string) (int64, error) {
-
+func (d *pgWriterDialect) computeWatermark(ctx context.Context, tx pgx.Tx, staging string, source *config.SourceConfig) (string, error) {
 	sql := fmt.Sprintf(
-		`SELECT COALESCE(MAX(%s),0) FROM %s`,
-		w.Dst.PK, // 应该换成 src_incr_field，但目前 config.yaml 里还没有这个字段，先用 dstpk 代替，后续改进时再统一替换掉
+		`SELECT COALESCE(MAX(%s), '') FROM %s`,
+		source.IncrField,
 		staging,
 	)
 
-	var wm int64
-
+	var wm string
 	err := tx.QueryRow(ctx, sql).Scan(&wm)
-
 	return wm, err
 }
 
-func (w *PGWriter) updateWatermark(ctx context.Context, tx pgx.Tx, wm int64) error {
+func (d *pgWriterDialect) updateWatermark(ctx context.Context, tx pgx.Tx, wm string, target *config.TargetConfig, source *config.SourceConfig, jobName string) error {
+	funcName := watermarkJobName(jobName)
+	srcSchema, srcTable, err := watermarkSourceParts(source)
+	if err != nil {
+		return err
+	}
+	dstSchema, dstTable, err := watermarkTargetParts(target)
+	if err != nil {
+		return err
+	}
 
-	return nil
+	tag, err := tx.Exec(
+		ctx,
+		`UPDATE manager.job_data_sync_v2
+            SET incr_point = $1
+          WHERE job_name = $2
+		    AND src_schema_name = $3
+		    AND src_table_name = $4
+		    AND dst_schema_name = $5
+		    AND dst_table_name = $6`,
+		wm, funcName, srcSchema, srcTable, dstSchema, dstTable,
+	)
+	if err != nil {
+		return err
+	}
+
+	if tag.RowsAffected() > 0 {
+		return nil
+	}
+
+	_, err = tx.Exec(
+		ctx,
+		`INSERT INTO manager.job_data_sync_v2
+		    (job_name, src_schema_name, src_table_name, dst_schema_name, dst_table_name, incr_point)
+		  VALUES ($1, $2, $3, $4, $5, $6)`,
+		funcName, srcSchema, srcTable, dstSchema, dstTable, wm,
+	)
+	return err
 }
 
-func (w *PGWriter) GetWatermark(src *config.SourceConfig) (string, error) {
-	return "", nil
+func (d *pgWriterDialect) getWatermark(target *config.TargetConfig, source *config.SourceConfig, jobName string) (string, error) {
+	funcName := watermarkJobName(jobName)
+	srcSchema, srcTable, err := watermarkSourceParts(source)
+	if err != nil {
+		return "", err
+	}
+	dstSchema, dstTable, err := watermarkTargetParts(target)
+	if err != nil {
+		return "", err
+	}
+
+	var wm string
+	err = d.conn.QueryRow(
+		context.Background(),
+		`SELECT COALESCE(incr_point, '')
+           FROM manager.job_data_sync_v2
+          WHERE job_name = $1
+		    AND src_schema_name = $2
+		    AND src_table_name = $3
+		    AND dst_schema_name = $4
+		    AND dst_table_name = $5
+          LIMIT 1`,
+		funcName, srcSchema, srcTable, dstSchema, dstTable,
+	).Scan(&wm)
+
+	if err == pgx.ErrNoRows {
+		return "", nil
+	}
+	if err != nil {
+		return "", err
+	}
+
+	return wm, nil
+}
+func splitQualifiedName(name string) (string, string, error) {
+	trimmed := strings.TrimSpace(name)
+	if trimmed == "" {
+		return "", "", fmt.Errorf("table name is required for watermark")
+	}
+
+	parts := strings.SplitN(trimmed, ".", 2)
+	if len(parts) == 1 {
+		return "", parts[0], nil
+	}
+
+	return parts[0], parts[1], nil
 }
 
 func buildTempTableName(fullTable string) string {

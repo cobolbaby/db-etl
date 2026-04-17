@@ -5,9 +5,16 @@ import (
 	"db-etl/transform"
 )
 
-type Writer interface {
+type BatchWriter interface {
 	// 从 channel 写入目标数据库
-	WriteBatch(in <-chan transform.CSVBatch) error
+	WriteBatch(source *config.SourceConfig, in <-chan transform.CSVBatch) error
+}
 
-	GetWatermark(src *config.SourceConfig) (string, error)
+type WatermarkStore interface {
+	GetWatermark(source *config.SourceConfig) (string, error)
+}
+
+type Writer interface {
+	BatchWriter
+	WatermarkStore
 }

@@ -3,13 +3,13 @@ package config
 import (
 	"fmt"
 	"os"
+	"strings"
 
 	"gopkg.in/yaml.v3"
 )
 
 type Config struct {
 	ErrorPolicy string       `yaml:"error_policy"`
-	BatchSize   int          `yaml:"batch_size"`
 	Databases   []DBConfig   `yaml:"databases"`
 	Tasks       []TaskConfig `yaml:"tasks"`
 }
@@ -33,11 +33,11 @@ const (
 )
 
 type TaskConfig struct {
-	Name       string            `yaml:"name"`
-	Type       TaskType          `yaml:"type"`
-	Comment    string            `yaml:"comment"`
-	Sources    []*SourceConfig   `yaml:"sources"`
-	Downstream *DownstreamConfig `yaml:"downstream"`
+	Name    string          `yaml:"name"`
+	Type    TaskType        `yaml:"type"`
+	Comment string          `yaml:"comment"`
+	Sources []*SourceConfig `yaml:"sources"`
+	Target  *TargetConfig   `yaml:"target"`
 }
 
 type TaskType string
@@ -48,19 +48,22 @@ const (
 )
 
 type SourceConfig struct {
-	Name      string   `yaml:"name"`
-	SQL       string   `yaml:"sql"`
-	Table     string   `yaml:"table"` // SQL 和 Table 至少要指定一个，SQL 优先级更高
-	Mode      ModeType `yaml:"mode"`
-	IncrField string   `yaml:"src_incr_field"` // 用于增量抽取，指定一个日期/时间字段，配合 Watermark 实现增量抽取
-	IncrPoint string   `yaml:"incr_point"`     // 增量抽取的起点, 可以是一个具体的日期/时间值，也可以是一个占位符，如 ${WATERMARK}，表示从上次抽取的 Watermark 位置开始抽取
+	DBName    string `yaml:"dbname"`
+	SQLName   string `yaml:"sql_name"`
+	SQL       string `yaml:"sql"`
+	Table     string `yaml:"table"` // SQL 和 Table 至少要指定一个，SQL 优先级更高
+	BatchSize int    `yaml:"batch_size"`
+	Mode      ModeType
+	IncrField string `yaml:"src_incr_field"` // 用于增量抽取，指定一个日期/时间字段，配合 Watermark 实现增量抽取
+	IncrPoint string `yaml:"incr_point"`     // 增量抽取的起点, 可以是一个具体的日期/时间值，也可以是一个占位符，如 ${WATERMARK}，表示从上次抽取的 Watermark 位置开始抽取
 }
 
-type DownstreamConfig struct {
-	Name  string   `yaml:"name"`
-	Table string   `yaml:"table"`
-	Mode  ModeType `yaml:"mode"`
-	PK    string   `yaml:"dst_pk"`
+type TargetConfig struct {
+	DBName    string   `yaml:"dbname"`
+	Table     string   `yaml:"table"`
+	Mode      ModeType `yaml:"mode"`
+	IncrField string
+	PK        string `yaml:"dst_pk"`
 }
 
 type ModeType string
@@ -87,10 +90,6 @@ func LoadConfig(path string) (*Config, error) {
 
 	if err := yaml.Unmarshal(data, &cfg); err != nil {
 		return nil, err
-	}
-
-	if cfg.BatchSize == 0 {
-		cfg.BatchSize = 20000
 	}
 
 	if err := cfg.Validate(); err != nil {
@@ -120,13 +119,35 @@ func (c *Config) Validate() error {
 	}
 
 	for _, t := range c.Tasks {
+		if t.Target == nil {
+			return fmt.Errorf("target must be specified")
+		}
+
 		for _, s := range t.Sources {
+			if s.BatchSize <= 0 {
+				s.BatchSize = 10000
+			}
+
 			if s.SQL == "" && s.Table == "" {
 				return fmt.Errorf("sql or table must be specified")
 			}
 
 			if s.SQL != "" && s.Table != "" {
 				return fmt.Errorf("sql and table cannot both be specified")
+			}
+
+			if strings.TrimSpace(s.IncrField) != "" {
+				if strings.TrimSpace(t.Name) == "" {
+					return fmt.Errorf("task name is required when source src_incr_field is configured")
+				}
+
+				if strings.TrimSpace(s.SQL) != "" {
+					if strings.TrimSpace(s.SQLName) == "" {
+						return fmt.Errorf("source sql_name is required when source src_incr_field is configured for sql source")
+					}
+				} else if strings.TrimSpace(s.Table) == "" {
+					return fmt.Errorf("source table is required when source src_incr_field is configured for table source")
+				}
 			}
 		}
 	}
@@ -168,4 +189,24 @@ func (db *DBConfig) DSN() string {
 		panic("unsupported db type: " + db.Type)
 
 	}
+}
+
+func splitQualifiedName(name string) (string, string, error) {
+	trimmed := strings.TrimSpace(name)
+	if trimmed == "" {
+		return "", "", fmt.Errorf("qualified name is required")
+	}
+
+	parts := strings.SplitN(trimmed, ".", 2)
+	if len(parts) != 2 {
+		return "", "", fmt.Errorf("qualified name must be schema.table")
+	}
+
+	schema := strings.TrimSpace(parts[0])
+	table := strings.TrimSpace(parts[1])
+	if schema == "" || table == "" {
+		return "", "", fmt.Errorf("qualified name must be schema.table")
+	}
+
+	return schema, table, nil
 }

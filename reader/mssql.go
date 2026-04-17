@@ -3,9 +3,7 @@ package reader
 import (
 	"database/sql"
 	"db-etl/config"
-	"db-etl/util"
 	"fmt"
-	"log"
 	"strings"
 	"time"
 
@@ -13,81 +11,40 @@ import (
 )
 
 type MSSQLReader struct {
-	DB        *sql.DB
-	Src       *config.SourceConfig
-	BatchSize int
+	*BaseReader
 }
 
-func (r *MSSQLReader) ReadBatch() <-chan RowBatch {
-	out := make(chan RowBatch, 8)
-	go func() {
-		defer close(out)
+type mssqlDialect struct{}
 
-		var query string
-		if r.Src.SQL != "" {
-			query = r.Src.SQL
-		} else if r.Src.Table != "" {
-			query = "SELECT * FROM " + r.Src.Table + " WHERE 1=1"
-		}
-
-		// 如果是增量抽取，替换掉 SQL 中的占位符
-		if r.Src.Mode != config.ModeTypeFull && r.Src.IncrField != "" {
-			query = query + fmt.Sprintf(" AND %s > %s", r.Src.IncrField, r.Src.IncrPoint)
-		}
-
-		rows, err := r.DB.Query(query)
-		if err != nil {
-			log.Fatal(err)
-		}
-		defer rows.Close()
-		cols, _ := rows.Columns()
-		for {
-			batch := make([][]any, 0, r.BatchSize)
-			for len(batch) < r.BatchSize && rows.Next() {
-				values := make([]any, len(cols))
-				valuePtrs := make([]any, len(cols))
-				for i := range values {
-					valuePtrs[i] = &values[i]
-				}
-				rows.Scan(valuePtrs...)
-				batch = append(batch, values)
-			}
-			if len(batch) == 0 {
-				break
-			}
-			out <- RowBatch{Rows: batch}
-		}
-	}()
-	return out
-}
-
-func (r *MSSQLReader) GetColumnHandlers() []ColHandler {
-	colTypes, _ := r.getColumnTypes()
-	handlers := make([]ColHandler, len(colTypes))
-	for i, ct := range colTypes {
-		handlers[i] = r.getColumnHandler(ct.DatabaseTypeName())
+func NewMSSQLReader(db *sql.DB, src *config.SourceConfig) Reader {
+	return &MSSQLReader{
+		BaseReader: &BaseReader{
+			DB:      db,
+			Source:  src,
+			dialect: mssqlDialect{},
+		},
 	}
-	return handlers
 }
 
-func (r *MSSQLReader) getColumnTypes() ([]*sql.ColumnType, error) {
-
+func (mssqlDialect) buildBaseQuery(source *config.SourceConfig, emptyResult bool) (string, error) {
 	var query string
-	if r.Src.SQL != "" {
-		query = fmt.Sprintf("SELECT * FROM (%s) t WHERE 1=0", r.Src.SQL)
-	} else if r.Src.Table != "" {
-		query = fmt.Sprintf("SELECT * FROM %s WHERE 1=0", r.Src.Table)
+	whereClause := "1=1"
+	if emptyResult {
+		whereClause = "1=0"
 	}
-	rows, err := r.DB.Query(query)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
 
-	return rows.ColumnTypes()
+	if source.SQL != "" {
+		query = fmt.Sprintf("SELECT * FROM (%s) t WHERE %s", source.SQL, whereClause)
+	} else if source.Table != "" {
+		query = fmt.Sprintf("SELECT * FROM %s WITH (NOLOCK) WHERE %s", source.Table, whereClause)
+	} else {
+		return "", fmt.Errorf("source sql or table is required")
+	}
+
+	return query, nil
 }
 
-func (r *MSSQLReader) getColumnHandler(dbType string) ColHandler {
+func (mssqlDialect) getColumnHandler(dbType string) ColHandler {
 	switch strings.ToUpper(dbType) {
 	case "UNIQUEIDENTIFIER":
 		return func(v any) string {
@@ -109,19 +66,7 @@ func (r *MSSQLReader) getColumnHandler(dbType string) ColHandler {
 			return ""
 		}
 	default:
-		return func(v any) string {
-			if v == nil {
-				return ""
-			}
-			switch t := v.(type) {
-			case []byte:
-				return util.SanitizeString(string(t))
-			case string:
-				return util.SanitizeString(t)
-			default:
-				return util.SanitizeString(fmt.Sprintf("%v", t))
-			}
-		}
+		return defaultColumnHandler
 	}
 }
 

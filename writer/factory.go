@@ -8,14 +8,14 @@ import (
 	"github.com/jackc/pgx/v5"
 )
 
-func NewWriter(db config.DBConfig, dst *config.DownstreamConfig) Writer {
+func NewWriter(db config.DBConfig, target *config.TargetConfig, jobName string) Writer {
 	switch db.Type {
 	case config.DBTypePG, config.DBTypeGP:
 		pgConn, err := pgx.Connect(context.Background(), db.DSN())
 		if err != nil {
 			log.Fatalf("PG connect failed: %v", err)
 		}
-		return &PGWriter{Conn: pgConn, Dst: dst}
+		return NewPGWriter(pgConn, target, jobName)
 	default:
 		log.Fatalf("unsupported target db type: %s", db.Type)
 	}

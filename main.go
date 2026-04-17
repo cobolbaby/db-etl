@@ -51,7 +51,7 @@ func main() {
 			defer wg.Done()
 			for task := range taskCh {
 				log.Printf("[Worker %d] start task", workerID)
-				if err := runTask(cfg, task, dbRegistry); err != nil {
+				if err := runTask(task, dbRegistry); err != nil {
 					log.Printf("task failed: %v", err)
 					if cfg.ErrorPolicy == "abort" {
 						log.Fatal(err)
@@ -67,32 +67,32 @@ func main() {
 
 }
 
-func runTask(cfg *config.Config, task config.TaskConfig, dbRegistry map[string]config.DBConfig) error {
+func runTask(task config.TaskConfig, dbRegistry map[string]config.DBConfig) error {
 
 	for _, src := range task.Sources {
 
-		srcDB, ok := dbRegistry[src.Name]
+		srcDB, ok := dbRegistry[src.DBName]
 		if !ok {
-			return fmt.Errorf("source db not found: %s", src.Name)
+			return fmt.Errorf("source db not found: %s", src.DBName)
 		}
 
-		dstDB, ok := dbRegistry[task.Downstream.Name]
+		dstDB, ok := dbRegistry[task.Target.DBName]
 		if !ok {
-			return fmt.Errorf("downstream db not found: %s", task.Downstream.Name)
+			return fmt.Errorf("target db not found: %s", task.Target.DBName)
 		}
 
-		log.Printf("Source DB: %s", src.Name)
-		log.Printf("Target DB: %s", task.Downstream.Name)
+		log.Printf("Source DB: %s", src.DBName)
+		log.Printf("Target DB: %s", task.Target.DBName)
 
 		// -----------------------------
 		// Writer
 		// -----------------------------
 
-		w := writer.NewWriter(dstDB, task.Downstream)
+		w := writer.NewWriter(dstDB, task.Target, task.Name)
 
 		// 同步方式定义在 Writer 端，但又会影响 Reader 端的抽取逻辑（增量抽取需要从目标端获取上次抽取的 Watermark 位置），
 		// 所以在这里把 Mode 同步到 SourceConfig 里，Reader 和 Writer 都可以访问到
-		src.Mode = task.Downstream.Mode
+		src.Mode = task.Target.Mode
 
 		// 增量抽取需要知道上次抽取的 Watermark 位置，这个位置存在目标数据库里
 		if src.Mode != config.ModeTypeFull && src.IncrField != "" {
@@ -109,7 +109,7 @@ func runTask(cfg *config.Config, task config.TaskConfig, dbRegistry map[string]c
 		// Reader
 		// -----------------------------
 
-		r := reader.NewReader(srcDB, src, cfg.BatchSize)
+		r := reader.NewReader(srcDB, src)
 
 		// -----------------------------
 		// Transformer
@@ -124,14 +124,14 @@ func runTask(cfg *config.Config, task config.TaskConfig, dbRegistry map[string]c
 		// Pipeline
 		// -----------------------------
 
-		err := pipeline.RunPipeline(r, t, w)
+		err := pipeline.RunPipeline(src, r, t, w)
 		if err != nil {
 			return err
 		}
 
 		log.Printf("finished source %s -> %s",
-			src.Name,
-			task.Downstream.Name)
+			src.DBName,
+			task.Target.DBName)
 	}
 
 	return nil

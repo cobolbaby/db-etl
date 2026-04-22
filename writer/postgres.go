@@ -34,7 +34,23 @@ func NewPGWriter(conn *pgx.Conn, target *config.TargetConfig, jobName string) Wr
 }
 
 func (d *pgWriterDialect) writeCopy(in <-chan transform.CSVBatch, table string) error {
-	return d.writeCopyWithFirstBatch(transform.CSVBatch{}, in, table)
+	var firstBatch transform.CSVBatch
+	foundRows := false
+	for batch := range in {
+		if len(batch.Rows) == 0 {
+			continue
+		}
+		firstBatch = batch
+		foundRows = true
+		break
+	}
+
+	if !foundRows {
+		log.Printf("table=%s no rows to copy, skip", table)
+		return nil
+	}
+
+	return d.writeCopyWithFirstBatch(firstBatch, in, table)
 }
 
 func (d *pgWriterDialect) writeCopyWithFirstBatch(firstBatch transform.CSVBatch, in <-chan transform.CSVBatch, table string) error {
@@ -43,7 +59,7 @@ func (d *pgWriterDialect) writeCopyWithFirstBatch(firstBatch transform.CSVBatch,
 	errCh := make(chan error, 1)
 
 	go func() {
-		copySQL := "COPY " + table + " FROM STDIN WITH (FORMAT CSV, DELIMITER ',', QUOTE '\"', ESCAPE '\"', NULL '')"
+		copySQL := buildCopySQL(table, firstBatch.Columns)
 		_, err := d.conn.PgConn().CopyFrom(context.Background(), pr, copySQL)
 		errCh <- err
 	}()
@@ -88,6 +104,15 @@ func (d *pgWriterDialect) writeCopyWithFirstBatch(firstBatch transform.CSVBatch,
 
 	log.Println("COPY completed successfully")
 	return nil
+}
+
+func buildCopySQL(table string, columns []string) string {
+	base := "COPY " + table
+	if len(columns) > 0 {
+		base += "(" + strings.Join(columns, ", ") + ")"
+	}
+
+	return base + " FROM STDIN WITH (FORMAT CSV, DELIMITER ',', QUOTE '\"', ESCAPE '\"', NULL '')"
 }
 
 func (d *pgWriterDialect) writeMerge(in <-chan transform.CSVBatch, target *config.TargetConfig, source *config.SourceConfig, jobName string) error {
@@ -146,7 +171,7 @@ func (d *pgWriterDialect) writeMerge(in <-chan transform.CSVBatch, target *confi
 		}
 	}
 
-	fmt.Printf(
+	log.Printf(
 		"table=%s deleted=%d inserted=%d\n",
 		target.Table, deleted, inserted,
 	)

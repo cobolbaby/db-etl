@@ -1,6 +1,7 @@
 package reader
 
 type RowBatch struct {
+	Columns []string
 	Rows [][]any
 }
 

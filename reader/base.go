@@ -16,9 +16,9 @@ type readerDialect interface {
 }
 
 type BaseReader struct {
-	DB        *sql.DB
-	Source    *config.SourceConfig
-	dialect   readerDialect
+	DB      *sql.DB
+	Source  *config.SourceConfig
+	dialect readerDialect
 }
 
 func (r *BaseReader) ReadBatch() <-chan RowBatch {
@@ -65,7 +65,7 @@ func (r *BaseReader) ReadBatch() <-chan RowBatch {
 			if len(batch) == 0 {
 				break
 			}
-			out <- RowBatch{Rows: batch}
+			out <- RowBatch{Columns: cols, Rows: batch}
 		}
 	}()
 	return out

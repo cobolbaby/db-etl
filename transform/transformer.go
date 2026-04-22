@@ -3,6 +3,7 @@ package transform
 import "db-etl/reader"
 
 type CSVBatch struct {
+	Columns []string
 	Rows [][]string
 }
 
@@ -24,5 +25,5 @@ func (t *DefaultTransformer) Transform(batch reader.RowBatch) CSVBatch {
 		}
 		res[i] = rec
 	}
-	return CSVBatch{Rows: res}
+	return CSVBatch{Columns: batch.Columns, Rows: res}
 }

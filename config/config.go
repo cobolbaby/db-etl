@@ -188,23 +188,3 @@ func (db *DBConfig) DSN() string {
 
 	}
 }
-
-func splitQualifiedName(name string) (string, string, error) {
-	trimmed := strings.TrimSpace(name)
-	if trimmed == "" {
-		return "", "", fmt.Errorf("qualified name is required")
-	}
-
-	parts := strings.SplitN(trimmed, ".", 2)
-	if len(parts) != 2 {
-		return "", "", fmt.Errorf("qualified name must be schema.table")
-	}
-
-	schema := strings.TrimSpace(parts[0])
-	table := strings.TrimSpace(parts[1])
-	if schema == "" || table == "" {
-		return "", "", fmt.Errorf("qualified name must be schema.table")
-	}
-
-	return schema, table, nil
-}

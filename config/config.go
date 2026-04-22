@@ -164,7 +164,6 @@ func (db *DBConfig) DSN() string {
 	switch db.Type {
 
 	case DBTypeMSSQL:
-
 		return fmt.Sprintf(
 			"server=%s;user id=%s;password=%s;port=%d;database=%s",
 			db.Host,
@@ -175,13 +174,12 @@ func (db *DBConfig) DSN() string {
 		)
 
 	case DBTypePG, DBTypeGP:
-
 		return fmt.Sprintf(
-			"postgresql://%s:%s@%s:%d/%s?sslmode=disable",
-			db.User,
-			db.Password,
+			"host=%s port=%d user=%s password=%s dbname=%s sslmode=disable",
 			db.Host,
 			db.Port,
+			db.User,
+			db.Password,
 			db.Database,
 		)
 

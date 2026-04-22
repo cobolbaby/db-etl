@@ -57,17 +57,60 @@ func (d *pgWriterDialect) writeCopyWithFirstBatch(firstBatch transform.CSVBatch,
 	pr, pw := io.Pipe()
 
 	errCh := make(chan error, 1)
+	copySQL := buildCopySQL(table, firstBatch.Columns)
 
 	go func() {
-		copySQL := buildCopySQL(table, firstBatch.Columns)
 		_, err := d.conn.PgConn().CopyFrom(context.Background(), pr, copySQL)
+		if err != nil {
+			_ = pr.CloseWithError(err)
+		} else {
+			_ = pr.Close()
+		}
 		errCh <- err
 	}()
 
 	buf := bytes.NewBuffer(make([]byte, 0, 4*1024*1024))
-	writeBatch := func(batch transform.CSVBatch) {
+	flushBuffer := func() error {
+		if buf.Len() == 0 {
+			return nil
+		}
+
+		if _, err := pw.Write(buf.Bytes()); err != nil {
+			return err
+		}
+
+		buf.Reset()
+		return nil
+	}
+	finishWithError := func(err error) error {
+		_ = pw.CloseWithError(err)
+		if copyErr := <-errCh; copyErr != nil {
+			return copyErr
+		}
+		return err
+	}
+	finishCopy := func() error {
+		if err := pw.Close(); err != nil {
+			if copyErr := <-errCh; copyErr != nil {
+				return copyErr
+			}
+			return err
+		}
+
+		log.Println("COPY data sent, waiting for completion...")
+
+		if err := <-errCh; err != nil {
+			log.Println("COPY error:", err)
+			return err
+		}
+
+		log.Println("COPY completed successfully")
+		return nil
+	}
+
+	writeBatch := func(batch transform.CSVBatch) error {
 		if len(batch.Rows) == 0 {
-			return
+			return nil
 		}
 
 		for _, row := range batch.Rows {
@@ -79,31 +122,30 @@ func (d *pgWriterDialect) writeCopyWithFirstBatch(firstBatch transform.CSVBatch,
 			}
 			buf.WriteByte('\n')
 			if buf.Len() > 3*1024*1024 {
-				pw.Write(buf.Bytes())
-				buf.Reset()
+				if err := flushBuffer(); err != nil {
+					return err
+				}
 			}
+		}
+
+		return nil
+	}
+
+	if err := writeBatch(firstBatch); err != nil {
+		return finishWithError(err)
+	}
+
+	for batch := range in {
+		if err := writeBatch(batch); err != nil {
+			return finishWithError(err)
 		}
 	}
 
-	writeBatch(firstBatch)
-	for batch := range in {
-		writeBatch(batch)
-	}
-	if buf.Len() > 0 {
-		pw.Write(buf.Bytes())
-	}
-	pw.Close()
-
-	log.Println("COPY data sent, waiting for completion...")
-
-	// 等待 COPY 完成
-	if err := <-errCh; err != nil {
-		log.Println("COPY error:", err)
-		return err
+	if err := flushBuffer(); err != nil {
+		return finishWithError(err)
 	}
 
-	log.Println("COPY completed successfully")
-	return nil
+	return finishCopy()
 }
 
 func buildCopySQL(table string, columns []string) string {

@@ -5,6 +5,7 @@ import (
 	"log"
 	"runtime"
 	"sync"
+	"time"
 
 	"db-etl/config"
 	"db-etl/pipeline"
@@ -124,14 +125,34 @@ func runTask(task config.TaskConfig, dbRegistry map[string]config.DBConfig) erro
 		// Pipeline
 		// -----------------------------
 
+		startedAt := time.Now()
+		log.Printf(
+			"pipeline start %s -> %s (%s)",
+			src.DBName,
+			task.Target.DBName,
+			task.Target.Table,
+		)
+
 		err := pipeline.RunPipeline(src, r, t, w)
 		if err != nil {
+			log.Printf(
+				"pipeline failed %s -> %s (%s) cost=%s err=%v",
+				src.DBName,
+				task.Target.DBName,
+				task.Target.Table,
+				time.Since(startedAt).Round(time.Millisecond),
+				err,
+			)
 			return err
 		}
 
-		log.Printf("finished source %s -> %s",
+		log.Printf(
+			"pipeline finished %s -> %s (%s) cost=%s",
 			src.DBName,
-			task.Target.DBName)
+			task.Target.DBName,
+			task.Target.Table,
+			time.Since(startedAt).Round(time.Millisecond),
+		)
 	}
 
 	return nil

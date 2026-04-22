@@ -1,18 +1,36 @@
-# Makefile for Go HTTP Proxy with Docker build/push
-
 APP_NAME := db-etl
 BUILD_DIR := bin
 SRC := main.go
+GO ?= go
+CGO_ENABLED ?= 0
+TARGET_OS ?= linux
+TARGET_ARCH ?= amd64
 
-.PHONY: all build run clean docker-build docker-push
+EXE_SUFFIX :=
+ifeq ($(TARGET_OS),windows)
+EXE_SUFFIX := .exe
+endif
 
-all: build
+BIN_NAME := $(APP_NAME)-$(TARGET_OS)-$(TARGET_ARCH)$(EXE_SUFFIX)
+
+.PHONY: all build build-linux build-exe build-windows build-macos clean
+
+all: build-linux
 
 build:
-	@echo "Building $(APP_NAME)..."
+	@echo "Cross-compiling $(BIN_NAME) for $(TARGET_OS)/$(TARGET_ARCH)..."
 	@mkdir -p $(BUILD_DIR)
-	@CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o $(BUILD_DIR)/$(APP_NAME) $(SRC)
-	@echo "Build complete: $(BUILD_DIR)/$(APP_NAME)"
+	@CGO_ENABLED=$(CGO_ENABLED) GOOS=$(TARGET_OS) GOARCH=$(TARGET_ARCH) $(GO) build -o $(BUILD_DIR)/$(BIN_NAME) $(SRC)
+	@echo "Build complete: $(BUILD_DIR)/$(BIN_NAME)"
+
+build-linux:
+	@$(MAKE) build TARGET_OS=linux TARGET_ARCH=amd64
+
+build-exe build-windows:
+	@$(MAKE) build TARGET_OS=windows TARGET_ARCH=amd64
+
+build-macos:
+	@$(MAKE) build TARGET_OS=darwin TARGET_ARCH=amd64
 
 clean:
 	@echo "Cleaning build artifacts..."

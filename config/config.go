@@ -12,6 +12,8 @@ type Config struct {
 	ErrorPolicy string       `yaml:"error_policy"`
 	Databases   []DBConfig   `yaml:"databases"`
 	Tasks       []TaskConfig `yaml:"tasks"`
+	Name        string       `yaml:"name"`
+	Comment     string       `yaml:"comment"`
 }
 
 type DBConfig struct {
@@ -35,7 +37,6 @@ const (
 type TaskConfig struct {
 	Name    string          `yaml:"name"`
 	Type    TaskType        `yaml:"type"`
-	Comment string          `yaml:"comment"`
 	Sources []*SourceConfig `yaml:"sources"`
 	Target  *TargetConfig   `yaml:"target"`
 }
@@ -43,8 +44,8 @@ type TaskConfig struct {
 type TaskType string
 
 const (
-	TaskTypeSQL   TaskType = "query"
-	TaskTypeTable TaskType = "exec"
+	TaskTypeEtl  TaskType = "query"
+	TaskTypeExec TaskType = "exec"
 )
 
 type SourceConfig struct {
@@ -104,6 +105,18 @@ Validate
 检查配置合法性
 */
 func (c *Config) Validate() error {
+
+	// Name 不能为空
+	if strings.TrimSpace(c.Name) == "" {
+		return fmt.Errorf("config name is required")
+	}
+
+	// ErrorPolicy 只能是 "abort" 或 "continue"，默认为 "abort"
+	if c.ErrorPolicy == "" {
+		c.ErrorPolicy = "abort"
+	} else if c.ErrorPolicy != "abort" && c.ErrorPolicy != "continue" {
+		return fmt.Errorf("invalid error_policy: %s", c.ErrorPolicy)
+	}
 
 	for _, db := range c.Databases {
 		if db.Name == "" {

@@ -31,6 +31,8 @@ func (r *BaseReader) ReadBatch() <-chan RowBatch {
 			log.Fatal(err)
 		}
 
+		// log.Println("query: ", query)
+
 		rows, err := r.DB.Query(query)
 		if err != nil {
 			log.Fatal(err)
@@ -109,7 +111,8 @@ func (r *BaseReader) buildReadQuery() (string, error) {
 		return query, nil
 	}
 
-	if strings.Contains(query, "${SRC_INCR_FIELD}") {
+	if strings.Contains(query, "${SRC_INCR_FIELD}") ||
+		strings.Contains(query, "${INCR_POINT}") {
 		query = strings.ReplaceAll(query, "${SRC_INCR_FIELD}", r.Source.IncrField)
 		query = strings.ReplaceAll(query, "${INCR_POINT}", r.Source.IncrPoint)
 		return query, nil

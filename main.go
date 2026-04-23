@@ -52,6 +52,10 @@ func main() {
 			defer wg.Done()
 			for task := range taskCh {
 				log.Printf("[Worker %d] start task", workerID)
+				// 如果 TaskConfig 里没有 Name，就用 Config 的 Name 作为默认值
+				if task.Name == "" {
+					task.Name = cfg.Name
+				}
 				if err := runTask(task, dbRegistry); err != nil {
 					log.Printf("task failed: %v", err)
 					if cfg.ErrorPolicy == "abort" {
@@ -81,9 +85,6 @@ func runTask(task config.TaskConfig, dbRegistry map[string]config.DBConfig) erro
 		if !ok {
 			return fmt.Errorf("target db not found: %s", task.Target.DBName)
 		}
-
-		log.Printf("Source DB: %s", src.DBName)
-		log.Printf("Target DB: %s", task.Target.DBName)
 
 		// -----------------------------
 		// Writer

@@ -12,6 +12,8 @@ type Config struct {
 	ErrorPolicy string       `yaml:"error_policy"`
 	Databases   []DBConfig   `yaml:"databases"`
 	Tasks       []TaskConfig `yaml:"tasks"`
+	Name        string       `yaml:"name"`
+	Comment     string       `yaml:"comment"`
 }
 
 type DBConfig struct {
@@ -35,7 +37,6 @@ const (
 type TaskConfig struct {
 	Name    string          `yaml:"name"`
 	Type    TaskType        `yaml:"type"`
-	Comment string          `yaml:"comment"`
 	Sources []*SourceConfig `yaml:"sources"`
 	Target  *TargetConfig   `yaml:"target"`
 }
@@ -43,14 +44,13 @@ type TaskConfig struct {
 type TaskType string
 
 const (
-	TaskTypeSQL   TaskType = "query"
-	TaskTypeTable TaskType = "exec"
+	TaskTypeEtl  TaskType = "query"
+	TaskTypeExec TaskType = "exec"
 )
 
 type SourceConfig struct {
-	DBName    string `yaml:"dbname"`
-	SQLName   string `yaml:"sql_name"`
-	SQL       string `yaml:"sql"`
+	DBName string `yaml:"dbname"`
+	SQL    string `yaml:"sql"`
 	Table     string `yaml:"table"` // SQL 和 Table 至少要指定一个，SQL 优先级更高
 	BatchSize int    `yaml:"batch_size"`
 	Mode      ModeType
@@ -105,6 +105,18 @@ Validate
 */
 func (c *Config) Validate() error {
 
+	// Name 不能为空
+	if strings.TrimSpace(c.Name) == "" {
+		return fmt.Errorf("config name is required")
+	}
+
+	// ErrorPolicy 只能是 "abort" 或 "continue"，默认为 "abort"
+	if c.ErrorPolicy == "" {
+		c.ErrorPolicy = "abort"
+	} else if c.ErrorPolicy != "abort" && c.ErrorPolicy != "continue" {
+		return fmt.Errorf("invalid error_policy: %s", c.ErrorPolicy)
+	}
+
 	for _, db := range c.Databases {
 		if db.Name == "" {
 			return fmt.Errorf("database name required")
@@ -136,19 +148,9 @@ func (c *Config) Validate() error {
 				return fmt.Errorf("sql and table cannot both be specified")
 			}
 
-			if strings.TrimSpace(s.IncrField) != "" {
-				if strings.TrimSpace(t.Name) == "" {
-					return fmt.Errorf("task name is required when source src_incr_field is configured")
-				}
-
-				if strings.TrimSpace(s.SQL) != "" {
-					if strings.TrimSpace(s.SQLName) == "" {
-						return fmt.Errorf("source sql_name is required when source src_incr_field is configured for sql source")
-					}
-				} else if strings.TrimSpace(s.Table) == "" {
-					return fmt.Errorf("source table is required when source src_incr_field is configured for table source")
-				}
-			}
+			// if strings.TrimSpace(s.IncrField) != "" {
+			// 	// ...
+			// }
 		}
 	}
 

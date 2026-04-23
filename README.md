@@ -2,6 +2,43 @@
 
 一个基于 Go 的数据库 ETL 工具，用于从 `mssql` / `postgres` / `greenplum` 读取数据，经过统一转换后写入目标库。
 
+## 环境准备
+
+```sql
+
+CREATE SCHEMA IF NOT EXISTS manager;
+
+CREATE TABLE IF NOT EXISTS manager.job_data_sync
+(
+    job_id serial primary key,
+    src_schema_name character varying(100) COLLATE pg_catalog."default",
+    src_table_name character varying(100) COLLATE pg_catalog."default",
+    dst_schema_name character varying(100) COLLATE pg_catalog."default",
+    dst_table_name character varying(100) COLLATE pg_catalog."default",
+    src_select_statement text COLLATE pg_catalog."default",
+    src_where_statement text COLLATE pg_catalog."default",
+    sync_mode character varying(10) COLLATE pg_catalog."default",
+    src_incr_field character varying(100) COLLATE pg_catalog."default",
+    dst_pk character varying(100) COLLATE pg_catalog."default",
+    fields_mapping jsonb,
+    incr_point text COLLATE pg_catalog."default",
+    cdt timestamp without time zone,
+    udt timestamp without time zone,
+    remark text COLLATE pg_catalog."default",
+    inuse boolean,
+    src_instance character varying(50) COLLATE pg_catalog."default",
+    src_db_name character varying(50) COLLATE pg_catalog."default",
+    job_name character varying(50) COLLATE pg_catalog."default",
+    src_conn_id integer,
+    dst_distributed_by character varying(100) COLLATE pg_catalog."default",
+    created_by character varying(50) COLLATE pg_catalog."default",
+    modified_by character varying(50) COLLATE pg_catalog."default",
+    src_rawsql text COLLATE pg_catalog."default"
+)
+TABLESPACE pg_default;
+
+```
+
 ## 配置文件
 
 程序默认从项目根目录读取 `config.yaml`。
@@ -57,7 +94,7 @@ tasks:
 
 - `name`：任务名称。
   - 当配置了 `sources[].src_incr_field` 时必填。
-  - 该值会写入 watermark 表 `manager.job_data_sync_v2.job_name`。
+  - 该值会写入 watermark 表 `manager.job_data_sync.job_name`。
 - `type`：任务类型，目前示例使用 `query`。
 - `comment`：可选备注。
 - `sources`：源配置列表。
@@ -188,7 +225,7 @@ tasks:
 
 ## Watermark 说明
 
-当 source 配置了 `src_incr_field` 且 target 使用增量相关流程时，程序会访问 `manager.job_data_sync_v2`。
+当 source 配置了 `src_incr_field` 且 target 使用增量相关流程时，程序会访问 `manager.job_data_sync`。
 
 当前匹配键为：
 

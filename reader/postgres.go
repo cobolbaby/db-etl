@@ -48,7 +48,7 @@ func (pgDialect) getColumnHandler(dbType string) ColHandler {
 	case "DATETIME", "DATE", "TIME":
 		return func(v any) string {
 			if t, ok := v.(time.Time); ok && !t.IsZero() {
-				return t.Format("2006-01-02 15:04:05")
+				return t.Format("2006-01-02 15:04:05.000")
 			}
 			return ""
 		}

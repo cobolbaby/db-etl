@@ -275,7 +275,7 @@ func (d *pgWriterDialect) insertTarget(ctx context.Context, tx pgx.Tx, staging s
 
 func (d *pgWriterDialect) computeWatermark(ctx context.Context, tx pgx.Tx, staging string, source *config.SourceConfig) (string, error) {
 	sql := fmt.Sprintf(
-		`SELECT COALESCE(MAX(%s), '') FROM %s`,
+		`SELECT COALESCE(MAX(%s)::text, '') FROM %s`,
 		source.IncrField,
 		staging,
 	)
@@ -298,7 +298,7 @@ func (d *pgWriterDialect) updateWatermark(ctx context.Context, tx pgx.Tx, wm str
 
 	tag, err := tx.Exec(
 		ctx,
-		`UPDATE manager.job_data_sync_v2
+		`UPDATE manager.job_data_sync
             SET incr_point = $1
           WHERE job_name = $2
 		    AND src_schema_name = $3
@@ -317,7 +317,7 @@ func (d *pgWriterDialect) updateWatermark(ctx context.Context, tx pgx.Tx, wm str
 
 	_, err = tx.Exec(
 		ctx,
-		`INSERT INTO manager.job_data_sync_v2
+		`INSERT INTO manager.job_data_sync
 		    (job_name, src_schema_name, src_table_name, dst_schema_name, dst_table_name, incr_point)
 		  VALUES ($1, $2, $3, $4, $5, $6)`,
 		funcName, srcSchema, srcTable, dstSchema, dstTable, wm,
@@ -340,7 +340,7 @@ func (d *pgWriterDialect) getWatermark(target *config.TargetConfig, source *conf
 	err = d.conn.QueryRow(
 		context.Background(),
 		`SELECT COALESCE(incr_point, '')
-           FROM manager.job_data_sync_v2
+           FROM manager.job_data_sync
           WHERE job_name = $1
 		    AND src_schema_name = $2
 		    AND src_table_name = $3
@@ -350,15 +350,44 @@ func (d *pgWriterDialect) getWatermark(target *config.TargetConfig, source *conf
 		funcName, srcSchema, srcTable, dstSchema, dstTable,
 	).Scan(&wm)
 
-	if err == pgx.ErrNoRows {
-		return "", nil
-	}
-	if err != nil {
+	if err != nil && err != pgx.ErrNoRows {
 		return "", err
+	}
+
+	// 如果 job_data_sync 中没有记录或 incr_point 为空，回退到从目标表查增量字段最大值
+	if wm == "" && source.IncrField != "" {
+		ctx := context.Background()
+		fallbackSQL := fmt.Sprintf(`SELECT COALESCE(MAX(%s)::text, '') FROM %s`, source.IncrField, target.Table)
+		var fallback string
+		if err := d.conn.QueryRow(ctx, fallbackSQL).Scan(&fallback); err != nil {
+			return "", fmt.Errorf("fallback watermark query failed: %w", err)
+		}
+		if fallback != "" {
+			log.Printf("watermark fallback: using MAX(%s)=%s from table %s", source.IncrField, fallback, target.Table)
+			return fallback, nil
+		}
+		// 目标表也无数据，根据字段名推算兜底值
+		defaultWM := defaultIncrPoint(source.IncrField)
+		log.Printf("watermark fallback: no data in table %s, using default %s=%s", target.Table, source.IncrField, defaultWM)
+		return defaultWM, nil
 	}
 
 	return wm, nil
 }
+
+// defaultIncrPoint 根据字段名推断兜底的增量起点：
+// 包含 time/date/at/updated/created 等关键词时返回 "1970-01-01 00:00:00.000"，否则返回 "1"。
+func defaultIncrPoint(incrField string) string {
+	lower := strings.ToLower(incrField)
+	timeKeywords := []string{"cdt", "udt", "created", "updated", "modified", "ts"}
+	for _, kw := range timeKeywords {
+		if strings.Contains(lower, kw) {
+			return "1970-01-01 00:00:00.000"
+		}
+	}
+	return "1"
+}
+
 func splitQualifiedName(name string) (string, string, error) {
 	trimmed := strings.TrimSpace(name)
 	if trimmed == "" {

@@ -82,9 +82,6 @@ func runTask(task config.TaskConfig, dbRegistry map[string]config.DBConfig) erro
 			return fmt.Errorf("target db not found: %s", task.Target.DBName)
 		}
 
-		log.Printf("Source DB: %s", src.DBName)
-		log.Printf("Target DB: %s", task.Target.DBName)
-
 		// -----------------------------
 		// Writer
 		// -----------------------------

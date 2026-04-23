@@ -45,26 +45,49 @@ func watermarkJobName(jobName string) string {
 	return strings.TrimSpace(jobName)
 }
 
-func watermarkSourceParts(source *config.SourceConfig) (string, string, error) {
+// wmSource holds the resolved identity of a source for watermark queries.
+// Exactly one of (Schema+Table) or RawSQL is non-empty.
+type wmSource struct {
+	Schema string
+	Table  string
+	RawSQL string
+}
+
+func sourceIdentity(source *config.SourceConfig) (wmSource, error) {
 	if source == nil {
-		return "", "", fmt.Errorf("source config is required for watermark")
+		return wmSource{}, fmt.Errorf("source config is required for watermark")
 	}
 
 	if table := strings.TrimSpace(source.Table); table != "" {
-		return splitQualifiedName(table)
+		schema, tbl, err := splitQualifiedName(table)
+		if err != nil {
+			return wmSource{}, err
+		}
+		return wmSource{Schema: schema, Table: tbl}, nil
 	}
 
-	if strings.TrimSpace(source.SQL) != "" {
-		return splitQualifiedName(strings.TrimSpace(source.SQLName))
+	if sql := strings.TrimSpace(source.SQL); sql != "" {
+		return wmSource{RawSQL: sql}, nil
 	}
 
-	return "", "", fmt.Errorf("source identity is required for watermark")
+	return wmSource{}, fmt.Errorf("source identity is required for watermark")
 }
 
-func watermarkTargetParts(target *config.TargetConfig) (string, string, error) {
+// wmTarget holds the resolved identity of a destination table for watermark queries.
+type wmTarget struct {
+	Schema string
+	Table  string
+}
+
+func targetIdentity(target *config.TargetConfig) (wmTarget, error) {
 	if target == nil {
-		return "", "", fmt.Errorf("target config is required for watermark")
+		return wmTarget{}, fmt.Errorf("target config is required for watermark")
 	}
 
-	return splitQualifiedName(target.Table)
+	schema, tbl, err := splitQualifiedName(target.Table)
+	if err != nil {
+		return wmTarget{}, err
+	}
+
+	return wmTarget{Schema: schema, Table: tbl}, nil
 }

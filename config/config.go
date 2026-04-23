@@ -49,9 +49,8 @@ const (
 )
 
 type SourceConfig struct {
-	DBName    string `yaml:"dbname"`
-	SQLName   string `yaml:"sql_name"`
-	SQL       string `yaml:"sql"`
+	DBName string `yaml:"dbname"`
+	SQL    string `yaml:"sql"`
 	Table     string `yaml:"table"` // SQL 和 Table 至少要指定一个，SQL 优先级更高
 	BatchSize int    `yaml:"batch_size"`
 	Mode      ModeType
@@ -149,19 +148,9 @@ func (c *Config) Validate() error {
 				return fmt.Errorf("sql and table cannot both be specified")
 			}
 
-			if strings.TrimSpace(s.IncrField) != "" {
-				if strings.TrimSpace(t.Name) == "" {
-					return fmt.Errorf("task name is required when source src_incr_field is configured")
-				}
-
-				if strings.TrimSpace(s.SQL) != "" {
-					if strings.TrimSpace(s.SQLName) == "" {
-						return fmt.Errorf("source sql_name is required when source src_incr_field is configured for sql source")
-					}
-				} else if strings.TrimSpace(s.Table) == "" {
-					return fmt.Errorf("source table is required when source src_incr_field is configured for table source")
-				}
-			}
+			// if strings.TrimSpace(s.IncrField) != "" {
+			// 	// ...
+			// }
 		}
 	}
 

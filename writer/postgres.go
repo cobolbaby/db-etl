@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 )
 
 type PGWriter struct {
@@ -287,68 +288,124 @@ func (d *pgWriterDialect) computeWatermark(ctx context.Context, tx pgx.Tx, stagi
 
 func (d *pgWriterDialect) updateWatermark(ctx context.Context, tx pgx.Tx, wm string, target *config.TargetConfig, source *config.SourceConfig, jobName string) error {
 	funcName := watermarkJobName(jobName)
-	srcSchema, srcTable, err := watermarkSourceParts(source)
+	src, err := sourceIdentity(source)
 	if err != nil {
 		return err
 	}
-	dstSchema, dstTable, err := watermarkTargetParts(target)
+	dst, err := targetIdentity(target)
 	if err != nil {
 		return err
 	}
 
-	tag, err := tx.Exec(
-		ctx,
-		`UPDATE manager.job_data_sync
-            SET incr_point = $1
-          WHERE job_name = $2
-		    AND src_schema_name = $3
-		    AND src_table_name = $4
-		    AND dst_schema_name = $5
-		    AND dst_table_name = $6`,
-		wm, funcName, srcSchema, srcTable, dstSchema, dstTable,
-	)
-	if err != nil {
-		return err
+	now := time.Now()
+
+	var tag pgconn.CommandTag
+	var execErr error
+	if src.RawSQL != "" {
+		tag, execErr = tx.Exec(
+			ctx,
+			`UPDATE manager.job_data_sync
+			    SET incr_point      = $1,
+			        sync_mode       = $2,
+			        src_incr_field  = $3,
+			        dst_pk          = $4,
+			        udt             = $5
+			  WHERE job_name        = $6
+			    AND src_rawsql      = $7
+			    AND dst_schema_name = $8
+			    AND dst_table_name  = $9`,
+			wm, string(target.Mode), source.IncrField, target.PK, now,
+			funcName, src.RawSQL, dst.Schema, dst.Table,
+		)
+	} else {
+		tag, execErr = tx.Exec(
+			ctx,
+			`UPDATE manager.job_data_sync
+			    SET incr_point      = $1,
+			        sync_mode       = $2,
+			        src_incr_field  = $3,
+			        dst_pk          = $4,
+			        udt             = $5
+			  WHERE job_name        = $6
+			    AND src_schema_name = $7
+			    AND src_table_name  = $8
+			    AND dst_schema_name = $9
+			    AND dst_table_name  = $10`,
+			wm, string(target.Mode), source.IncrField, target.PK, now,
+			funcName, src.Schema, src.Table, dst.Schema, dst.Table,
+		)
+	}
+	if execErr != nil {
+		return execErr
 	}
 
 	if tag.RowsAffected() > 0 {
 		return nil
 	}
 
-	_, err = tx.Exec(
-		ctx,
-		`INSERT INTO manager.job_data_sync
-		    (job_name, src_schema_name, src_table_name, dst_schema_name, dst_table_name, incr_point)
-		  VALUES ($1, $2, $3, $4, $5, $6)`,
-		funcName, srcSchema, srcTable, dstSchema, dstTable, wm,
-	)
+	if src.RawSQL != "" {
+		_, err = tx.Exec(
+			ctx,
+			`INSERT INTO manager.job_data_sync
+			    (job_name, src_rawsql, dst_schema_name, dst_table_name,
+			     incr_point, sync_mode, src_incr_field, dst_pk, cdt, udt)
+			  VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $9)`,
+			funcName, src.RawSQL, dst.Schema, dst.Table,
+			wm, string(target.Mode), source.IncrField, target.PK, now,
+		)
+	} else {
+		_, err = tx.Exec(
+			ctx,
+			`INSERT INTO manager.job_data_sync
+			    (job_name, src_schema_name, src_table_name, dst_schema_name, dst_table_name,
+			     incr_point, sync_mode, src_incr_field, dst_pk, cdt, udt)
+			  VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $10)`,
+			funcName, src.Schema, src.Table, dst.Schema, dst.Table,
+			wm, string(target.Mode), source.IncrField, target.PK, now,
+		)
+	}
 	return err
 }
 
 func (d *pgWriterDialect) getWatermark(target *config.TargetConfig, source *config.SourceConfig, jobName string) (string, error) {
 	funcName := watermarkJobName(jobName)
-	srcSchema, srcTable, err := watermarkSourceParts(source)
+	src, err := sourceIdentity(source)
 	if err != nil {
 		return "", err
 	}
-	dstSchema, dstTable, err := watermarkTargetParts(target)
+	dst, err := targetIdentity(target)
 	if err != nil {
 		return "", err
 	}
 
+	ctx := context.Background()
 	var wm string
-	err = d.conn.QueryRow(
-		context.Background(),
-		`SELECT COALESCE(incr_point, '')
-           FROM manager.job_data_sync
-          WHERE job_name = $1
-		    AND src_schema_name = $2
-		    AND src_table_name = $3
-		    AND dst_schema_name = $4
-		    AND dst_table_name = $5
-          LIMIT 1`,
-		funcName, srcSchema, srcTable, dstSchema, dstTable,
-	).Scan(&wm)
+	if src.RawSQL != "" {
+		err = d.conn.QueryRow(
+			ctx,
+			`SELECT COALESCE(incr_point, '')
+			   FROM manager.job_data_sync
+			  WHERE job_name = $1
+			    AND src_rawsql = $2
+			    AND dst_schema_name = $3
+			    AND dst_table_name = $4
+			  LIMIT 1`,
+			funcName, src.RawSQL, dst.Schema, dst.Table,
+		).Scan(&wm)
+	} else {
+		err = d.conn.QueryRow(
+			ctx,
+			`SELECT COALESCE(incr_point, '')
+			   FROM manager.job_data_sync
+			  WHERE job_name = $1
+			    AND src_schema_name = $2
+			    AND src_table_name = $3
+			    AND dst_schema_name = $4
+			    AND dst_table_name = $5
+			  LIMIT 1`,
+			funcName, src.Schema, src.Table, dst.Schema, dst.Table,
+		).Scan(&wm)
+	}
 
 	if err != nil && err != pgx.ErrNoRows {
 		return "", err

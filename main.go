@@ -104,7 +104,7 @@ func runTask(task config.TaskConfig, dbRegistry map[string]config.DBConfig) erro
 				return fmt.Errorf("failed to get incr point: %v", err)
 			}
 			src.IncrPoint = incrPoint
-			log.Printf("Incr extraction mode, field: %s, point: %s", src.IncrField, src.IncrPoint)
+			log.Printf("incr extraction mode, target table: %s, field: %s, point: %s", task.Target.Table, src.IncrField, src.IncrPoint)
 		}
 
 		// -----------------------------

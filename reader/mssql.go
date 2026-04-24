@@ -3,6 +3,7 @@ package reader
 import (
 	"database/sql"
 	"db-etl/config"
+	"encoding/hex"
 	"fmt"
 	"strings"
 	"time"
@@ -62,6 +63,14 @@ func (mssqlDialect) getColumnHandler(dbType string) ColHandler {
 		return func(v any) string {
 			if t, ok := v.(time.Time); ok && !t.IsZero() {
 				return t.Format("2006-01-02 15:04:05.000")
+			}
+			return ""
+		}
+	case "IMAGE", "VARBINARY", "BINARY":
+		// PostgreSQL bytea 在 COPY CSV 中使用 \x 十六进制格式
+		return func(v any) string {
+			if b, ok := v.([]byte); ok && len(b) > 0 {
+				return `\x` + hex.EncodeToString(b)
 			}
 			return ""
 		}

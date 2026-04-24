@@ -162,7 +162,7 @@ func (c *Config) Validate() error {
 			// 分段提交时必须保证有序，自动补齐 OrderBy
 			if t.Target.CommitBatchSize > 0 {
 				if s.IncrField == "" {
-					return fmt.Errorf("src_incr_field is required when commit_batch_size > 0")
+					return fmt.Errorf("incr_field is required when commit_batch_size > 0")
 				}
 				if s.OrderBy == "" {
 					s.OrderBy = s.IncrField + " ASC"

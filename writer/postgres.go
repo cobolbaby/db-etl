@@ -159,6 +159,14 @@ func buildCopySQL(table string, columns []string) string {
 }
 
 func (d *pgWriterDialect) writeMerge(in <-chan transform.CSVBatch, target *config.TargetConfig, source *config.SourceConfig, jobName string) error {
+	if target.CommitBatchSize > 0 {
+		return d.writeMergeSegmented(in, target, source, jobName)
+	}
+	return d.writeMergeOnce(in, target, source, jobName)
+}
+
+// writeMergeOnce 在单个事务中完成全量 merge（原有行为）。
+func (d *pgWriterDialect) writeMergeOnce(in <-chan transform.CSVBatch, target *config.TargetConfig, source *config.SourceConfig, jobName string) error {
 	var firstBatch transform.CSVBatch
 	foundRows := false
 	for batch := range in {
@@ -220,6 +228,92 @@ func (d *pgWriterDialect) writeMerge(in <-chan transform.CSVBatch, target *confi
 	)
 
 	return tx.Commit(ctx)
+}
+
+// writeMergeSegmented 将 merge 拆成若干段，每 CommitBatchSize 个 batch 提交一次事务并更新水位。
+// 适用于超大表：中断后重启可从上次已提交的水位断点继续，而不必从头同步。
+func (d *pgWriterDialect) writeMergeSegmented(in <-chan transform.CSVBatch, target *config.TargetConfig, source *config.SourceConfig, jobName string) error {
+	ctx := context.Background()
+	var totalDeleted, totalInserted int64
+	segmentIdx := 0
+
+	// execSegment 在独立事务内完成一段的 COPY → delete+insert → watermark → commit
+	execSegment := func(batches []transform.CSVBatch) error {
+		segmentIdx++
+		tx, err := d.conn.Begin(ctx)
+		if err != nil {
+			return err
+		}
+		defer tx.Rollback(ctx)
+
+		staging := buildTempTableName(target.Table)
+		if err := d.createTempTable(ctx, tx, staging, target); err != nil {
+			return err
+		}
+
+		// 将 []CSVBatch 转成 channel 喂给 writeCopyWithFirstBatch
+		restCh := make(chan transform.CSVBatch, len(batches)-1)
+		for _, b := range batches[1:] {
+			restCh <- b
+		}
+		close(restCh)
+
+		if err := d.writeCopyWithFirstBatch(batches[0], restCh, staging); err != nil {
+			return err
+		}
+
+		deleted, err := d.deleteTarget(ctx, tx, staging, target)
+		if err != nil {
+			return err
+		}
+		inserted, err := d.insertTarget(ctx, tx, staging, target)
+		if err != nil {
+			return err
+		}
+		totalDeleted += deleted
+		totalInserted += inserted
+
+		if source != nil && source.IncrField != "" {
+			maxWM, err := d.computeWatermark(ctx, tx, staging, source)
+			if err != nil {
+				return err
+			}
+			if err := d.updateWatermark(ctx, tx, maxWM, target, source, jobName); err != nil {
+				return err
+			}
+			log.Printf("table=%s segment#%d: deleted=%d inserted=%d watermark=%s",
+				target.Table, segmentIdx, deleted, inserted, maxWM)
+		} else {
+			log.Printf("table=%s segment#%d: deleted=%d inserted=%d",
+				target.Table, segmentIdx, deleted, inserted)
+		}
+
+		return tx.Commit(ctx)
+	}
+
+	segment := make([]transform.CSVBatch, 0, target.CommitBatchSize)
+	for batch := range in {
+		if len(batch.Rows) == 0 {
+			continue
+		}
+		segment = append(segment, batch)
+		if len(segment) >= target.CommitBatchSize {
+			if err := execSegment(segment); err != nil {
+				return err
+			}
+			segment = segment[:0]
+		}
+	}
+
+	if len(segment) > 0 {
+		if err := execSegment(segment); err != nil {
+			return err
+		}
+	}
+
+	log.Printf("table=%s total: deleted=%d inserted=%d segments=%d",
+		target.Table, totalDeleted, totalInserted, segmentIdx)
+	return nil
 }
 
 func (d *pgWriterDialect) createTempTable(ctx context.Context, tx pgx.Tx, staging string, target *config.TargetConfig) error {

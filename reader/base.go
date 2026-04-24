@@ -1,6 +1,7 @@
 package reader
 
 import (
+	"context"
 	"database/sql"
 	"db-etl/config"
 	"db-etl/util"
@@ -8,6 +9,7 @@ import (
 	"log"
 	"strconv"
 	"strings"
+	"time"
 )
 
 type readerDialect interface {
@@ -16,9 +18,18 @@ type readerDialect interface {
 }
 
 type BaseReader struct {
-	DB      *sql.DB
-	Source  *config.SourceConfig
-	dialect readerDialect
+	DB           *sql.DB
+	Source       *config.SourceConfig
+	QueryTimeout time.Duration // 0 表示不限制
+	dialect      readerDialect
+}
+
+// queryContext 返回一个带超时的 context，若 QueryTimeout == 0 则返回 background context。
+func (r *BaseReader) queryContext() (context.Context, context.CancelFunc) {
+	if r.QueryTimeout > 0 {
+		return context.WithTimeout(context.Background(), r.QueryTimeout)
+	}
+	return context.Background(), func() {}
 }
 
 func (r *BaseReader) ReadBatch() <-chan RowBatch {
@@ -33,7 +44,10 @@ func (r *BaseReader) ReadBatch() <-chan RowBatch {
 
 		// log.Println("query: ", query)
 
-		rows, err := r.DB.Query(query)
+		ctx, cancel := r.queryContext()
+		defer cancel()
+
+		rows, err := r.DB.QueryContext(ctx, query)
 		if err != nil {
 			log.Fatal(err)
 		}
@@ -92,7 +106,10 @@ func (r *BaseReader) getColumnTypes() ([]*sql.ColumnType, error) {
 		return nil, err
 	}
 
-	rows, err := r.DB.Query(query)
+	ctx, cancel := r.queryContext()
+	defer cancel()
+
+	rows, err := r.DB.QueryContext(ctx, query)
 	if err != nil {
 		return nil, err
 	}
@@ -115,11 +132,18 @@ func (r *BaseReader) buildReadQuery() (string, error) {
 		strings.Contains(query, "${INCR_POINT}") {
 		query = strings.ReplaceAll(query, "${SRC_INCR_FIELD}", r.Source.IncrField)
 		query = strings.ReplaceAll(query, "${INCR_POINT}", r.Source.IncrPoint)
+		// 占位符模式下用户 SQL 自行控制排序，不再追加
 		return query, nil
 	}
 
 	cond := fmt.Sprintf("%s > %s", r.Source.IncrField, formatSQLValue(r.Source.IncrPoint))
-	return query + " AND " + cond, nil
+	query = query + " AND " + cond
+
+	if r.Source.OrderBy != "" {
+		query += " ORDER BY " + r.Source.OrderBy
+	}
+
+	return query, nil
 }
 
 func defaultColumnHandler(v any) string {

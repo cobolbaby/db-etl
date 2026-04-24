@@ -17,12 +17,13 @@ type MSSQLReader struct {
 
 type mssqlDialect struct{}
 
-func NewMSSQLReader(db *sql.DB, src *config.SourceConfig) Reader {
+func NewMSSQLReader(db *sql.DB, src *config.SourceConfig, queryTimeout time.Duration) Reader {
 	return &MSSQLReader{
 		BaseReader: &BaseReader{
-			DB:      db,
-			Source:  src,
-			dialect: mssqlDialect{},
+			DB:           db,
+			Source:       src,
+			QueryTimeout: queryTimeout,
+			dialect:      mssqlDialect{},
 		},
 	}
 }

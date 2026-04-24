@@ -14,12 +14,13 @@ type PGReader struct {
 
 type pgDialect struct{}
 
-func NewPGReader(db *sql.DB, src *config.SourceConfig) Reader {
+func NewPGReader(db *sql.DB, src *config.SourceConfig, queryTimeout time.Duration) Reader {
 	return &PGReader{
 		BaseReader: &BaseReader{
-			DB:      db,
-			Source:  src,
-			dialect: pgDialect{},
+			DB:           db,
+			Source:       src,
+			QueryTimeout: queryTimeout,
+			dialect:      pgDialect{},
 		},
 	}
 }

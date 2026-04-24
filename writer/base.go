@@ -29,7 +29,7 @@ func (w *BaseWriter) WriteBatch(source *config.SourceConfig, in <-chan transform
 		return w.dialect.writeCopy(in, w.Target.Table)
 	case config.ModeTypeMerge:
 		if w.Target.PK == "" {
-			return fmt.Errorf("dst_pk is required for merge mode")
+			return fmt.Errorf("pk is required for merge mode")
 		}
 		return w.dialect.writeMerge(in, w.Target, source, w.JobName)
 	default:

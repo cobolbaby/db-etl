@@ -24,6 +24,12 @@ type DBConfig struct {
 	User     string `yaml:"user"`
 	Password string `yaml:"password"`
 	Database string `yaml:"database"`
+	// QueryTimeout 单条查询语句的超时（秒），0 表示不限制（默认）。
+	// 仅影响读取端 SELECT 查询; 写入端的 COPY 不受此限制。
+	QueryTimeout int `yaml:"query_timeout"`
+	// StatementTimeout 写入端单条语句的执行超时（秒），0 表示不限制（默认）。
+	// 通过 PostgreSQL 会话参数 statement_timeout 实现; merge 模式下 DELETE+INSERT 耗时较长，建议设为 0（不限制）或足够大的值。
+	StatementTimeout int `yaml:"statement_timeout"`
 }
 
 type DBType string
@@ -49,13 +55,14 @@ const (
 )
 
 type SourceConfig struct {
-	DBName string `yaml:"dbname"`
-	SQL    string `yaml:"sql"`
+	DBName    string `yaml:"dbname"`
+	SQL       string `yaml:"sql"`
 	Table     string `yaml:"table"` // SQL 和 Table 至少要指定一个，SQL 优先级更高
 	BatchSize int    `yaml:"batch_size"`
 	Mode      ModeType
-	IncrField string `yaml:"src_incr_field"` // 用于增量抽取，指定一个日期/时间字段，配合 Watermark 实现增量抽取
-	IncrPoint string `yaml:"incr_point"`     // 增量抽取的起点, 可以是一个具体的日期/时间值，也可以是一个占位符，如 ${WATERMARK}，表示从上次抽取的 Watermark 位置开始抽取
+	IncrField string `yaml:"incr_field"` // 用于增量抽取，指定一个日期/时间字段，配合 Watermark 实现增量抽取
+	IncrPoint string `yaml:"incr_point"` // 增量抽取的起点
+	OrderBy   string `yaml:"order_by"`   // OrderBy 指定查询排序字段。当 target.commit_batch_size > 0 时必须有序，框架会自动设为 src_incr_field，也可手动指定其他表达式（如 "id ASC"）。
 }
 
 type TargetConfig struct {
@@ -63,7 +70,11 @@ type TargetConfig struct {
 	Table     string   `yaml:"table"`
 	Mode      ModeType `yaml:"mode"`
 	IncrField string
-	PK        string `yaml:"dst_pk"`
+	PK        string `yaml:"pk"`
+	// CommitBatchSize 控制 merge 模式下每隔多少个 batch 提交一次事务并更新水位。
+	// 0 表示不分段，整个任务在单个事务中完成（原有行为）。
+	// 适用于超大表，设置后可在中断重启后从上次水位断点续传。
+	CommitBatchSize int `yaml:"commit_batch_size"`
 }
 
 type ModeType string
@@ -148,9 +159,15 @@ func (c *Config) Validate() error {
 				return fmt.Errorf("sql and table cannot both be specified")
 			}
 
-			// if strings.TrimSpace(s.IncrField) != "" {
-			// 	// ...
-			// }
+			// 分段提交时必须保证有序，自动补齐 OrderBy
+			if t.Target.CommitBatchSize > 0 {
+				if s.IncrField == "" {
+					return fmt.Errorf("src_incr_field is required when commit_batch_size > 0")
+				}
+				if s.OrderBy == "" {
+					s.OrderBy = s.IncrField + " ASC"
+				}
+			}
 		}
 	}
 

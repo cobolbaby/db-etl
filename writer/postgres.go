@@ -436,7 +436,7 @@ func (d *pgWriterDialect) getWatermark(target *config.TargetConfig, source *conf
 // 包含 time/date/at/updated/created 等关键词时返回 "1970-01-01 00:00:00.000"，否则返回 "1"。
 func defaultIncrPoint(incrField string) string {
 	lower := strings.ToLower(incrField)
-	timeKeywords := []string{"cdt", "udt", "created", "updated", "modified", "ts"}
+	timeKeywords := []string{"date", "time", "cdt", "udt", "create", "update", "modified"}
 	for _, kw := range timeKeywords {
 		if strings.Contains(lower, kw) {
 			return "1970-01-01 00:00:00.000"

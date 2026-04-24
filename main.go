@@ -51,7 +51,7 @@ func main() {
 		go func(workerID int) {
 			defer wg.Done()
 			for task := range taskCh {
-				log.Printf("[Worker %d] start task", workerID)
+				// log.Printf("[Worker %d] start task", workerID)
 				// 如果 TaskConfig 里没有 Name，就用 Config 的 Name 作为默认值
 				if task.Name == "" {
 					task.Name = cfg.Name
@@ -62,7 +62,7 @@ func main() {
 						log.Fatal(err)
 					}
 				}
-				log.Printf("[Worker %d] finish task", workerID)
+				// log.Printf("[Worker %d] finish task", workerID)
 			}
 		}(i)
 	}

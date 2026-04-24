@@ -43,6 +43,14 @@ func (pgDialect) buildBaseQuery(source *config.SourceConfig, emptyResult bool) (
 	return query, nil
 }
 
+func (pgDialect) formatIncrValue(v string) string {
+	s := strings.TrimSpace(v)
+	if isNumericLiteral(s) {
+		return s
+	}
+	return "'" + s + "'"
+}
+
 func (pgDialect) getColumnHandler(dbType string) ColHandler {
 	switch strings.ToUpper(dbType) {
 

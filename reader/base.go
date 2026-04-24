@@ -15,6 +15,8 @@ import (
 type readerDialect interface {
 	buildBaseQuery(source *config.SourceConfig, emptyResult bool) (string, error)
 	getColumnHandler(dbType string) ColHandler
+	// formatIncrValue 将增量水位字符串格式化为可直接嵌入 SQL 的字面量或函数调用。
+	formatIncrValue(v string) string
 }
 
 type BaseReader struct {
@@ -39,7 +41,7 @@ func (r *BaseReader) ReadBatch() <-chan RowBatch {
 
 		query, err := r.buildReadQuery()
 		if err != nil {
-			log.Fatal(err)
+			log.Fatalf("build query: %v，sql: %s", err, query)
 		}
 
 		// log.Println("query: ", query)
@@ -49,7 +51,7 @@ func (r *BaseReader) ReadBatch() <-chan RowBatch {
 
 		rows, err := r.DB.QueryContext(ctx, query)
 		if err != nil {
-			log.Fatal(err)
+			log.Fatalf("execute query: %v，sql: %s", err, query)
 		}
 		defer rows.Close()
 
@@ -57,7 +59,7 @@ func (r *BaseReader) ReadBatch() <-chan RowBatch {
 
 		cols, err := rows.Columns()
 		if err != nil {
-			log.Fatal(err)
+			log.Fatalf("get columns: %v，sql: %s", err, query)
 		}
 
 		for {
@@ -69,13 +71,13 @@ func (r *BaseReader) ReadBatch() <-chan RowBatch {
 					valuePtrs[i] = &values[i]
 				}
 				if err := rows.Scan(valuePtrs...); err != nil {
-					log.Fatal(err)
+					log.Fatalf("scan row: %v，sql: %s", err, query)
 				}
 				batch = append(batch, values)
 			}
 
 			if err := rows.Err(); err != nil {
-				log.Fatal(err)
+				log.Fatalf("iterate rows: %v，sql: %s", err, query)
 			}
 
 			if len(batch) == 0 {
@@ -90,7 +92,7 @@ func (r *BaseReader) ReadBatch() <-chan RowBatch {
 func (r *BaseReader) GetColumnHandlers() []ColHandler {
 	colTypes, err := r.getColumnTypes()
 	if err != nil {
-		log.Fatal(err)
+		log.Fatalf("get column types: %v", err)
 	}
 
 	handlers := make([]ColHandler, len(colTypes))
@@ -136,7 +138,7 @@ func (r *BaseReader) buildReadQuery() (string, error) {
 		return query, nil
 	}
 
-	cond := fmt.Sprintf("%s > %s", r.Source.IncrField, formatSQLValue(r.Source.IncrPoint))
+	cond := fmt.Sprintf("%s > %s", r.Source.IncrField, r.dialect.formatIncrValue(r.Source.IncrPoint))
 	query = query + " AND " + cond
 
 	if r.Source.OrderBy != "" {
@@ -161,20 +163,31 @@ func defaultColumnHandler(v any) string {
 	}
 }
 
-func formatSQLValue(v string) string {
-	s := strings.TrimSpace(v)
-	if isNumericLiteral(s) {
-		return s
-	}
-	return "'" + s + "'"
-}
-
 func isNumericLiteral(s string) bool {
 	if _, err := strconv.ParseInt(s, 10, 64); err == nil {
 		return true
 	}
 	if _, err := strconv.ParseFloat(s, 64); err == nil {
 		return true
+	}
+	return false
+}
+
+// isDateTimeLiteral 判断字符串是否为日期/时间字面量。
+// 支持 "2006-01-02 15:04:05"、"2006-01-02 15:04:05.999999999" 等常见格式。
+func isDateTimeLiteral(s string) bool {
+	formats := []string{
+		"2006-01-02 15:04:05",
+		"2006-01-02 15:04:05.999999999",
+		"2006-01-02T15:04:05",
+		"2006-01-02T15:04:05.999999999",
+		"2006-01-02T15:04:05Z07:00",
+		"2006-01-02T15:04:05.999999999Z07:00",
+	}
+	for _, f := range formats {
+		if _, err := time.Parse(f, s); err == nil {
+			return true
+		}
 	}
 	return false
 }

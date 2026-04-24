@@ -103,32 +103,6 @@ func (d *pgWriterDialect) writeCopyStream(
 		buf.Reset()
 		return nil
 	}
-	finishWithError := func(err error) error {
-		_ = pw.CloseWithError(err)
-		if copyErr := <-errCh; copyErr != nil {
-			return copyErr
-		}
-		return err
-	}
-	finishCopy := func() error {
-		if err := pw.Close(); err != nil {
-			if copyErr := <-errCh; copyErr != nil {
-				return copyErr
-			}
-			return err
-		}
-
-		log.Println("COPY data sent, waiting for completion...")
-
-		if err := <-errCh; err != nil {
-			log.Println("COPY error:", err)
-			return err
-		}
-
-		log.Println("COPY completed successfully")
-		return nil
-	}
-
 	writeBatch := func(batch transform.CSVBatch) error {
 		if len(batch.Rows) == 0 {
 			return nil
@@ -149,6 +123,31 @@ func (d *pgWriterDialect) writeCopyStream(
 			}
 		}
 
+		return nil
+	}
+	finishWithError := func(err error) error {
+		_ = pw.CloseWithError(err)
+		if copyErr := <-errCh; copyErr != nil {
+			return copyErr
+		}
+		return err
+	}
+	finishCopy := func() error {
+		if err := pw.Close(); err != nil {
+			if copyErr := <-errCh; copyErr != nil {
+				return copyErr
+			}
+			return err
+		}
+
+		log.Printf("COPY %s waiting for completion...", table)
+
+		if err := <-errCh; err != nil {
+			log.Printf("COPY %s error: %v", table, err)
+			return err
+		}
+
+		log.Printf("COPY %s completed successfully", table)
 		return nil
 	}
 
@@ -291,10 +290,7 @@ func (d *pgWriterDialect) writeMergeSegmented(in <-chan transform.CSVBatch, targ
 
 	commitSegment := func() error {
 		close(feedCh)
-		if err := <-copyDone; err != nil {
-			_ = currentTx.Rollback(ctx)
-			return err
-		}
+
 		deleted, err := d.deleteTarget(ctx, currentTx, currentStaging, target)
 		if err != nil {
 			_ = currentTx.Rollback(ctx)
@@ -336,8 +332,20 @@ func (d *pgWriterDialect) writeMergeSegmented(in <-chan transform.CSVBatch, targ
 				return err
 			}
 		}
-		feedCh <- batch
-		batchCount++
+
+		// 同时监听 copyDone：若 copy goroutine 提前退出（如写入出错），
+		// feedCh 将无人消费，直接阻塞在此会造成整条 pipeline 死锁。
+		select {
+		case feedCh <- batch:
+			batchCount++
+		case copyErr := <-copyDone:
+			_ = currentTx.Rollback(ctx)
+			if copyErr != nil {
+				return fmt.Errorf("table=%s copy goroutine failed: %w", target.Table, copyErr)
+			}
+			return fmt.Errorf("table=%s copy goroutine exited unexpectedly", target.Table)
+		}
+
 		if batchCount >= target.CommitBatchSize {
 			if err := commitSegment(); err != nil {
 				return err
@@ -354,11 +362,11 @@ func (d *pgWriterDialect) writeMergeSegmented(in <-chan transform.CSVBatch, targ
 
 	if segmentIdx == 0 {
 		log.Printf("table=%s no incremental rows, skip merge", target.Table)
-		return nil
+	} else {
+		log.Printf("table=%s total: deleted=%d inserted=%d segments=%d",
+			target.Table, totalDeleted, totalInserted, segmentIdx)
 	}
 
-	log.Printf("table=%s total: deleted=%d inserted=%d segments=%d",
-		target.Table, totalDeleted, totalInserted, segmentIdx)
 	return nil
 }
 

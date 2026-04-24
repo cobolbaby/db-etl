@@ -46,6 +46,19 @@ func (mssqlDialect) buildBaseQuery(source *config.SourceConfig, emptyResult bool
 	return query, nil
 }
 
+func (mssqlDialect) formatIncrValue(v string) string {
+	s := strings.TrimSpace(v)
+	if isNumericLiteral(s) {
+		return s
+	}
+	// 仅当值看起来像日期/时间时才显式 CONVERT，避免对字符串类型增量字段误转。
+	// MSSQL 无法隐式解析带微秒精度（6位小数）的时间戳字符串，需显式指定目标类型。
+	if isDateTimeLiteral(s) {
+		return "CONVERT(DATETIME2, '" + s + "')"
+	}
+	return "'" + s + "'"
+}
+
 func (mssqlDialect) getColumnHandler(dbType string) ColHandler {
 	switch strings.ToUpper(dbType) {
 	case "UNIQUEIDENTIFIER":

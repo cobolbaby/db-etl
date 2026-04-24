@@ -55,10 +55,30 @@ func (d *pgWriterDialect) writeCopy(in <-chan transform.CSVBatch, table string) 
 }
 
 func (d *pgWriterDialect) writeCopyWithFirstBatch(firstBatch transform.CSVBatch, in <-chan transform.CSVBatch, table string) error {
+	return d.writeCopyStream(table, firstBatch.Columns, func(write func(transform.CSVBatch) error) error {
+		if err := write(firstBatch); err != nil {
+			return err
+		}
+		for batch := range in {
+			if err := write(batch); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+}
+
+// writeCopyStream 是 COPY 写入的底层实现。
+// columns 用于构建 COPY SQL；iterFn 负责逐个传递所有 batch。
+func (d *pgWriterDialect) writeCopyStream(
+	table string,
+	columns []string,
+	iterFn func(write func(transform.CSVBatch) error) error,
+) error {
 	pr, pw := io.Pipe()
 
 	errCh := make(chan error, 1)
-	copySQL := buildCopySQL(table, firstBatch.Columns)
+	copySQL := buildCopySQL(table, columns)
 
 	go func() {
 		_, err := d.conn.PgConn().CopyFrom(context.Background(), pr, copySQL)
@@ -132,14 +152,8 @@ func (d *pgWriterDialect) writeCopyWithFirstBatch(firstBatch transform.CSVBatch,
 		return nil
 	}
 
-	if err := writeBatch(firstBatch); err != nil {
+	if err := iterFn(writeBatch); err != nil {
 		return finishWithError(err)
-	}
-
-	for batch := range in {
-		if err := writeBatch(batch); err != nil {
-			return finishWithError(err)
-		}
 	}
 
 	if err := flushBuffer(); err != nil {
@@ -232,53 +246,76 @@ func (d *pgWriterDialect) writeMergeOnce(in <-chan transform.CSVBatch, target *c
 
 // writeMergeSegmented 将 merge 拆成若干段，每 CommitBatchSize 个 batch 提交一次事务并更新水位。
 // 适用于超大表：中断后重启可从上次已提交的水位断点继续，而不必从头同步。
+// batch 从 in 直接流入每段的 COPY goroutine，无需缓存到 slice。
 func (d *pgWriterDialect) writeMergeSegmented(in <-chan transform.CSVBatch, target *config.TargetConfig, source *config.SourceConfig, jobName string) error {
 	ctx := context.Background()
 	var totalDeleted, totalInserted int64
 	segmentIdx := 0
 
-	// execSegment 在独立事务内完成一段的 COPY → delete+insert → watermark → commit
-	execSegment := func(batches []transform.CSVBatch) error {
+	// 当前段的状态
+	var (
+		currentTx      pgx.Tx
+		currentStaging string
+		feedCh         chan transform.CSVBatch
+		copyDone       chan error
+		batchCount     int
+	)
+
+	startSegment := func(columns []string) error {
 		segmentIdx++
 		tx, err := d.conn.Begin(ctx)
 		if err != nil {
 			return err
 		}
-		defer tx.Rollback(ctx)
-
 		staging := buildTempTableName(target.Table)
 		if err := d.createTempTable(ctx, tx, staging, target); err != nil {
+			_ = tx.Rollback(ctx)
 			return err
 		}
+		currentTx = tx
+		currentStaging = staging
+		feedCh = make(chan transform.CSVBatch, 1)
+		copyDone = make(chan error, 1)
+		go func() {
+			copyDone <- d.writeCopyStream(staging, columns, func(write func(transform.CSVBatch) error) error {
+				for b := range feedCh {
+					if err := write(b); err != nil {
+						return err
+					}
+				}
+				return nil
+			})
+		}()
+		return nil
+	}
 
-		// 将 []CSVBatch 转成 channel 喂给 writeCopyWithFirstBatch
-		restCh := make(chan transform.CSVBatch, len(batches)-1)
-		for _, b := range batches[1:] {
-			restCh <- b
-		}
-		close(restCh)
-
-		if err := d.writeCopyWithFirstBatch(batches[0], restCh, staging); err != nil {
+	commitSegment := func() error {
+		close(feedCh)
+		if err := <-copyDone; err != nil {
+			_ = currentTx.Rollback(ctx)
 			return err
 		}
-
-		deleted, err := d.deleteTarget(ctx, tx, staging, target)
+		deleted, err := d.deleteTarget(ctx, currentTx, currentStaging, target)
 		if err != nil {
+			_ = currentTx.Rollback(ctx)
 			return err
 		}
-		inserted, err := d.insertTarget(ctx, tx, staging, target)
+		inserted, err := d.insertTarget(ctx, currentTx, currentStaging, target)
 		if err != nil {
+			_ = currentTx.Rollback(ctx)
 			return err
 		}
 		totalDeleted += deleted
 		totalInserted += inserted
 
 		if source != nil && source.IncrField != "" {
-			maxWM, err := d.computeWatermark(ctx, tx, staging, source)
+			maxWM, err := d.computeWatermark(ctx, currentTx, currentStaging, source)
 			if err != nil {
+				_ = currentTx.Rollback(ctx)
 				return err
 			}
-			if err := d.updateWatermark(ctx, tx, maxWM, target, source, jobName); err != nil {
+			if err := d.updateWatermark(ctx, currentTx, maxWM, target, source, jobName); err != nil {
+				_ = currentTx.Rollback(ctx)
 				return err
 			}
 			log.Printf("table=%s segment#%d: deleted=%d inserted=%d watermark=%s",
@@ -287,28 +324,37 @@ func (d *pgWriterDialect) writeMergeSegmented(in <-chan transform.CSVBatch, targ
 			log.Printf("table=%s segment#%d: deleted=%d inserted=%d",
 				target.Table, segmentIdx, deleted, inserted)
 		}
-
-		return tx.Commit(ctx)
+		return currentTx.Commit(ctx)
 	}
 
-	segment := make([]transform.CSVBatch, 0, target.CommitBatchSize)
 	for batch := range in {
 		if len(batch.Rows) == 0 {
 			continue
 		}
-		segment = append(segment, batch)
-		if len(segment) >= target.CommitBatchSize {
-			if err := execSegment(segment); err != nil {
+		if batchCount == 0 {
+			if err := startSegment(batch.Columns); err != nil {
 				return err
 			}
-			segment = segment[:0]
+		}
+		feedCh <- batch
+		batchCount++
+		if batchCount >= target.CommitBatchSize {
+			if err := commitSegment(); err != nil {
+				return err
+			}
+			batchCount = 0
 		}
 	}
 
-	if len(segment) > 0 {
-		if err := execSegment(segment); err != nil {
+	if batchCount > 0 {
+		if err := commitSegment(); err != nil {
 			return err
 		}
+	}
+
+	if segmentIdx == 0 {
+		log.Printf("table=%s no incremental rows, skip merge", target.Table)
+		return nil
 	}
 
 	log.Printf("table=%s total: deleted=%d inserted=%d segments=%d",

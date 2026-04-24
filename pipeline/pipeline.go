@@ -11,7 +11,7 @@ import (
 
 func RunPipeline(source *config.SourceConfig, r reader.Reader, t transform.Transformer, w writer.BatchWriter) error {
 	rowChan := r.ReadBatch()
-	csvChan := make(chan transform.CSVBatch, 8)
+	csvChan := make(chan transform.CSVBatch, 4)
 
 	var wg sync.WaitGroup
 	workers := min(runtime.NumCPU(), 2) // 4 is an empirical value, can be tuned

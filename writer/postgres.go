@@ -291,6 +291,12 @@ func (d *pgWriterDialect) writeMergeSegmented(in <-chan transform.CSVBatch, targ
 	commitSegment := func() error {
 		close(feedCh)
 
+		// 必须等待 COPY goroutine 完全结束，才能在同一连接上执行后续 SQL
+		if copyErr := <-copyDone; copyErr != nil {
+			_ = currentTx.Rollback(ctx)
+			return fmt.Errorf("table=%s COPY failed: %w", target.Table, copyErr)
+		}
+
 		deleted, err := d.deleteTarget(ctx, currentTx, currentStaging, target)
 		if err != nil {
 			_ = currentTx.Rollback(ctx)

@@ -14,6 +14,9 @@ type Config struct {
 	Tasks       []TaskConfig `yaml:"tasks"`
 	Name        string       `yaml:"name"`
 	Comment     string       `yaml:"comment"`
+	// MetaDB 指定存放 manager.job_data_sync 配置表的数据库别名（引用 databases[].name）。
+	// 当通过 -job 参数从数据库加载任务列表时必填。
+	MetaDB string `yaml:"meta_db"`
 }
 
 type DBConfig struct {
@@ -137,8 +140,8 @@ func (c *Config) Validate() error {
 		}
 	}
 
-	if len(c.Tasks) == 0 {
-		return fmt.Errorf("tasks cannot be empty")
+	if len(c.Tasks) == 0 && c.MetaDB == "" {
+		return fmt.Errorf("tasks cannot be empty (set 'meta_db' to load tasks from database)")
 	}
 
 	for _, t := range c.Tasks {

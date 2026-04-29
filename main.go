@@ -1,6 +1,8 @@
 package main
 
 import (
+	"context"
+	"flag"
 	"fmt"
 	"log"
 	"runtime"
@@ -16,7 +18,10 @@ import (
 
 func main() {
 
-	cfg, err := config.LoadConfig("config.yaml")
+	configPath := flag.String("config", "config.yaml", "path to config file")
+	flag.Parse()
+
+	cfg, err := config.LoadConfig(*configPath)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -31,11 +36,36 @@ func main() {
 	}
 
 	// --------------------------------
-	// 2. Task Channel
+	// 2. 确定 Task 列表
 	// --------------------------------
 
-	taskCh := make(chan config.TaskConfig, len(cfg.Tasks))
-	for _, t := range cfg.Tasks {
+	tasks := cfg.Tasks
+
+	if cfg.MetaDB != "" {
+		// 从数据库加载任务列表，job_name 取自 config.yaml 的 name 字段
+		metaDB, ok := dbRegistry[cfg.MetaDB]
+		if !ok {
+			log.Fatalf("meta_db %q not found in databases config", cfg.MetaDB)
+		}
+
+		dbTasks, err := config.LoadTasksFromDB(context.Background(), metaDB, cfg.Name)
+		if err != nil {
+			log.Fatalf("load tasks from db failed: %v", err)
+		}
+		log.Printf("loaded %d task(s) from manager.job_data_sync for job_name=%q", len(dbTasks), cfg.Name)
+		tasks = dbTasks
+	}
+
+	if len(tasks) == 0 {
+		log.Fatal("no tasks to run")
+	}
+
+	// --------------------------------
+	// 3. Task Channel
+	// --------------------------------
+
+	taskCh := make(chan config.TaskConfig, len(tasks))
+	for _, t := range tasks {
 		taskCh <- t
 	}
 	close(taskCh)

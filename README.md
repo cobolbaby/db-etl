@@ -8,7 +8,7 @@
 
 CREATE SCHEMA IF NOT EXISTS manager;
 
-CREATE TABLE IF NOT EXISTS manager.job_data_sync
+CREATE TABLE IF NOT EXISTS manager.job_data_sync_v2
 (
     job_id serial primary key,
     src_schema_name character varying(100) COLLATE pg_catalog."default",
@@ -104,13 +104,13 @@ tasks:
 
 任务定义列表。每个任务将多个 `sources` 的数据写入一个 `target`。
 
-| 字段      | 说明                                                                        |
-| --------- | --------------------------------------------------------------------------- |
-| `name`    | 任务名称，配置了 `incr_field` 时必填，写入 `manager.job_data_sync.job_name` |
-| `type`    | 任务类型，目前支持 `query`                                                  |
-| `comment` | 可选备注                                                                    |
-| `sources` | 源配置列表，见下节                                                          |
-| `target`  | 目标配置，见下节                                                            |
+| 字段      | 说明                                                                           |
+| --------- | ------------------------------------------------------------------------------ |
+| `name`    | 任务名称，配置了 `incr_field` 时必填，写入 `manager.job_data_sync_v2.job_name` |
+| `type`    | 任务类型，目前支持 `query`                                                     |
+| `comment` | 可选备注                                                                       |
+| `sources` | 源配置列表，见下节                                                             |
+| `target`  | 目标配置，见下节                                                               |
 
 ## `sources` 配置
 
@@ -130,7 +130,7 @@ tasks:
 
 - `sql` 和 `table` 至少配置一个，不能同时配置。
 - 使用 `table` 时，watermark 的 `src_schema_name` / `src_table_name` 直接从 `table` 解析。
-- 使用 `sql` 时，watermark 的源标识使用 SQL 文本本身（写入 `manager.job_data_sync.src_rawsql`）。
+- 使用 `sql` 时，watermark 的源标识使用 SQL 文本本身（写入 `manager.job_data_sync_v2.src_rawsql`）。
 
 ### 增量抽取约束
 
@@ -234,7 +234,7 @@ tasks:
 
 ## Watermark 说明
 
-当 source 配置了 `incr_field` 时，程序会读写 `manager.job_data_sync` 表来记录同步进度（水位）。
+当 source 配置了 `incr_field` 时，程序会读写 `manager.job_data_sync_v2` 表来记录同步进度（水位）。
 
 > **注意**：数据库表中的字段名称维持建表语句原样，不随配置 key 的改名而变化。
 
@@ -260,7 +260,7 @@ tasks:
 
 ### 水位回填逻辑（启动时）
 
-1. 查 `manager.job_data_sync.incr_point`
+1. 查 `manager.job_data_sync_v2.incr_point`
 2. 若无记录或为空 → 查目标表 `MAX(incr_field)`
 3. 若目标表也无数据 → 根据字段名推断兜底值（时间类字段返回 `1970-01-01 00:00:00.000`，其他返回 `1`）
 

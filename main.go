@@ -52,7 +52,7 @@ func main() {
 		if err != nil {
 			log.Fatalf("load tasks from db failed: %v", err)
 		}
-		log.Printf("loaded %d task(s) from manager.job_data_sync for job_name=%q", len(dbTasks), cfg.Name)
+		log.Printf("loaded %d task(s) from manager.job_data_sync_v2 for job_name=%q", len(dbTasks), cfg.Name)
 		tasks = dbTasks
 	}
 

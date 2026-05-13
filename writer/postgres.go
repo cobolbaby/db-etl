@@ -458,7 +458,7 @@ func (d *pgWriterDialect) updateWatermark(ctx context.Context, tx pgx.Tx, wm str
 	if src.RawSQL != "" {
 		tag, execErr = tx.Exec(
 			ctx,
-			`UPDATE manager.job_data_sync
+			`UPDATE manager.job_data_sync_v2
 			    SET incr_point      = $1,
 			        sync_mode       = $2,
 			        src_incr_field  = $3,
@@ -474,7 +474,7 @@ func (d *pgWriterDialect) updateWatermark(ctx context.Context, tx pgx.Tx, wm str
 	} else {
 		tag, execErr = tx.Exec(
 			ctx,
-			`UPDATE manager.job_data_sync
+			`UPDATE manager.job_data_sync_v2
 			    SET incr_point      = $1,
 			        sync_mode       = $2,
 			        src_incr_field  = $3,
@@ -500,7 +500,7 @@ func (d *pgWriterDialect) updateWatermark(ctx context.Context, tx pgx.Tx, wm str
 	if src.RawSQL != "" {
 		_, err = tx.Exec(
 			ctx,
-			`INSERT INTO manager.job_data_sync
+			`INSERT INTO manager.job_data_sync_v2
 			    (job_name, src_rawsql, dst_schema_name, dst_table_name,
 			     incr_point, sync_mode, src_incr_field, dst_pk, cdt, udt)
 			  VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $9)`,
@@ -510,7 +510,7 @@ func (d *pgWriterDialect) updateWatermark(ctx context.Context, tx pgx.Tx, wm str
 	} else {
 		_, err = tx.Exec(
 			ctx,
-			`INSERT INTO manager.job_data_sync
+			`INSERT INTO manager.job_data_sync_v2
 			    (job_name, src_schema_name, src_table_name, dst_schema_name, dst_table_name,
 			     incr_point, sync_mode, src_incr_field, dst_pk, cdt, udt)
 			  VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $10)`,
@@ -538,7 +538,7 @@ func (d *pgWriterDialect) getWatermark(target *config.TargetConfig, source *conf
 		err = d.conn.QueryRow(
 			ctx,
 			`SELECT COALESCE(incr_point, '')
-			   FROM manager.job_data_sync
+			   FROM manager.job_data_sync_v2
 			  WHERE job_name = $1
 			    AND src_rawsql = $2
 			    AND dst_schema_name = $3
@@ -550,7 +550,7 @@ func (d *pgWriterDialect) getWatermark(target *config.TargetConfig, source *conf
 		err = d.conn.QueryRow(
 			ctx,
 			`SELECT COALESCE(incr_point, '')
-			   FROM manager.job_data_sync
+			   FROM manager.job_data_sync_v2
 			  WHERE job_name = $1
 			    AND src_schema_name = $2
 			    AND src_table_name = $3

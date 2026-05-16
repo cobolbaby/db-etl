@@ -35,18 +35,20 @@ func NewPGWriter(conn *pgx.Conn, target *config.TargetConfig, jobName string) Wr
 	return &PGWriter{BaseWriter: base}
 }
 
-func (d *pgWriterDialect) writeFull(in <-chan transform.CSVBatch, target *config.TargetConfig) error {
-
-	var firstBatch transform.CSVBatch
-	foundRows := false
+// drainFirstBatch 从 channel 中取出第一个非空 batch，用于获取列信息并启动后续写入。
+func drainFirstBatch(in <-chan transform.CSVBatch) (transform.CSVBatch, bool) {
 	for batch := range in {
 		if len(batch.Rows) == 0 {
 			continue
 		}
-		firstBatch = batch
-		foundRows = true
-		break
+		return batch, true
 	}
+	return transform.CSVBatch{}, false
+}
+
+func (d *pgWriterDialect) writeFull(in <-chan transform.CSVBatch, target *config.TargetConfig) error {
+
+	firstBatch, foundRows := drainFirstBatch(in)
 
 	if !foundRows {
 		log.Printf("table=%s full refresh finished: no rows to load", target.Table)
@@ -67,7 +69,7 @@ func (d *pgWriterDialect) writeFull(in <-chan transform.CSVBatch, target *config
 			return err
 		}
 
-		log.Printf("table=%s TRUNCATE 等待锁超时，退避为 DELETE FROM", target.Table)
+		log.Printf("table=%s TRUNCATE lock timeout, falling back to DELETE FROM", target.Table)
 
 		_ = tx.Rollback(ctx)
 
@@ -80,7 +82,7 @@ func (d *pgWriterDialect) writeFull(in <-chan transform.CSVBatch, target *config
 		if _, err := tx.Exec(ctx, fmt.Sprintf("DELETE FROM %s", target.Table)); err != nil {
 			return err
 		}
-		log.Printf("table=%s DELETE FROM 完成", target.Table)
+		log.Printf("table=%s DELETE FROM completed", target.Table)
 	}
 
 	// 使用事务所在连接执行 COPY，确保 COPY 与清表操作在同一事务内原子提交。
@@ -92,7 +94,6 @@ func (d *pgWriterDialect) writeFull(in <-chan transform.CSVBatch, target *config
 	return tx.Commit(ctx)
 }
 
-// TODO:
 func (d *pgWriterDialect) writeAppend(in <-chan transform.CSVBatch, target *config.TargetConfig, source *config.SourceConfig, jobName string) error {
 	if target.CommitBatchSize > 0 {
 		return d.writeIncrSegmented(in, target, source, jobName, false)
@@ -101,16 +102,7 @@ func (d *pgWriterDialect) writeAppend(in <-chan transform.CSVBatch, target *conf
 }
 
 func (d *pgWriterDialect) writeCopy(in <-chan transform.CSVBatch, target *config.TargetConfig) error {
-	var firstBatch transform.CSVBatch
-	foundRows := false
-	for batch := range in {
-		if len(batch.Rows) == 0 {
-			continue
-		}
-		firstBatch = batch
-		foundRows = true
-		break
-	}
+	firstBatch, foundRows := drainFirstBatch(in)
 
 	if !foundRows {
 		log.Printf("table=%s no rows to copy, skip", target.Table)
@@ -249,16 +241,7 @@ func (d *pgWriterDialect) writeMerge(in <-chan transform.CSVBatch, target *confi
 // writeIncrOnce 在单个事务中完成增量写入（append / merge 共用）。
 // needDelete=true 时先按 PK 从目标表删除重复行（merge 语义），false 时仅追加（append 语义）。
 func (d *pgWriterDialect) writeIncrOnce(in <-chan transform.CSVBatch, target *config.TargetConfig, source *config.SourceConfig, jobName string, needDelete bool) error {
-	var firstBatch transform.CSVBatch
-	foundRows := false
-	for batch := range in {
-		if len(batch.Rows) == 0 {
-			continue
-		}
-		firstBatch = batch
-		foundRows = true
-		break
-	}
+	firstBatch, foundRows := drainFirstBatch(in)
 
 	if !foundRows {
 		log.Printf("table=%s no incremental rows, skip", target.Table)
@@ -481,25 +464,19 @@ func (d *pgWriterDialect) createTempTable(ctx context.Context, tx pgx.Tx, stagin
 	return err
 }
 
-func (d *pgWriterDialect) truncateTarget(ctx context.Context, tx pgx.Tx, target *config.TargetConfig) error {
-	_, err := tx.Exec(ctx, fmt.Sprintf(`TRUNCATE TABLE %s`, target.Table))
-	return err
-}
-
 // tryTruncateWithTimeout 尝试在事务内执行带 lock_timeout 的 TRUNCATE。
 // 若 TRUNCATE 因锁等待超时失败，返回 lock_timeout 错误（55P03），由调用方决定后续退避策略。
 // TruncateTimeout=0 使用默认 30 秒；负值表示不设超时直接 TRUNCATE。
 func (d *pgWriterDialect) tryTruncateWithTimeout(ctx context.Context, tx pgx.Tx, target *config.TargetConfig) error {
 	timeout := target.TruncateTimeout
-	if timeout < 0 {
-		return d.truncateTarget(ctx, tx, target)
-	}
 	if timeout == 0 {
 		timeout = 30
 	}
 
-	if _, err := tx.Exec(ctx, fmt.Sprintf("SET LOCAL lock_timeout = '%ds'", timeout)); err != nil {
-		return err
+	if timeout > 0 {
+		if _, err := tx.Exec(ctx, fmt.Sprintf("SET LOCAL lock_timeout = '%ds'", timeout)); err != nil {
+			return err
+		}
 	}
 
 	_, err := tx.Exec(ctx, fmt.Sprintf("TRUNCATE TABLE %s", target.Table))

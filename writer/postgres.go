@@ -5,6 +5,7 @@ import (
 	"context"
 	"db-etl/config"
 	"db-etl/transform"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -60,11 +61,30 @@ func (d *pgWriterDialect) writeFull(in <-chan transform.CSVBatch, target *config
 	}
 	defer tx.Rollback(ctx)
 
-	if err := d.truncateTarget(ctx, tx, target); err != nil {
-		return err
+	// 尝试带超时的 TRUNCATE；若锁等待超时则回滚当前事务，开新事务用 DELETE FROM 退避
+	if err := d.tryTruncateWithTimeout(ctx, tx, target); err != nil {
+		if !isLockTimeoutError(err) {
+			return err
+		}
+
+		log.Printf("table=%s TRUNCATE 等待锁超时，退避为 DELETE FROM", target.Table)
+
+		_ = tx.Rollback(ctx)
+
+		tx, err = d.conn.Begin(ctx)
+		if err != nil {
+			return err
+		}
+		defer tx.Rollback(ctx)
+
+		if _, err := tx.Exec(ctx, fmt.Sprintf("DELETE FROM %s", target.Table)); err != nil {
+			return err
+		}
+		log.Printf("table=%s DELETE FROM 完成", target.Table)
 	}
 
-	if err := d.writeCopyWithFirstBatch(firstBatch, in, target.Table); err != nil {
+	// 使用事务所在连接执行 COPY，确保 COPY 与清表操作在同一事务内原子提交。
+	if err := d.writeCopyWithFirstBatch(firstBatch, in, target.Table, tx.Conn()); err != nil {
 		return err
 	}
 
@@ -74,7 +94,10 @@ func (d *pgWriterDialect) writeFull(in <-chan transform.CSVBatch, target *config
 
 // TODO:
 func (d *pgWriterDialect) writeAppend(in <-chan transform.CSVBatch, target *config.TargetConfig, source *config.SourceConfig, jobName string) error {
-	return nil
+	if target.CommitBatchSize > 0 {
+		return d.writeIncrSegmented(in, target, source, jobName, false)
+	}
+	return d.writeIncrOnce(in, target, source, jobName, false)
 }
 
 func (d *pgWriterDialect) writeCopy(in <-chan transform.CSVBatch, target *config.TargetConfig) error {
@@ -94,11 +117,11 @@ func (d *pgWriterDialect) writeCopy(in <-chan transform.CSVBatch, target *config
 		return nil
 	}
 
-	return d.writeCopyWithFirstBatch(firstBatch, in, target.Table)
+	return d.writeCopyWithFirstBatch(firstBatch, in, target.Table, d.conn)
 }
 
-func (d *pgWriterDialect) writeCopyWithFirstBatch(firstBatch transform.CSVBatch, in <-chan transform.CSVBatch, table string) error {
-	return d.writeCopyStream(table, firstBatch.Columns, func(write func(transform.CSVBatch) error) error {
+func (d *pgWriterDialect) writeCopyWithFirstBatch(firstBatch transform.CSVBatch, in <-chan transform.CSVBatch, table string, conn *pgx.Conn) error {
+	return d.writeCopyStream(table, firstBatch.Columns, conn, func(write func(transform.CSVBatch) error) error {
 		if err := write(firstBatch); err != nil {
 			return err
 		}
@@ -112,10 +135,12 @@ func (d *pgWriterDialect) writeCopyWithFirstBatch(firstBatch transform.CSVBatch,
 }
 
 // writeCopyStream 是 COPY 写入的底层实现。
-// columns 用于构建 COPY SQL；iterFn 负责逐个传递所有 batch。
+// columns 用于构建 COPY SQL；conn 为执行 COPY 的连接（可传入 tx.Conn() 以确保在同一事务内）；
+// iterFn 负责逐个传递所有 batch。
 func (d *pgWriterDialect) writeCopyStream(
 	table string,
 	columns []string,
+	conn *pgx.Conn,
 	iterFn func(write func(transform.CSVBatch) error) error,
 ) error {
 	pr, pw := io.Pipe()
@@ -124,7 +149,7 @@ func (d *pgWriterDialect) writeCopyStream(
 	copySQL := buildCopySQL(table, columns)
 
 	go func() {
-		_, err := d.conn.PgConn().CopyFrom(context.Background(), pr, copySQL)
+		_, err := conn.PgConn().CopyFrom(context.Background(), pr, copySQL)
 		if err != nil {
 			_ = pr.CloseWithError(err)
 		} else {
@@ -216,13 +241,14 @@ func buildCopySQL(table string, columns []string) string {
 
 func (d *pgWriterDialect) writeMerge(in <-chan transform.CSVBatch, target *config.TargetConfig, source *config.SourceConfig, jobName string) error {
 	if target.CommitBatchSize > 0 {
-		return d.writeMergeSegmented(in, target, source, jobName)
+		return d.writeIncrSegmented(in, target, source, jobName, true)
 	}
-	return d.writeMergeOnce(in, target, source, jobName)
+	return d.writeIncrOnce(in, target, source, jobName, true)
 }
 
-// writeMergeOnce 在单个事务中完成全量 merge（原有行为）。
-func (d *pgWriterDialect) writeMergeOnce(in <-chan transform.CSVBatch, target *config.TargetConfig, source *config.SourceConfig, jobName string) error {
+// writeIncrOnce 在单个事务中完成增量写入（append / merge 共用）。
+// needDelete=true 时先按 PK 从目标表删除重复行（merge 语义），false 时仅追加（append 语义）。
+func (d *pgWriterDialect) writeIncrOnce(in <-chan transform.CSVBatch, target *config.TargetConfig, source *config.SourceConfig, jobName string, needDelete bool) error {
 	var firstBatch transform.CSVBatch
 	foundRows := false
 	for batch := range in {
@@ -235,7 +261,7 @@ func (d *pgWriterDialect) writeMergeOnce(in <-chan transform.CSVBatch, target *c
 	}
 
 	if !foundRows {
-		log.Printf("table=%s no incremental rows, skip merge", target.Table)
+		log.Printf("table=%s no incremental rows, skip", target.Table)
 		return nil
 	}
 
@@ -253,13 +279,16 @@ func (d *pgWriterDialect) writeMergeOnce(in <-chan transform.CSVBatch, target *c
 		return err
 	}
 
-	if err := d.writeCopyWithFirstBatch(firstBatch, in, staging); err != nil {
+	if err := d.writeCopyWithFirstBatch(firstBatch, in, staging, tx.Conn()); err != nil {
 		return err
 	}
 
-	deleted, err := d.deleteTarget(ctx, tx, staging, target)
-	if err != nil {
-		return err
+	var deleted int64
+	if needDelete {
+		deleted, err = d.deleteTarget(ctx, tx, staging, target)
+		if err != nil {
+			return err
+		}
 	}
 
 	inserted, err := d.insertTarget(ctx, tx, staging, target)
@@ -278,18 +307,19 @@ func (d *pgWriterDialect) writeMergeOnce(in <-chan transform.CSVBatch, target *c
 		}
 	}
 
-	log.Printf(
-		"table=%s deleted=%d inserted=%d\n",
-		target.Table, deleted, inserted,
-	)
+	if needDelete {
+		log.Printf("table=%s deleted=%d inserted=%d\n", target.Table, deleted, inserted)
+	} else {
+		log.Printf("table=%s appended=%d\n", target.Table, inserted)
+	}
 
 	return tx.Commit(ctx)
 }
 
-// writeMergeSegmented 将 merge 拆成若干段，每 CommitBatchSize 个 batch 提交一次事务并更新水位。
+// writeIncrSegmented 将增量写入拆成若干段，每 CommitBatchSize 个 batch 提交一次事务并更新水位。
+// needDelete=true 时每段先 DELETE 再 INSERT（merge），false 时仅 INSERT（append）。
 // 适用于超大表：中断后重启可从上次已提交的水位断点继续，而不必从头同步。
-// batch 从 in 直接流入每段的 COPY goroutine，无需缓存到 slice。
-func (d *pgWriterDialect) writeMergeSegmented(in <-chan transform.CSVBatch, target *config.TargetConfig, source *config.SourceConfig, jobName string) error {
+func (d *pgWriterDialect) writeIncrSegmented(in <-chan transform.CSVBatch, target *config.TargetConfig, source *config.SourceConfig, jobName string, needDelete bool) error {
 	ctx := context.Background()
 	var totalDeleted, totalInserted int64
 	segmentIdx := 0
@@ -318,8 +348,8 @@ func (d *pgWriterDialect) writeMergeSegmented(in <-chan transform.CSVBatch, targ
 		currentStaging = staging
 		feedCh = make(chan transform.CSVBatch, 1)
 		copyDone = make(chan error, 1)
-		go func() {
-			copyDone <- d.writeCopyStream(staging, columns, func(write func(transform.CSVBatch) error) error {
+		go func(txConn *pgx.Conn) {
+			copyDone <- d.writeCopyStream(staging, columns, txConn, func(write func(transform.CSVBatch) error) error {
 				for b := range feedCh {
 					if err := write(b); err != nil {
 						return err
@@ -327,7 +357,7 @@ func (d *pgWriterDialect) writeMergeSegmented(in <-chan transform.CSVBatch, targ
 				}
 				return nil
 			})
-		}()
+		}(tx.Conn())
 		return nil
 	}
 
@@ -340,11 +370,16 @@ func (d *pgWriterDialect) writeMergeSegmented(in <-chan transform.CSVBatch, targ
 			return fmt.Errorf("table=%s COPY failed: %w", target.Table, copyErr)
 		}
 
-		deleted, err := d.deleteTarget(ctx, currentTx, currentStaging, target)
-		if err != nil {
-			_ = currentTx.Rollback(ctx)
-			return err
+		var deleted int64
+		if needDelete {
+			var err error
+			deleted, err = d.deleteTarget(ctx, currentTx, currentStaging, target)
+			if err != nil {
+				_ = currentTx.Rollback(ctx)
+				return err
+			}
 		}
+
 		inserted, err := d.insertTarget(ctx, currentTx, currentStaging, target)
 		if err != nil {
 			_ = currentTx.Rollback(ctx)
@@ -363,11 +398,21 @@ func (d *pgWriterDialect) writeMergeSegmented(in <-chan transform.CSVBatch, targ
 				_ = currentTx.Rollback(ctx)
 				return err
 			}
-			log.Printf("table=%s segment#%d: deleted=%d inserted=%d watermark=%s",
-				target.Table, segmentIdx, deleted, inserted, maxWM)
+			if needDelete {
+				log.Printf("table=%s segment#%d: deleted=%d inserted=%d watermark=%s",
+					target.Table, segmentIdx, deleted, inserted, maxWM)
+			} else {
+				log.Printf("table=%s segment#%d: appended=%d watermark=%s",
+					target.Table, segmentIdx, inserted, maxWM)
+			}
 		} else {
-			log.Printf("table=%s segment#%d: deleted=%d inserted=%d",
-				target.Table, segmentIdx, deleted, inserted)
+			if needDelete {
+				log.Printf("table=%s segment#%d: deleted=%d inserted=%d",
+					target.Table, segmentIdx, deleted, inserted)
+			} else {
+				log.Printf("table=%s segment#%d: appended=%d",
+					target.Table, segmentIdx, inserted)
+			}
 		}
 		return currentTx.Commit(ctx)
 	}
@@ -410,10 +455,13 @@ func (d *pgWriterDialect) writeMergeSegmented(in <-chan transform.CSVBatch, targ
 	}
 
 	if segmentIdx == 0 {
-		log.Printf("table=%s no incremental rows, skip merge", target.Table)
-	} else {
+		log.Printf("table=%s no incremental rows, skip", target.Table)
+	} else if needDelete {
 		log.Printf("table=%s total: deleted=%d inserted=%d segments=%d",
 			target.Table, totalDeleted, totalInserted, segmentIdx)
+	} else {
+		log.Printf("table=%s total: appended=%d segments=%d",
+			target.Table, totalInserted, segmentIdx)
 	}
 
 	return nil
@@ -436,6 +484,32 @@ func (d *pgWriterDialect) createTempTable(ctx context.Context, tx pgx.Tx, stagin
 func (d *pgWriterDialect) truncateTarget(ctx context.Context, tx pgx.Tx, target *config.TargetConfig) error {
 	_, err := tx.Exec(ctx, fmt.Sprintf(`TRUNCATE TABLE %s`, target.Table))
 	return err
+}
+
+// tryTruncateWithTimeout 尝试在事务内执行带 lock_timeout 的 TRUNCATE。
+// 若 TRUNCATE 因锁等待超时失败，返回 lock_timeout 错误（55P03），由调用方决定后续退避策略。
+// TruncateTimeout=0 使用默认 30 秒；负值表示不设超时直接 TRUNCATE。
+func (d *pgWriterDialect) tryTruncateWithTimeout(ctx context.Context, tx pgx.Tx, target *config.TargetConfig) error {
+	timeout := target.TruncateTimeout
+	if timeout < 0 {
+		return d.truncateTarget(ctx, tx, target)
+	}
+	if timeout == 0 {
+		timeout = 30
+	}
+
+	if _, err := tx.Exec(ctx, fmt.Sprintf("SET LOCAL lock_timeout = '%ds'", timeout)); err != nil {
+		return err
+	}
+
+	_, err := tx.Exec(ctx, fmt.Sprintf("TRUNCATE TABLE %s", target.Table))
+	return err
+}
+
+// isLockTimeoutError 判断是否为 PostgreSQL lock_timeout 触发的错误（错误码 55P03）。
+func isLockTimeoutError(err error) bool {
+	var pgErr *pgconn.PgError
+	return errors.As(err, &pgErr) && pgErr.Code == "55P03"
 }
 
 func (d *pgWriterDialect) deleteTarget(

@@ -297,6 +297,10 @@ type TargetConfig struct {
 	// 0 表示不分段，整个任务在单个事务中完成（原有行为）。
 	// 适用于超大表，设置后可在中断重启后从上次水位断点续传。
 	CommitBatchSize int `yaml:"commit_batch_size"`
+	// TruncateTimeout full 模式下 TRUNCATE 尝试获取锁的超时时间（秒）。
+	// 超时后自动退避为 DELETE FROM，以避免长时间阻塞下游。
+	// 0 表示使用默认值（30 秒），负值表示不设超时（不退避）。
+	TruncateTimeout int `yaml:"truncate_timeout"`
 }
 
 type ModeType string

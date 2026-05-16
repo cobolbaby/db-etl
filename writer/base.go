@@ -31,8 +31,8 @@ func (w *BaseWriter) WriteBatch(source *config.SourceConfig, in <-chan transform
 		return w.dialect.writeCopy(in, w.Target)
 	case config.ModeTypeFull:
 		return w.dialect.writeFull(in, w.Target)
-	// case config.ModeTypeAppend:
-	// 	return w.dialect.writeAppend(in, w.Target, source, w.JobName)
+	case config.ModeTypeAppend:
+		return w.dialect.writeAppend(in, w.Target, source, w.JobName)
 	case config.ModeTypeMerge:
 		if w.Target.PK == "" {
 			return fmt.Errorf("pk is required for merge mode")

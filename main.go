@@ -178,7 +178,8 @@ func runTask(task config.TaskConfig, dbRegistry map[string]config.DBConfig) erro
 				time.Since(startedAt).Round(time.Millisecond),
 				err,
 			)
-			return err
+			// return err
+			continue // 继续执行下一个 source 的任务
 		}
 
 		log.Printf(

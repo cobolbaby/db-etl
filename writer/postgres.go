@@ -34,13 +34,13 @@ func NewPGWriter(conn *pgx.Conn, target *config.TargetConfig, jobName string) Wr
 	return &PGWriter{BaseWriter: base}
 }
 
+// TODO:
 func (d *pgWriterDialect) writeFull(in <-chan transform.CSVBatch, target *config.TargetConfig) error {
-
 	return nil
 }
 
+// TODO:
 func (d *pgWriterDialect) writeAppend(in <-chan transform.CSVBatch, target *config.TargetConfig, source *config.SourceConfig, jobName string) error {
-
 	return nil
 }
 

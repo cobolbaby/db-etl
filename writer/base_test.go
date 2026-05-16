@@ -37,3 +37,15 @@ func TestSourceIdentityRejectsThreePartTableForNonMSSQL(t *testing.T) {
 		t.Fatalf("unexpected error: %v", err)
 	}
 }
+
+func TestTargetIdentityRejectsThreePartTable(t *testing.T) {
+	target := &config.TargetConfig{Table: "sales.public.orders"}
+
+	_, err := targetIdentity(target)
+	if err == nil {
+		t.Fatal("expected three-part target table to be rejected")
+	}
+	if !strings.Contains(err.Error(), "target table must be table or schema.table") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}

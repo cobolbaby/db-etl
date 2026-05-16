@@ -60,11 +60,14 @@ func sourceIdentity(source *config.SourceConfig) (wmSource, error) {
 	}
 
 	if table := strings.TrimSpace(source.Table); table != "" {
-		database, schema, tbl, err := splitSourceQualifiedName(table, source.DBType)
+		parts, err := splitQualifiedName(table)
 		if err != nil {
 			return wmSource{}, err
 		}
-		return wmSource{Database: database, Schema: schema, Table: tbl}, nil
+		if parts.Database != "" && source.DBType != config.DBTypeMSSQL {
+			return wmSource{}, fmt.Errorf("source table %q uses db.schema.table, which is only supported for mssql sources", table)
+		}
+		return wmSource{Database: parts.Database, Schema: parts.Schema, Table: parts.Table}, nil
 	}
 
 	if sql := strings.TrimSpace(source.SQL); sql != "" {
@@ -85,32 +88,38 @@ func targetIdentity(target *config.TargetConfig) (wmTarget, error) {
 		return wmTarget{}, fmt.Errorf("target config is required for watermark")
 	}
 
-	schema, tbl, err := splitQualifiedName(target.Table)
+	parts, err := splitQualifiedName(target.Table)
 	if err != nil {
 		return wmTarget{}, err
 	}
+	if parts.Database != "" {
+		return wmTarget{}, fmt.Errorf("target table must be table or schema.table")
+	}
 
-	return wmTarget{Schema: schema, Table: tbl}, nil
+	return wmTarget{Schema: parts.Schema, Table: parts.Table}, nil
 }
 
-func splitSourceQualifiedName(name string, dbType config.DBType) (string, string, string, error) {
+type qualifiedName struct {
+	Database string
+	Schema   string
+	Table    string
+}
+
+func splitQualifiedName(name string) (qualifiedName, error) {
 	trimmed := strings.TrimSpace(name)
 	if trimmed == "" {
-		return "", "", "", fmt.Errorf("table name is required for watermark")
+		return qualifiedName{}, fmt.Errorf("table name is required for watermark")
 	}
 
 	parts := strings.Split(trimmed, ".")
 	switch len(parts) {
 	case 1:
-		return "", "", parts[0], nil
+		return qualifiedName{Table: parts[0]}, nil
 	case 2:
-		return "", parts[0], parts[1], nil
+		return qualifiedName{Schema: parts[0], Table: parts[1]}, nil
 	case 3:
-		if dbType != config.DBTypeMSSQL {
-			return "", "", "", fmt.Errorf("source table %q uses db.schema.table, which is only supported for mssql sources", trimmed)
-		}
-		return parts[0], parts[1], parts[2], nil
+		return qualifiedName{Database: parts[0], Schema: parts[1], Table: parts[2]}, nil
 	default:
-		return "", "", "", fmt.Errorf("source table must be table, schema.table, or db.schema.table")
+		return qualifiedName{}, fmt.Errorf("table name must be table, schema.table, or db.schema.table")
 	}
 }

@@ -601,20 +601,6 @@ func defaultIncrPoint(incrField string) string {
 	return "1"
 }
 
-func splitQualifiedName(name string) (string, string, error) {
-	trimmed := strings.TrimSpace(name)
-	if trimmed == "" {
-		return "", "", fmt.Errorf("table name is required for watermark")
-	}
-
-	parts := strings.SplitN(trimmed, ".", 2)
-	if len(parts) == 1 {
-		return "", parts[0], nil
-	}
-
-	return parts[0], parts[1], nil
-}
-
 func buildTempTableName(fullTable string) string {
 	schema := ""
 	table := fullTable

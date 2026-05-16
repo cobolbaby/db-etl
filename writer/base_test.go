@@ -5,7 +5,36 @@ import (
 	"testing"
 
 	"db-etl/config"
+	"db-etl/transform"
 )
+
+type stubWriterDialect struct {
+	called string
+}
+
+func (d *stubWriterDialect) writeCopy(in <-chan transform.CSVBatch, target *config.TargetConfig) error {
+	d.called = "copy"
+	return nil
+}
+
+func (d *stubWriterDialect) writeFull(in <-chan transform.CSVBatch, target *config.TargetConfig) error {
+	d.called = "full"
+	return nil
+}
+
+func (d *stubWriterDialect) writeAppend(in <-chan transform.CSVBatch, target *config.TargetConfig, source *config.SourceConfig, jobName string) error {
+	d.called = "append"
+	return nil
+}
+
+func (d *stubWriterDialect) writeMerge(in <-chan transform.CSVBatch, target *config.TargetConfig, source *config.SourceConfig, jobName string) error {
+	d.called = "merge"
+	return nil
+}
+
+func (d *stubWriterDialect) getWatermark(target *config.TargetConfig, source *config.SourceConfig, jobName string) (string, error) {
+	return "", nil
+}
 
 func TestSourceIdentityAllowsThreePartTableForMSSQL(t *testing.T) {
 	source := &config.SourceConfig{
@@ -47,5 +76,24 @@ func TestTargetIdentityRejectsThreePartTable(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "target table must be table or schema.table") {
 		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestBaseWriterDispatchesFullMode(t *testing.T) {
+	dialect := &stubWriterDialect{}
+	writer := &BaseWriter{
+		Target:  &config.TargetConfig{Table: "public.orders", Mode: config.ModeTypeFull},
+		dialect: dialect,
+	}
+
+	in := make(chan transform.CSVBatch)
+	close(in)
+
+	if err := writer.WriteBatch(nil, in); err != nil {
+		t.Fatalf("WriteBatch returned error: %v", err)
+	}
+
+	if dialect.called != "full" {
+		t.Fatalf("expected full mode dispatch, got %q", dialect.called)
 	}
 }

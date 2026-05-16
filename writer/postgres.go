@@ -34,9 +34,42 @@ func NewPGWriter(conn *pgx.Conn, target *config.TargetConfig, jobName string) Wr
 	return &PGWriter{BaseWriter: base}
 }
 
-// TODO:
 func (d *pgWriterDialect) writeFull(in <-chan transform.CSVBatch, target *config.TargetConfig) error {
-	return nil
+
+	var firstBatch transform.CSVBatch
+	foundRows := false
+	for batch := range in {
+		if len(batch.Rows) == 0 {
+			continue
+		}
+		firstBatch = batch
+		foundRows = true
+		break
+	}
+
+	if !foundRows {
+		log.Printf("table=%s full refresh finished: no rows to load", target.Table)
+		return nil
+	}
+
+	ctx := context.Background()
+
+	tx, err := d.conn.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx)
+
+	if err := d.truncateTarget(ctx, tx, target); err != nil {
+		return err
+	}
+
+	if err := d.writeCopyWithFirstBatch(firstBatch, in, target.Table); err != nil {
+		return err
+	}
+
+	log.Printf("table=%s full refresh finished: target replaced", target.Table)
+	return tx.Commit(ctx)
 }
 
 // TODO:
@@ -397,6 +430,11 @@ func (d *pgWriterDialect) createTempTable(ctx context.Context, tx pgx.Tx, stagin
 
 	_, err := tx.Exec(ctx, sql)
 
+	return err
+}
+
+func (d *pgWriterDialect) truncateTarget(ctx context.Context, tx pgx.Tx, target *config.TargetConfig) error {
+	_, err := tx.Exec(ctx, fmt.Sprintf(`TRUNCATE TABLE %s`, target.Table))
 	return err
 }
 

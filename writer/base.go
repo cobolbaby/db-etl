@@ -29,8 +29,8 @@ func (w *BaseWriter) WriteBatch(source *config.SourceConfig, in <-chan transform
 	switch w.Target.Mode {
 	case config.ModeTypeCopy:
 		return w.dialect.writeCopy(in, w.Target)
-	// case config.ModeTypeFull:
-	// 	return w.dialect.writeFull(in, w.Target)
+	case config.ModeTypeFull:
+		return w.dialect.writeFull(in, w.Target)
 	// case config.ModeTypeAppend:
 	// 	return w.dialect.writeAppend(in, w.Target, source, w.JobName)
 	case config.ModeTypeMerge:

@@ -57,8 +57,7 @@ func LoadTasksFromDB(ctx context.Context, metaDB DBConfig, jobName string) ([]Ta
 		FROM manager.job_data_sync_v2
 		WHERE job_name = $1
 		  AND inuse = true
-		  AND (sync_mode IN ('full', 'append', 'merge')
-		  	or (sync_mode = 'cdc' AND dst_pk <> ''))
+		  AND sync_mode IN ('full', 'append', 'merge')
 		ORDER BY job_id
 	`
 

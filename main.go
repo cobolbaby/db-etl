@@ -110,6 +110,10 @@ func runTask(task config.TaskConfig, dbRegistry map[string]config.DBConfig) erro
 		if !ok {
 			return fmt.Errorf("source db not found: %s", src.DBName)
 		}
+		src.DBType = srcDB.Type
+		if err := config.ValidateSourceTableName(src.Table, src.DBType); err != nil {
+			return err
+		}
 
 		dstDB, ok := dbRegistry[task.Target.DBName]
 		if !ok {

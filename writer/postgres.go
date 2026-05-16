@@ -481,12 +481,13 @@ func (d *pgWriterDialect) updateWatermark(ctx context.Context, tx pgx.Tx, wm str
 			        dst_pk          = $4,
 			        udt             = $5
 			  WHERE job_name        = $6
-			    AND src_schema_name = $7
-			    AND src_table_name  = $8
-			    AND dst_schema_name = $9
-			    AND dst_table_name  = $10`,
+			    AND COALESCE(src_db_name, '') = $7
+			    AND src_schema_name = $8
+			    AND src_table_name  = $9
+			    AND dst_schema_name = $10
+			    AND dst_table_name  = $11`,
 			wm, string(target.Mode), source.IncrField, target.PK, now,
-			funcName, src.Schema, src.Table, dst.Schema, dst.Table,
+			funcName, src.Database, src.Schema, src.Table, dst.Schema, dst.Table,
 		)
 	}
 	if execErr != nil {
@@ -511,10 +512,10 @@ func (d *pgWriterDialect) updateWatermark(ctx context.Context, tx pgx.Tx, wm str
 		_, err = tx.Exec(
 			ctx,
 			`INSERT INTO manager.job_data_sync_v2
-			    (job_name, src_schema_name, src_table_name, dst_schema_name, dst_table_name,
+			    (job_name, src_db_name, src_schema_name, src_table_name, dst_schema_name, dst_table_name,
 			     incr_point, sync_mode, src_incr_field, dst_pk, cdt, udt)
-			  VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $10)`,
-			funcName, src.Schema, src.Table, dst.Schema, dst.Table,
+			  VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $12)`,
+			funcName, src.Database, src.Schema, src.Table, dst.Schema, dst.Table,
 			wm, string(target.Mode), source.IncrField, target.PK, now,
 		)
 	}
@@ -552,12 +553,13 @@ func (d *pgWriterDialect) getWatermark(target *config.TargetConfig, source *conf
 			`SELECT COALESCE(incr_point, '')
 			   FROM manager.job_data_sync_v2
 			  WHERE job_name = $1
-			    AND src_schema_name = $2
-			    AND src_table_name = $3
-			    AND dst_schema_name = $4
-			    AND dst_table_name = $5
+			    AND COALESCE(src_db_name, '') = $2
+			    AND src_schema_name = $3
+			    AND src_table_name = $4
+			    AND dst_schema_name = $5
+			    AND dst_table_name = $6
 			  LIMIT 1`,
-			funcName, src.Schema, src.Table, dst.Schema, dst.Table,
+			funcName, src.Database, src.Schema, src.Table, dst.Schema, dst.Table,
 		).Scan(&wm)
 	}
 

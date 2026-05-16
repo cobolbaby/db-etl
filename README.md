@@ -26,7 +26,7 @@ CREATE TABLE IF NOT EXISTS manager.job_data_sync_v2
     udt timestamp without time zone,
     remark text COLLATE pg_catalog."default",
     inuse boolean,
-    src_instance character varying(50) COLLATE pg_catalog."default",
+    src_conn_name character varying(50) COLLATE pg_catalog."default",
     src_db_name character varying(50) COLLATE pg_catalog."default",
     job_name character varying(50) COLLATE pg_catalog."default",
     src_conn_id integer,
@@ -116,20 +116,23 @@ tasks:
 
 每个 source 表示一个源库读取定义。
 
-| 字段         | 必填   | 说明                                                                             |
-| ------------ | ------ | -------------------------------------------------------------------------------- |
-| `dbname`     | ✅     | 引用 `databases[].name`                                                          |
-| `sql`        | 二选一 | 自定义查询语句                                                                   |
-| `table`      | 二选一 | 直接读取的表名，格式 `schema.table`                                              |
-| `batch_size` |        | 每批读取行数，默认 `10000`                                                       |
-| `incr_field` |        | 增量抽取字段名（日期/时间类型），配合 watermark 实现断点续传                     |
-| `incr_point` |        | 增量起点，通常由程序从 watermark 自动回填，也可手动指定初始值                    |
-| `order_by`   |        | 查询排序表达式，启用 `commit_batch_size` 时若未指定则自动补为 `<incr_field> ASC` |
+| 字段              | 必填   | 说明                                                                             |
+| ----------------- | ------ | -------------------------------------------------------------------------------- |
+| `dbname`          | ✅     | 引用 `databases[].name`                                                          |
+| `sql`             | 二选一 | 自定义查询语句                                                                   |
+| `table`           | 二选一 | 直接读取的表名，格式 `schema.table`；仅 SQL Server 支持 `db.schema.table`        |
+| `where_statement` |        | 附加过滤条件；使用 `table` 时直接拼到 `WHERE`，使用 `sql` 时作为外层过滤条件追加 |
+| `fields_mapping`  |        | 字段投影/映射；仅支持简单 map，格式为 `源字段或表达式: 目标字段`                 |
+| `batch_size`      |        | 每批读取行数，默认 `10000`                                                       |
+| `incr_field`      |        | 增量抽取字段名（日期/时间类型），配合 watermark 实现断点续传                     |
+| `incr_point`      |        | 增量起点，通常由程序从 watermark 自动回填，也可手动指定初始值                    |
+| `order_by`        |        | 查询排序表达式，启用 `commit_batch_size` 时若未指定则自动补为 `<incr_field> ASC` |
 
 ### `sql` 与 `table` 规则
 
 - `sql` 和 `table` 至少配置一个，不能同时配置。
-- 使用 `table` 时，watermark 的 `src_schema_name` / `src_table_name` 直接从 `table` 解析。
+- 使用 `table` 时，watermark 的 `src_schema_name` / `src_table_name` 直接从 `table` 解析；只有 SQL Server 源支持三段式 `db.schema.table`。
+- 使用 `table` 时，优先保留 `table` 形态，`where_statement` / `fields_mapping` 在 reader 阶段再拼装查询，不会在配置加载阶段改写成 SQL。
 - 使用 `sql` 时，watermark 的源标识使用 SQL 文本本身（写入 `manager.job_data_sync_v2.src_rawsql`）。
 
 ### 增量抽取约束
@@ -186,6 +189,11 @@ tasks:
       - dbname: source-mssql
         batch_size: 10000
         table: "dbo.source_table_2"
+        where_statement: "is_deleted = 0"
+        fields_mapping:
+          source_id: id
+          CustomerName: customer_name
+          updated_at: updated_at
     target:
       dbname: target-pg
       table: target_schema.target_table_2

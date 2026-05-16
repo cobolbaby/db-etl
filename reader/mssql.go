@@ -28,17 +28,13 @@ func NewMSSQLReader(db *sql.DB, src *config.SourceConfig, queryTimeout time.Dura
 	}
 }
 
-func (mssqlDialect) buildBaseQuery(source *config.SourceConfig, emptyResult bool) (string, error) {
+func (mssqlDialect) buildBaseQuery(source *config.SourceConfig, projection string, whereClause string) (string, error) {
 	var query string
-	whereClause := "1=1"
-	if emptyResult {
-		whereClause = "1=0"
-	}
 
 	if source.SQL != "" {
-		query = fmt.Sprintf("SELECT * FROM (%s) t WHERE %s", source.SQL, whereClause)
+		query = fmt.Sprintf("SELECT %s FROM (%s) t WHERE %s", projection, source.SQL, whereClause)
 	} else if source.Table != "" {
-		query = fmt.Sprintf("SELECT * FROM %s WITH (NOLOCK) WHERE %s", source.Table, whereClause)
+		query = fmt.Sprintf("SELECT %s FROM %s WITH (NOLOCK) WHERE %s", projection, source.Table, whereClause)
 	} else {
 		return "", fmt.Errorf("source sql or table is required")
 	}
@@ -57,6 +53,13 @@ func (mssqlDialect) formatIncrValue(v string) string {
 		return "CONVERT(DATETIME2, '" + s + "')"
 	}
 	return "'" + s + "'"
+}
+
+func (mssqlDialect) quoteIdentifier(identifier string) string {
+	if isAlreadyQuotedIdentifier(identifier) {
+		return identifier
+	}
+	return "[" + identifier + "]"
 }
 
 func (mssqlDialect) getColumnHandler(dbType string) ColHandler {

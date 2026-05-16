@@ -13,10 +13,11 @@ import (
 )
 
 type readerDialect interface {
-	buildBaseQuery(source *config.SourceConfig, emptyResult bool) (string, error)
+	buildBaseQuery(source *config.SourceConfig, projection string, whereClause string) (string, error)
 	getColumnHandler(dbType string) ColHandler
 	// formatIncrValue 将增量水位字符串格式化为可直接嵌入 SQL 的字面量或函数调用。
 	formatIncrValue(v string) string
+	quoteIdentifier(identifier string) string
 }
 
 type BaseReader struct {
@@ -32,6 +33,37 @@ func (r *BaseReader) queryContext() (context.Context, context.CancelFunc) {
 		return context.WithTimeout(context.Background(), r.QueryTimeout)
 	}
 	return context.Background(), func() {}
+}
+
+func (r *BaseReader) GetColumnHandlers() []ColHandler {
+	colTypes, err := r.getColumnTypes()
+	if err != nil {
+		log.Fatalf("get column types: %v", err)
+	}
+
+	handlers := make([]ColHandler, len(colTypes))
+	for i, ct := range colTypes {
+		handlers[i] = r.dialect.getColumnHandler(ct.DatabaseTypeName())
+	}
+	return handlers
+}
+
+func (r *BaseReader) getColumnTypes() ([]*sql.ColumnType, error) {
+	query, err := r.buildBaseQuery(true)
+	if err != nil {
+		return nil, err
+	}
+
+	ctx, cancel := r.queryContext()
+	defer cancel()
+
+	rows, err := r.DB.QueryContext(ctx, query)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	return rows.ColumnTypes()
 }
 
 func (r *BaseReader) ReadBatch() <-chan RowBatch {
@@ -89,39 +121,8 @@ func (r *BaseReader) ReadBatch() <-chan RowBatch {
 	return out
 }
 
-func (r *BaseReader) GetColumnHandlers() []ColHandler {
-	colTypes, err := r.getColumnTypes()
-	if err != nil {
-		log.Fatalf("get column types: %v", err)
-	}
-
-	handlers := make([]ColHandler, len(colTypes))
-	for i, ct := range colTypes {
-		handlers[i] = r.dialect.getColumnHandler(ct.DatabaseTypeName())
-	}
-	return handlers
-}
-
-func (r *BaseReader) getColumnTypes() ([]*sql.ColumnType, error) {
-	query, err := r.dialect.buildBaseQuery(r.Source, true)
-	if err != nil {
-		return nil, err
-	}
-
-	ctx, cancel := r.queryContext()
-	defer cancel()
-
-	rows, err := r.DB.QueryContext(ctx, query)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-
-	return rows.ColumnTypes()
-}
-
 func (r *BaseReader) buildReadQuery() (string, error) {
-	query, err := r.dialect.buildBaseQuery(r.Source, false)
+	query, err := r.buildBaseQuery(false)
 	if err != nil {
 		return "", err
 	}
@@ -146,6 +147,95 @@ func (r *BaseReader) buildReadQuery() (string, error) {
 	}
 
 	return query, nil
+}
+
+func (r *BaseReader) buildBaseQuery(emptyResult bool) (string, error) {
+	projection, err := r.resolveProjection()
+	if err != nil {
+		return "", err
+	}
+
+	whereClause := r.buildWhereClause(emptyResult)
+	return r.dialect.buildBaseQuery(r.Source, projection, whereClause)
+}
+
+func (r *BaseReader) buildWhereClause(emptyResult bool) string {
+	if emptyResult {
+		return "1=0"
+	}
+
+	parts := make([]string, 0, 2)
+	if cond := strings.TrimSpace(r.Source.WhereStatement); cond != "" {
+		parts = append(parts, fmt.Sprintf("(%s)", cond))
+	}
+	parts = append(parts, "1=1")
+	return strings.Join(parts, " AND ")
+}
+
+func (r *BaseReader) resolveProjection() (string, error) {
+	if r.Source == nil {
+		return "*", nil
+	}
+
+	if r.Source.FieldsMapping.IsEmpty() {
+		return "*", nil
+	}
+
+	return r.Source.FieldsMapping.Projection(
+		func(sourceField string) string {
+			return formatProjectionSource(sourceField, r.dialect.quoteIdentifier)
+		},
+		func(targetField string) string {
+			return formatProjectionAlias(targetField, r.dialect.quoteIdentifier)
+		},
+	)
+}
+
+func formatProjectionSource(sourceField string, quoteIdentifier func(string) string) string {
+	sourceField = strings.TrimSpace(sourceField)
+	if sourceField == "" {
+		return ""
+	}
+
+	if isBareIdentifier(sourceField) || isAlreadyQuotedIdentifier(sourceField) {
+		return quoteIdentifier(sourceField)
+	}
+
+	return sourceField
+}
+
+func formatProjectionAlias(alias string, quoteIdentifier func(string) string) string {
+	alias = strings.TrimSpace(alias)
+	if alias == "" {
+		return ""
+	}
+	if isAlreadyQuotedIdentifier(alias) {
+		return alias
+	}
+	return quoteIdentifier(alias)
+}
+
+func isBareIdentifier(value string) bool {
+	if value == "" {
+		return false
+	}
+	for index, char := range value {
+		if index == 0 {
+			if (char < 'A' || char > 'Z') && (char < 'a' || char > 'z') && char != '_' {
+				return false
+			}
+			continue
+		}
+		if (char < 'A' || char > 'Z') && (char < 'a' || char > 'z') && (char < '0' || char > '9') && char != '_' {
+			return false
+		}
+	}
+	return true
+}
+
+func isAlreadyQuotedIdentifier(value string) bool {
+	return (strings.HasPrefix(value, `"`) && strings.HasSuffix(value, `"`)) ||
+		(strings.HasPrefix(value, "[") && strings.HasSuffix(value, "]"))
 }
 
 func defaultColumnHandler(v any) string {

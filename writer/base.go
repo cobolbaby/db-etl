@@ -46,11 +46,12 @@ func watermarkJobName(jobName string) string {
 }
 
 // wmSource holds the resolved identity of a source for watermark queries.
-// Exactly one of (Schema+Table) or RawSQL is non-empty.
+// Exactly one of (Database+Schema+Table) or RawSQL is non-empty.
 type wmSource struct {
-	Schema string
-	Table  string
-	RawSQL string
+	Database string
+	Schema   string
+	Table    string
+	RawSQL   string
 }
 
 func sourceIdentity(source *config.SourceConfig) (wmSource, error) {
@@ -59,11 +60,11 @@ func sourceIdentity(source *config.SourceConfig) (wmSource, error) {
 	}
 
 	if table := strings.TrimSpace(source.Table); table != "" {
-		schema, tbl, err := splitQualifiedName(table)
+		database, schema, tbl, err := splitSourceQualifiedName(table, source.DBType)
 		if err != nil {
 			return wmSource{}, err
 		}
-		return wmSource{Schema: schema, Table: tbl}, nil
+		return wmSource{Database: database, Schema: schema, Table: tbl}, nil
 	}
 
 	if sql := strings.TrimSpace(source.SQL); sql != "" {
@@ -90,4 +91,26 @@ func targetIdentity(target *config.TargetConfig) (wmTarget, error) {
 	}
 
 	return wmTarget{Schema: schema, Table: tbl}, nil
+}
+
+func splitSourceQualifiedName(name string, dbType config.DBType) (string, string, string, error) {
+	trimmed := strings.TrimSpace(name)
+	if trimmed == "" {
+		return "", "", "", fmt.Errorf("table name is required for watermark")
+	}
+
+	parts := strings.Split(trimmed, ".")
+	switch len(parts) {
+	case 1:
+		return "", "", parts[0], nil
+	case 2:
+		return "", parts[0], parts[1], nil
+	case 3:
+		if dbType != config.DBTypeMSSQL {
+			return "", "", "", fmt.Errorf("source table %q uses db.schema.table, which is only supported for mssql sources", trimmed)
+		}
+		return parts[0], parts[1], parts[2], nil
+	default:
+		return "", "", "", fmt.Errorf("source table must be table, schema.table, or db.schema.table")
+	}
 }

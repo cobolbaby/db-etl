@@ -1,8 +1,11 @@
 package config
 
 import (
+	"encoding/json"
 	"fmt"
+	"log"
 	"os"
+	"sort"
 	"strings"
 
 	"gopkg.in/yaml.v3"
@@ -58,14 +61,230 @@ const (
 )
 
 type SourceConfig struct {
-	DBName    string `yaml:"dbname"`
-	SQL       string `yaml:"sql"`
-	Table     string `yaml:"table"` // SQL 和 Table 至少要指定一个，SQL 优先级更高
-	BatchSize int    `yaml:"batch_size"`
-	Mode      ModeType
-	IncrField string `yaml:"incr_field"` // 用于增量抽取，指定一个日期/时间字段，配合 Watermark 实现增量抽取
-	IncrPoint string `yaml:"incr_point"` // 增量抽取的起点
-	OrderBy   string `yaml:"order_by"`   // OrderBy 指定查询排序字段。当 target.commit_batch_size > 0 时必须有序，框架会自动设为 src_incr_field，也可手动指定其他表达式（如 "id ASC"）。
+	DBName         string        `yaml:"dbname"`
+	SQL            string        `yaml:"sql"`
+	Table          string        `yaml:"table"`           // SQL 和 Table 至少要指定一个，SQL 优先级更高
+	WhereStatement string        `yaml:"where_statement"` // Table 场景下的附加过滤条件；SQL 场景下会作为外层过滤条件追加
+	FieldsMapping  FieldsMapping `yaml:"fields_mapping"`  // Table 场景下的字段映射，格式为 map[源字段/表达式]目标字段
+	BatchSize      int           `yaml:"batch_size"`
+	DBType         DBType        `yaml:"-"`
+	Mode           ModeType      `yaml:"-"`
+	IncrField      string        `yaml:"incr_field"` // 用于增量抽取，指定一个日期/时间字段，配合 Watermark 实现增量抽取
+	IncrPoint      string        `yaml:"incr_point"` // 增量抽取的起点
+	OrderBy        string        `yaml:"order_by"`   // OrderBy 指定查询排序字段。当 target.commit_batch_size > 0 时必须有序，框架会自动设为 src_incr_field，也可手动指定其他表达式（如 "id ASC"）。
+}
+
+type FieldsMapping struct {
+	Items map[string]string
+}
+
+func (m *FieldsMapping) UnmarshalYAML(value *yaml.Node) error {
+	if m == nil {
+		return nil
+	}
+
+	var parsed map[string]string
+	if err := value.Decode(&parsed); err != nil {
+		return err
+	}
+
+	*m = FieldsMapping{Items: normalizeFieldsMappingItems(parsed)}
+	return nil
+}
+
+func ParseFieldsMapping(raw string) (FieldsMapping, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return FieldsMapping{}, nil
+	}
+
+	var parsed map[string]string
+	if err := json.Unmarshal([]byte(raw), &parsed); err != nil {
+		return FieldsMapping{}, fmt.Errorf("fields_mapping must be json object map[string]string: %w", err)
+	}
+
+	return FieldsMapping{Items: normalizeFieldsMappingItems(parsed)}, nil
+}
+
+func (m FieldsMapping) Projection(formatSource func(string) string, formatTarget func(string) string) (string, error) {
+	if len(m.Items) > 0 {
+		sources := make([]string, 0, len(m.Items))
+		for source := range m.Items {
+			sources = append(sources, source)
+		}
+		sort.Strings(sources)
+
+		projection := make([]string, 0, len(sources))
+		for _, source := range sources {
+			source = strings.TrimSpace(source)
+			target := strings.TrimSpace(m.Items[source])
+			if source == "" || target == "" {
+				return "", fmt.Errorf("fields_mapping contains empty key or value")
+			}
+			if formatSource != nil {
+				source = formatSource(source)
+			}
+			if formatTarget != nil {
+				target = formatTarget(target)
+			}
+			projection = append(projection, fmt.Sprintf("%s AS %s", source, target))
+		}
+
+		return strings.Join(projection, ", "), nil
+	}
+
+	return "*", nil
+}
+
+func (m FieldsMapping) IsEmpty() bool {
+	return len(m.Items) == 0
+}
+
+func normalizeFieldsMappingItems(items map[string]string) map[string]string {
+	if len(items) == 0 {
+		return nil
+	}
+
+	normalized := make(map[string]string, len(items))
+	for key, value := range items {
+		normalized[strings.TrimSpace(key)] = strings.TrimSpace(value)
+	}
+
+	return normalized
+}
+
+func (m FieldsMapping) Validate() error {
+	if len(m.Items) == 0 {
+		return nil
+	}
+
+	sources := make([]string, 0, len(m.Items))
+	for source := range m.Items {
+		sources = append(sources, source)
+	}
+	sort.Strings(sources)
+
+	for _, source := range sources {
+		target := strings.TrimSpace(m.Items[source])
+		if target == "" {
+			return fmt.Errorf("fields_mapping target field for source %q is empty", source)
+		}
+		if !isAllowedFieldName(target) {
+			return fmt.Errorf("fields_mapping target field %q contains invalid characters; only letters, digits, and underscore are allowed", target)
+		}
+		if isReservedKeyword(target) {
+			return fmt.Errorf("fields_mapping target field %q is a reserved keyword", target)
+		}
+		if !looksLikeExpression(source) && !isAllowedFieldName(source) {
+			log.Printf("warning: fields_mapping source field %q contains special characters; only letters, digits, and underscore are recommended", source)
+		}
+	}
+
+	return nil
+}
+
+func isAllowedFieldName(value string) bool {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return false
+	}
+	for _, char := range value {
+		if (char >= 'a' && char <= 'z') || (char >= 'A' && char <= 'Z') || (char >= '0' && char <= '9') || char == '_' {
+			continue
+		}
+		return false
+	}
+	return true
+}
+
+func looksLikeExpression(value string) bool {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return false
+	}
+	for _, token := range []string{"(", ")", " ", "'", `"`, "+", "-", "*", "/", "%", "=", ","} {
+		if strings.Contains(value, token) {
+			return true
+		}
+	}
+	return false
+}
+
+func isReservedKeyword(value string) bool {
+	_, ok := reservedKeywords[strings.ToLower(strings.TrimSpace(value))]
+	return ok
+}
+
+var reservedKeywords = map[string]struct{}{
+	"add":        {},
+	"all":        {},
+	"alter":      {},
+	"and":        {},
+	"any":        {},
+	"as":         {},
+	"asc":        {},
+	"by":         {},
+	"case":       {},
+	"check":      {},
+	"column":     {},
+	"constraint": {},
+	"create":     {},
+	"current":    {},
+	"database":   {},
+	"default":    {},
+	"delete":     {},
+	"desc":       {},
+	"distinct":   {},
+	"drop":       {},
+	"else":       {},
+	"exists":     {},
+	"false":      {},
+	"for":        {},
+	"foreign":    {},
+	"from":       {},
+	"full":       {},
+	"group":      {},
+	"having":     {},
+	"in":         {},
+	"index":      {},
+	"inner":      {},
+	"insert":     {},
+	"into":       {},
+	"is":         {},
+	"join":       {},
+	"key":        {},
+	"left":       {},
+	"like":       {},
+	"limit":      {},
+	"not":        {},
+	"null":       {},
+	"offset":     {},
+	"on":         {},
+	"or":         {},
+	"order":      {},
+	"outer":      {},
+	"primary":    {},
+	"references": {},
+	"right":      {},
+	"select":     {},
+	"set":        {},
+	"table":      {},
+	"then":       {},
+	"top":        {},
+	"true":       {},
+	"union":      {},
+	"unique":     {},
+	"update":     {},
+	"user":       {},
+	"using":      {},
+	"values":     {},
+	"view":       {},
+	"when":       {},
+	"where":      {},
+}
+
+func (s *SourceConfig) normalize() {
+	s.WhereStatement = strings.TrimSpace(s.WhereStatement)
 }
 
 type TargetConfig struct {
@@ -119,7 +338,6 @@ Validate
 检查配置合法性
 */
 func (c *Config) Validate() error {
-
 	// Name 不能为空
 	if strings.TrimSpace(c.Name) == "" {
 		return fmt.Errorf("config name is required")
@@ -132,50 +350,143 @@ func (c *Config) Validate() error {
 		return fmt.Errorf("invalid error_policy: %s", c.ErrorPolicy)
 	}
 
+	dbTypes, err := c.validateDatabases()
+	if err != nil {
+		return err
+	}
+
+	if err := c.validateTasks(dbTypes); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func (c *Config) validateDatabases() (map[string]DBType, error) {
+	dbTypes := make(map[string]DBType, len(c.Databases))
 	for _, db := range c.Databases {
 		if db.Name == "" {
-			return fmt.Errorf("database name required")
+			return nil, fmt.Errorf("database name required")
 		}
 		if db.Type == "" {
-			return fmt.Errorf("database type required for %s", db.Name)
+			return nil, fmt.Errorf("database type required for %s", db.Name)
 		}
+		dbTypes[db.Name] = db.Type
 	}
+	return dbTypes, nil
+}
+
+func (c *Config) validateTasks(dbTypes map[string]DBType) error {
 
 	if len(c.Tasks) == 0 && c.MetaDB == "" {
 		return fmt.Errorf("tasks cannot be empty (set 'meta_db' to load tasks from database)")
 	}
 
 	for _, t := range c.Tasks {
-		if t.Target == nil {
-			return fmt.Errorf("target must be specified")
-		}
-
-		for _, s := range t.Sources {
-			if s.BatchSize <= 0 {
-				s.BatchSize = 10000
-			}
-
-			if s.SQL == "" && s.Table == "" {
-				return fmt.Errorf("sql or table must be specified")
-			}
-
-			if s.SQL != "" && s.Table != "" {
-				return fmt.Errorf("sql and table cannot both be specified")
-			}
-
-			// 分段提交时必须保证有序，自动补齐 OrderBy
-			if t.Target.CommitBatchSize > 0 {
-				if s.IncrField == "" {
-					return fmt.Errorf("incr_field is required when commit_batch_size > 0")
-				}
-				if s.OrderBy == "" {
-					s.OrderBy = s.IncrField + " ASC"
-				}
-			}
+		if err := validateTask(t, dbTypes); err != nil {
+			return err
 		}
 	}
 
 	return nil
+}
+
+func validateTask(task TaskConfig, dbTypes map[string]DBType) error {
+	if task.Target == nil {
+		return fmt.Errorf("target must be specified")
+	}
+	if err := validateTarget(task.Target, dbTypes); err != nil {
+		return err
+	}
+
+	for _, source := range task.Sources {
+		if err := validateSource(source, task.Target, dbTypes); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+func validateTarget(target *TargetConfig, dbTypes map[string]DBType) error {
+	if target.DBName == "" {
+		return fmt.Errorf("target dbname is required")
+	}
+	if _, ok := dbTypes[target.DBName]; !ok {
+		return fmt.Errorf("target db not found: %s", target.DBName)
+	}
+	if strings.TrimSpace(target.Table) == "" {
+		return fmt.Errorf("target table is required")
+	}
+	return nil
+}
+
+func validateSource(source *SourceConfig, target *TargetConfig, dbTypes map[string]DBType) error {
+	if source == nil {
+		return fmt.Errorf("source must be specified")
+	}
+	if source.DBName == "" {
+		return fmt.Errorf("source dbname is required")
+	}
+
+	dbType, ok := dbTypes[source.DBName]
+	if !ok {
+		return fmt.Errorf("source db not found: %s", source.DBName)
+	}
+
+	source.normalize()
+	source.DBType = dbType
+
+	if err := source.FieldsMapping.Validate(); err != nil {
+		return err
+	}
+
+	if source.BatchSize <= 0 {
+		source.BatchSize = 10000
+	}
+
+	if source.SQL == "" && source.Table == "" {
+		return fmt.Errorf("sql or table must be specified")
+	}
+
+	if source.SQL != "" && source.Table != "" {
+		return fmt.Errorf("sql and table cannot both be specified")
+	}
+
+	if err := ValidateSourceTableName(source.Table, source.DBType); err != nil {
+		return err
+	}
+
+	if target.CommitBatchSize > 0 {
+		if source.IncrField == "" {
+			return fmt.Errorf("incr_field is required when commit_batch_size > 0")
+		}
+		if source.OrderBy == "" {
+			source.OrderBy = source.IncrField + " ASC"
+		}
+	}
+
+	return nil
+}
+
+func ValidateSourceTableName(table string, dbType DBType) error {
+	trimmed := strings.TrimSpace(table)
+	if trimmed == "" {
+		return nil
+	}
+
+	parts := strings.Split(trimmed, ".")
+	switch len(parts) {
+	case 1, 2:
+		return nil
+	case 3:
+		if dbType != DBTypeMSSQL {
+			return fmt.Errorf("source table %q uses db.schema.table, which is only supported for mssql sources", trimmed)
+		}
+		return nil
+	default:
+		return fmt.Errorf("source table must be table, schema.table, or db.schema.table")
+	}
 }
 
 /*

@@ -10,19 +10,20 @@ import (
 
 // JobDataSyncRow 对应 manager.job_data_sync_v2 表中的一行记录。
 type JobDataSyncRow struct {
-	JobName            string
-	SrcConnID          string // 引用 config.yaml 中 databases[].id
-	SrcConnName        string // 通过 SrcConnID 在 config.yaml 中找到对应的数据库配置
-	SrcSchemaName      string
-	SrcTableName       string
-	SrcRawSQL          string // 优先使用；非空时作为 source.SQL
-	SrcSelectStatement string // 次优先；SrcRawSQL 为空时使用
-	SrcWhereStatement  string
-	SrcIncrField       string
-	SyncMode           string
-	DstSchemaName      string
-	DstTableName       string
-	DstPK              string
+	JobName           string
+	SrcConnID         string // 引用 config.yaml 中 databases[].id
+	SrcConnName       string // 通过 SrcConnID / src_conn_name 在 config.yaml 中找到对应的数据库配置
+	SrcDBName         string
+	SrcSchemaName     string
+	SrcTableName      string
+	SrcRawSQL         string // 优先使用；非空时作为 source.SQL
+	SrcWhereStatement string
+	FieldsMapping     string
+	SrcIncrField      string
+	SyncMode          string
+	DstSchemaName     string
+	DstTableName      string
+	DstPK             string
 }
 
 // LoadTasksFromDB 连接 metaDB 所指定的 PostgreSQL 数据库，
@@ -41,12 +42,13 @@ func LoadTasksFromDB(ctx context.Context, metaDB DBConfig, jobName string) ([]Ta
 		SELECT
 			job_name,
 			src_conn_id,
-			COALESCE(src_instance, '')       AS src_conn_name,
+			COALESCE(src_conn_name, '')      AS src_conn_name,
+			COALESCE(src_db_name, '')        AS src_db_name,
 			COALESCE(src_schema_name, '')     AS src_schema_name,
 			COALESCE(src_table_name, '')      AS src_table_name,
 			COALESCE(src_rawsql, '')          AS src_rawsql,
-			COALESCE(src_select_statement, '') AS src_select_statement,
 			COALESCE(src_where_statement, '') AS src_where_statement,
+			COALESCE(fields_mapping::text, '') AS fields_mapping,
 			COALESCE(src_incr_field, '')      AS src_incr_field,
 			COALESCE(sync_mode, '')           AS sync_mode,
 			COALESCE(dst_schema_name, '')     AS dst_schema_name,
@@ -73,11 +75,12 @@ func LoadTasksFromDB(ctx context.Context, metaDB DBConfig, jobName string) ([]Ta
 			&r.JobName,
 			&r.SrcConnID,
 			&r.SrcConnName,
+			&r.SrcDBName,
 			&r.SrcSchemaName,
 			&r.SrcTableName,
 			&r.SrcRawSQL,
-			&r.SrcSelectStatement,
 			&r.SrcWhereStatement,
+			&r.FieldsMapping,
 			&r.SrcIncrField,
 			&r.SyncMode,
 			&r.DstSchemaName,
@@ -110,13 +113,14 @@ func LoadTasksFromDB(ctx context.Context, metaDB DBConfig, jobName string) ([]Ta
 //
 // SQL 来源优先级：
 //  1. src_rawsql（非空时直接作为 source.SQL）
-//  2. src_select_statement（非空时作为 source.SQL）
-//  3. 否则使用 src_schema_name.src_table_name 作为 source.Table；
-//     如果同时存在 src_where_statement，则拼装为完整 SQL。
+//  2. 否则使用 src_db_name.src_schema_name.src_table_name（若 src_db_name 非空）
+//     或 src_schema_name.src_table_name 作为 source.Table；
+//     并将 src_where_statement / fields_mapping
+//     写入 source.WhereStatement / source.FieldsMapping，留到 reader 阶段再拼装查询。
 func rowToTaskConfig(r JobDataSyncRow, defaultDstDB string) (TaskConfig, error) {
 
 	if r.SrcConnName == "" && r.SrcConnID == "" {
-		return TaskConfig{}, fmt.Errorf("src_instance and src_conn_id are empty")
+		return TaskConfig{}, fmt.Errorf("src_conn_name and src_conn_id are empty")
 	}
 	if r.DstSchemaName == "" || r.DstTableName == "" {
 		return TaskConfig{}, fmt.Errorf("dst_schema_name / dst_table_name is empty")
@@ -125,9 +129,19 @@ func rowToTaskConfig(r JobDataSyncRow, defaultDstDB string) (TaskConfig, error) 
 	// TODO: 访问 DTS HTTP 接口，传入 SrcConnID，获取对应的数据库连接配置（DBConfig），并将 DBConfig.Name 赋值给 SrcConnName。
 
 	src := &SourceConfig{
-		DBName:    r.SrcConnName,
-		BatchSize: 10000,
-		IncrField: r.SrcIncrField,
+		DBName:         r.SrcConnName,
+		BatchSize:      10000,
+		IncrField:      r.SrcIncrField,
+		WhereStatement: strings.TrimSpace(r.SrcWhereStatement),
+	}
+
+	fieldsMapping := strings.TrimSpace(r.FieldsMapping)
+	if fieldsMapping != "" && fieldsMapping != "*" {
+		parsedMapping, err := ParseFieldsMapping(fieldsMapping)
+		if err != nil {
+			return TaskConfig{}, fmt.Errorf("parse fields_mapping failed: %w", err)
+		}
+		src.FieldsMapping = parsedMapping
 	}
 
 	switch {
@@ -138,19 +152,10 @@ func rowToTaskConfig(r JobDataSyncRow, defaultDstDB string) (TaskConfig, error) 
 		if r.SrcSchemaName == "" || r.SrcTableName == "" {
 			return TaskConfig{}, fmt.Errorf("src_schema_name / src_table_name is empty and no sql provided")
 		}
-		tableRef := r.SrcSchemaName + "." + r.SrcTableName
-		selectClause := strings.TrimSpace(r.SrcSelectStatement)
-		if selectClause == "" {
-			selectClause = "*"
-		}
-		whereClause := strings.TrimSpace(r.SrcWhereStatement)
-		if whereClause != "" {
-			src.SQL = fmt.Sprintf("SELECT %s FROM %s WHERE %s", selectClause, tableRef, whereClause)
-		} else if selectClause != "*" {
-			// 有自定义列但无 WHERE 条件
-			src.SQL = fmt.Sprintf("SELECT %s FROM %s", selectClause, tableRef)
+		if strings.TrimSpace(r.SrcDBName) != "" {
+			src.Table = r.SrcDBName + "." + r.SrcSchemaName + "." + r.SrcTableName
 		} else {
-			src.Table = tableRef
+			src.Table = r.SrcSchemaName + "." + r.SrcTableName
 		}
 	}
 

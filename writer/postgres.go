@@ -34,7 +34,17 @@ func NewPGWriter(conn *pgx.Conn, target *config.TargetConfig, jobName string) Wr
 	return &PGWriter{BaseWriter: base}
 }
 
-func (d *pgWriterDialect) writeCopy(in <-chan transform.CSVBatch, table string) error {
+func (d *pgWriterDialect) writeFull(in <-chan transform.CSVBatch, target *config.TargetConfig) error {
+
+	return nil
+}
+
+func (d *pgWriterDialect) writeAppend(in <-chan transform.CSVBatch, target *config.TargetConfig, source *config.SourceConfig, jobName string) error {
+
+	return nil
+}
+
+func (d *pgWriterDialect) writeCopy(in <-chan transform.CSVBatch, target *config.TargetConfig) error {
 	var firstBatch transform.CSVBatch
 	foundRows := false
 	for batch := range in {
@@ -47,11 +57,11 @@ func (d *pgWriterDialect) writeCopy(in <-chan transform.CSVBatch, table string) 
 	}
 
 	if !foundRows {
-		log.Printf("table=%s no rows to copy, skip", table)
+		log.Printf("table=%s no rows to copy, skip", target.Table)
 		return nil
 	}
 
-	return d.writeCopyWithFirstBatch(firstBatch, in, table)
+	return d.writeCopyWithFirstBatch(firstBatch, in, target.Table)
 }
 
 func (d *pgWriterDialect) writeCopyWithFirstBatch(firstBatch transform.CSVBatch, in <-chan transform.CSVBatch, table string) error {

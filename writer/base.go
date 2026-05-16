@@ -8,7 +8,9 @@ import (
 )
 
 type writerDialect interface {
-	writeCopy(in <-chan transform.CSVBatch, table string) error
+	writeCopy(in <-chan transform.CSVBatch, target *config.TargetConfig) error
+	writeFull(in <-chan transform.CSVBatch, target *config.TargetConfig) error
+	writeAppend(in <-chan transform.CSVBatch, target *config.TargetConfig, source *config.SourceConfig, jobName string) error
 	writeMerge(in <-chan transform.CSVBatch, target *config.TargetConfig, source *config.SourceConfig, jobName string) error
 	getWatermark(target *config.TargetConfig, source *config.SourceConfig, jobName string) (string, error)
 }
@@ -26,7 +28,11 @@ func (w *BaseWriter) WriteBatch(source *config.SourceConfig, in <-chan transform
 
 	switch w.Target.Mode {
 	case config.ModeTypeCopy:
-		return w.dialect.writeCopy(in, w.Target.Table)
+		return w.dialect.writeCopy(in, w.Target)
+	case config.ModeTypeFull:
+		return w.dialect.writeFull(in, w.Target)
+	case config.ModeTypeAppend:
+		return w.dialect.writeAppend(in, w.Target, source, w.JobName)
 	case config.ModeTypeMerge:
 		if w.Target.PK == "" {
 			return fmt.Errorf("pk is required for merge mode")

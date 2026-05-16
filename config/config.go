@@ -64,8 +64,8 @@ type SourceConfig struct {
 	DBName         string        `yaml:"dbname"`
 	SQL            string        `yaml:"sql"`
 	Table          string        `yaml:"table"`           // SQL 和 Table 至少要指定一个，SQL 优先级更高
-	WhereStatement string        `yaml:"where_statement"` // Table 场景下的附加过滤条件；SQL 场景下会作为外层过滤条件追加
 	FieldsMapping  FieldsMapping `yaml:"fields_mapping"`  // Table 场景下的字段映射，格式为 map[源字段/表达式]目标字段
+	WhereStatement string        `yaml:"where_statement"` // Table 场景下的附加过滤条件；SQL 场景下会作为外层过滤条件追加
 	BatchSize      int           `yaml:"batch_size"`
 	DBType         DBType        `yaml:"-"`
 	Mode           ModeType      `yaml:"-"`
@@ -308,6 +308,13 @@ const (
 	ModeTypeMerge  ModeType = "merge"
 )
 
+var supportedTargetModes = map[ModeType]struct{}{
+	ModeTypeCopy:   {},
+	ModeTypeFull:   {},
+	ModeTypeAppend: {},
+	ModeTypeMerge:  {},
+}
+
 /*
 LoadConfig
 读取 YAML 配置
@@ -417,6 +424,9 @@ func validateTarget(target *TargetConfig, dbTypes map[string]DBType) error {
 	if strings.TrimSpace(target.Table) == "" {
 		return fmt.Errorf("target table is required")
 	}
+	if _, ok := supportedTargetModes[target.Mode]; !ok {
+		return fmt.Errorf("unsupported target mode: %s", target.Mode)
+	}
 	return nil
 }
 
@@ -433,16 +443,7 @@ func validateSource(source *SourceConfig, target *TargetConfig, dbTypes map[stri
 		return fmt.Errorf("source db not found: %s", source.DBName)
 	}
 
-	source.normalize()
 	source.DBType = dbType
-
-	if err := source.FieldsMapping.Validate(); err != nil {
-		return err
-	}
-
-	if source.BatchSize <= 0 {
-		source.BatchSize = 10000
-	}
 
 	if source.SQL == "" && source.Table == "" {
 		return fmt.Errorf("sql or table must be specified")
@@ -454,6 +455,14 @@ func validateSource(source *SourceConfig, target *TargetConfig, dbTypes map[stri
 
 	if err := ValidateSourceTableName(source.Table, source.DBType); err != nil {
 		return err
+	}
+
+	if err := source.FieldsMapping.Validate(); err != nil {
+		return err
+	}
+
+	if source.BatchSize <= 0 {
+		source.BatchSize = 10000
 	}
 
 	if target.CommitBatchSize > 0 {

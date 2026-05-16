@@ -306,7 +306,6 @@ const (
 	ModeTypeFull   ModeType = "full"
 	ModeTypeAppend ModeType = "append"
 	ModeTypeMerge  ModeType = "merge"
-	ModeTypeCDC    ModeType = "cdc"
 )
 
 /*

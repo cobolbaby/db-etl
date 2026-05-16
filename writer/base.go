@@ -27,7 +27,7 @@ func (w *BaseWriter) WriteBatch(source *config.SourceConfig, in <-chan transform
 	switch w.Target.Mode {
 	case config.ModeTypeCopy:
 		return w.dialect.writeCopy(in, w.Target.Table)
-	case config.ModeTypeMerge, config.ModeTypeCDC:
+	case config.ModeTypeMerge:
 		if w.Target.PK == "" {
 			return fmt.Errorf("pk is required for merge mode")
 		}

@@ -13,6 +13,7 @@ import (
 	"db-etl/pipeline"
 	"db-etl/reader"
 	"db-etl/transform"
+	"db-etl/util"
 	"db-etl/writer"
 )
 
@@ -74,6 +75,19 @@ func main() {
 	// 3. Worker Pool
 	// --------------------------------
 
+	retryCfg := util.DefaultRetryConfig()
+	if cfg.Retry != nil {
+		if cfg.Retry.MaxAttempts > 0 {
+			retryCfg.MaxAttempts = cfg.Retry.MaxAttempts
+		}
+		if cfg.Retry.DelaySeconds > 0 {
+			retryCfg.Delay = time.Duration(cfg.Retry.DelaySeconds) * time.Second
+		}
+		if cfg.Retry.MaxDelaySeconds > 0 {
+			retryCfg.MaxDelay = time.Duration(cfg.Retry.MaxDelaySeconds) * time.Second
+		}
+	}
+
 	workers := min(runtime.NumCPU(), 4) // 4 is an empirical value, can be tuned
 	var wg sync.WaitGroup
 	for i := 0; i < workers; i++ {
@@ -86,7 +100,7 @@ func main() {
 				if task.Name == "" {
 					task.Name = cfg.Name
 				}
-				if err := runTask(task, dbRegistry); err != nil {
+				if err := runTask(task, dbRegistry, retryCfg); err != nil {
 					log.Printf("task failed: %v", err)
 					if cfg.ErrorPolicy == "abort" {
 						log.Fatal(err)
@@ -102,7 +116,7 @@ func main() {
 
 }
 
-func runTask(task config.TaskConfig, dbRegistry map[string]config.DBConfig) error {
+func runTask(task config.TaskConfig, dbRegistry map[string]config.DBConfig, retryCfg util.RetryConfig) error {
 
 	for _, src := range task.Sources {
 
@@ -120,76 +134,101 @@ func runTask(task config.TaskConfig, dbRegistry map[string]config.DBConfig) erro
 			return fmt.Errorf("target db not found: %s", task.Target.DBName)
 		}
 
-		// -----------------------------
-		// Writer
-		// -----------------------------
-
-		w := writer.NewWriter(dstDB, task.Target, task.Name)
-
-		// 同步方式定义在 Writer 端，但又会影响 Reader 端的抽取逻辑（增量抽取需要从目标端获取上次抽取的 Watermark 位置），
-		// 所以在这里把 Mode 同步到 SourceConfig 里，Reader 和 Writer 都可以访问到
-		src.Mode = task.Target.Mode
-
-		// 增量抽取需要知道上次抽取的 Watermark 位置，这个位置存在目标数据库里
-		if src.Mode != config.ModeTypeFull && src.IncrField != "" {
-
-			incrPoint, err := w.GetWatermark(src)
-			if err != nil {
-				return fmt.Errorf("failed to get incr point: %v", err)
-			}
-			src.IncrPoint = incrPoint
-			log.Printf("incr extraction mode, target table: %s, field: %s, point: %s", task.Target.Table, src.IncrField, src.IncrPoint)
-		}
-
-		// -----------------------------
-		// Reader
-		// -----------------------------
-
-		r := reader.NewReader(srcDB, src)
-
-		// -----------------------------
-		// Transformer
-		// -----------------------------
-
-		handlers := r.GetColumnHandlers()
-		t := &transform.DefaultTransformer{
-			Handlers: handlers,
-		}
-
-		// -----------------------------
-		// Pipeline
-		// -----------------------------
-
-		startedAt := time.Now()
-		log.Printf(
-			"pipeline start %s -> %s (%s)",
-			src.DBName,
-			task.Target.DBName,
-			task.Target.Table,
-		)
-
-		err := pipeline.RunPipeline(src, r, t, w)
+		label := fmt.Sprintf("%s → %s (%s)", src.DBName, task.Target.DBName, task.Target.Table)
+		err := util.Retry(label, retryCfg, func() error {
+			return runSource(src, srcDB, dstDB, task)
+		})
 		if err != nil {
-			log.Printf(
-				"pipeline failed %s -> %s (%s) cost=%s err=%v",
-				src.DBName,
-				task.Target.DBName,
-				task.Target.Table,
-				time.Since(startedAt).Round(time.Millisecond),
-				err,
-			)
-			// return err
-			continue // 继续执行下一个 source 的任务
+			log.Printf("pipeline failed %s after retries: %v", label, err)
+			continue
 		}
+	}
 
+	return nil
+}
+
+func runSource(src *config.SourceConfig, srcDB config.DBConfig, dstDB config.DBConfig, task config.TaskConfig) error {
+
+	// mc := metrics.Default()
+	// pm := mc.NewPipelineMetrics(src.DBName, task.Target.DBName, task.Target.Table, string(task.Target.Mode))
+
+	// -----------------------------
+	// Writer
+	// -----------------------------
+
+	w := writer.NewWriter(dstDB, task.Target, task.Name)
+
+	// 同步方式定义在 Writer 端，但又会影响 Reader 端的抽取逻辑（增量抽取需要从目标端获取上次抽取的 Watermark 位置），
+	// 所以在这里把 Mode 同步到 SourceConfig 里，Reader 和 Writer 都可以访问到
+	src.Mode = task.Target.Mode
+
+	// 增量抽取需要知道上次抽取的 Watermark 位置，这个位置存在目标数据库里
+	if src.Mode != config.ModeTypeFull && src.IncrField != "" {
+
+		incrPoint, err := w.GetWatermark(src)
+		if err != nil {
+			return fmt.Errorf("failed to get incr point: %v", err)
+		}
+		src.IncrPoint = incrPoint
+		log.Printf("incr extraction mode, target table: %s, field: %s, point: %s", task.Target.Table, src.IncrField, src.IncrPoint)
+	}
+
+	// -----------------------------
+	// Reader
+	// -----------------------------
+
+	r := reader.NewReader(srcDB, src)
+
+	// -----------------------------
+	// Transformer
+	// -----------------------------
+
+	handlers := r.GetColumnHandlers()
+	t := &transform.DefaultTransformer{
+		Handlers: handlers,
+	}
+
+	// -----------------------------
+	// Pipeline
+	// -----------------------------
+
+	startedAt := time.Now()
+	log.Printf(
+		"pipeline start %s -> %s (%s)",
+		src.DBName,
+		task.Target.DBName,
+		task.Target.Table,
+	)
+
+	err := pipeline.RunPipeline(src, r, t, w)
+	// mc.Finish(pm, err)
+
+	if err != nil {
 		log.Printf(
-			"pipeline finished %s -> %s (%s) cost=%s",
+			"pipeline failed %s -> %s (%s) cost=%s err=%v",
 			src.DBName,
 			task.Target.DBName,
 			task.Target.Table,
 			time.Since(startedAt).Round(time.Millisecond),
+			err,
 		)
+		return fmt.Errorf(
+			"pipeline failed %s -> %s (%s) cost=%s: %v",
+			src.DBName,
+			task.Target.DBName,
+			task.Target.Table,
+			time.Since(startedAt).Round(time.Millisecond),
+			err,
+		)
+
 	}
 
+	log.Printf(
+		"pipeline finished %s -> %s (%s) cost=%s",
+		src.DBName,
+		task.Target.DBName,
+		task.Target.Table,
+		time.Since(startedAt).Round(time.Millisecond),
+	)
 	return nil
 }

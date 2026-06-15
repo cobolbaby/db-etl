@@ -20,6 +20,15 @@ type Config struct {
 	// MetaDB 指定存放 manager.job_data_sync_v2 配置表的数据库别名（引用 databases[].name）。
 	// 当通过 -job 参数从数据库加载任务列表时必填。
 	MetaDB string `yaml:"meta_db"`
+	// Retry 配置任务失败时的重试策略。
+	Retry *RetryPolicy `yaml:"retry"`
+}
+
+// RetryPolicy configures retry behavior for source-level failures.
+type RetryPolicy struct {
+	MaxAttempts     int `yaml:"max_attempts"`      // Max attempts including the first. Default 3.
+	DelaySeconds    int `yaml:"delay_seconds"`     // Initial delay in seconds. Default 5.
+	MaxDelaySeconds int `yaml:"max_delay_seconds"` // Max backoff delay in seconds. Default 60.
 }
 
 type DBConfig struct {
@@ -72,6 +81,16 @@ type SourceConfig struct {
 	IncrField      string        `yaml:"incr_field"` // 用于增量抽取，指定一个日期/时间字段，配合 Watermark 实现增量抽取
 	IncrPoint      string        `yaml:"incr_point"` // 增量抽取的起点
 	OrderBy        string        `yaml:"order_by"`   // OrderBy 指定查询排序字段。当 target.commit_batch_size > 0 时必须有序，框架会自动设为 src_incr_field，也可手动指定其他表达式（如 "id ASC"）。
+	// Transforms 定义字段级后处理转换规则（在类型序列化之后执行）。
+	Transforms []FieldTransformDef `yaml:"transforms"`
+}
+
+// FieldTransformDef defines a single field transformation rule in config.
+type FieldTransformDef struct {
+	Column    string `yaml:"column"`
+	Transform string `yaml:"transform"` // trim, upper, lower, replace, default, prefix, suffix
+	Arg1      string `yaml:"arg1"`
+	Arg2      string `yaml:"arg2"`
 }
 
 type FieldsMapping struct {
@@ -333,6 +352,11 @@ func LoadConfig(path string) (*Config, error) {
 	var cfg Config
 
 	if err := yaml.Unmarshal(data, &cfg); err != nil {
+		return nil, err
+	}
+
+	// 解析敏感字段中的环境变量引用
+	if err := ResolveSecrets(&cfg); err != nil {
 		return nil, err
 	}
 

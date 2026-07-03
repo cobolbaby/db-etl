@@ -55,6 +55,10 @@ func main() {
 		}
 		log.Printf("loaded %d task(s) from manager.job_data_sync_v2 for job_name=%q", len(dbTasks), cfg.Name)
 		tasks = dbTasks
+
+		// tasks = append(tasks, dbTasks...)
+		// TODO: 理论上跑了一遍的任务，任务状态都会更新到数据库中，所以加载的任务列表要进行一次去重，否则可能会有重复。
+		// 需要 review 一下 getWatermark 方法，获取哪个字段可能作为唯一标识符，然后与配置文件中的任务进行匹配去重。
 	}
 
 	if len(tasks) == 0 {
@@ -136,7 +140,7 @@ func runTask(task config.TaskConfig, dbRegistry map[string]config.DBConfig, retr
 
 		label := fmt.Sprintf("%s → %s (%s)", src.DBName, task.Target.DBName, task.Target.Table)
 		err := util.Retry(label, retryCfg, func() error {
-			return runSource(src, srcDB, dstDB, task)
+			return runPipeline(src, srcDB, dstDB, task)
 		})
 		if err != nil {
 			log.Printf("pipeline failed %s after retries: %v", label, err)
@@ -147,7 +151,7 @@ func runTask(task config.TaskConfig, dbRegistry map[string]config.DBConfig, retr
 	return nil
 }
 
-func runSource(src *config.SourceConfig, srcDB config.DBConfig, dstDB config.DBConfig, task config.TaskConfig) error {
+func runPipeline(src *config.SourceConfig, srcDB config.DBConfig, dstDB config.DBConfig, task config.TaskConfig) error {
 
 	// mc := metrics.Default()
 	// pm := mc.NewPipelineMetrics(src.DBName, task.Target.DBName, task.Target.Table, string(task.Target.Mode))
@@ -204,14 +208,6 @@ func runSource(src *config.SourceConfig, srcDB config.DBConfig, dstDB config.DBC
 	// mc.Finish(pm, err)
 
 	if err != nil {
-		log.Printf(
-			"pipeline failed %s -> %s (%s) cost=%s err=%v",
-			src.DBName,
-			task.Target.DBName,
-			task.Target.Table,
-			time.Since(startedAt).Round(time.Millisecond),
-			err,
-		)
 		return fmt.Errorf(
 			"pipeline failed %s -> %s (%s) cost=%s: %v",
 			src.DBName,

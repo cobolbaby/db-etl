@@ -5,6 +5,7 @@ import (
 	"context"
 	"db-etl/config"
 	"db-etl/transform"
+	"db-etl/util"
 	"errors"
 	"fmt"
 	"io"
@@ -33,6 +34,24 @@ func NewPGWriter(conn *pgx.Conn, target *config.TargetConfig, jobName string) Wr
 	base.dialect = &pgWriterDialect{conn: conn}
 
 	return &PGWriter{BaseWriter: base}
+}
+
+// pgPermanentError returns util.NonRetryable(err) for PostgreSQL error classes that
+// cannot be resolved by retrying (data exceptions, integrity constraints, syntax errors).
+func pgPermanentError(err error) error {
+	if err == nil {
+		return nil
+	}
+	var pgErr *pgconn.PgError
+	if errors.As(err, &pgErr) && len(pgErr.Code) >= 2 {
+		switch pgErr.Code[:2] {
+		case "22", // Data Exception (type mismatches, overflow, …)
+			"23", // Integrity Constraint Violation (not-null, FK, unique, check)
+			"42": // Syntax Error or Access Rule Violation (bad column, bad table, …)
+			return util.NonRetryable(err)
+		}
+	}
+	return err
 }
 
 // drainFirstBatch 从 channel 中取出第一个非空 batch，用于获取列信息并启动后续写入。
@@ -204,7 +223,7 @@ func (d *pgWriterDialect) writeCopyStream(
 
 		if err := <-errCh; err != nil {
 			log.Printf("COPY %s error: %v", table, err)
-			return err
+			return pgPermanentError(err)
 		}
 
 		log.Printf("COPY %s completed successfully", table)
@@ -222,6 +241,8 @@ func (d *pgWriterDialect) writeCopyStream(
 	return finishCopy()
 }
 
+// TODO: 如何处理 NULL？ COPY 语句里可以指定 NULL ”，表示空字符串会被当作 NULL 处理；
+// 如果需要区分空字符串和 NULL，可以改用其他不太可能出现的占位符，如 \N，并在写入时将 Go 中的 nil 转换为 \N。
 func buildCopySQL(table string, columns []string) string {
 	base := "COPY " + table
 	if len(columns) > 0 {
@@ -350,7 +371,7 @@ func (d *pgWriterDialect) writeIncrSegmented(in <-chan transform.CSVBatch, targe
 		// 必须等待 COPY goroutine 完全结束，才能在同一连接上执行后续 SQL
 		if copyErr := <-copyDone; copyErr != nil {
 			_ = currentTx.Rollback(ctx)
-			return fmt.Errorf("table=%s COPY failed: %w", target.Table, copyErr)
+			return fmt.Errorf("table=%s COPY failed: %w", target.Table, pgPermanentError(copyErr))
 		}
 
 		var deleted int64

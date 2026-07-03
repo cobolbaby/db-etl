@@ -1,11 +1,28 @@
 package util
 
 import (
+	"errors"
 	"fmt"
 	"log"
 	"math"
 	"time"
 )
+
+// NonRetryableError wraps an error that should not be retried.
+type NonRetryableError struct {
+	Err error
+}
+
+func (e *NonRetryableError) Error() string { return e.Err.Error() }
+func (e *NonRetryableError) Unwrap() error { return e.Err }
+
+// NonRetryable wraps err to signal that Retry should abort immediately without further attempts.
+func NonRetryable(err error) error {
+	if err == nil {
+		return nil
+	}
+	return &NonRetryableError{Err: err}
+}
 
 // RetryConfig holds retry behavior settings.
 type RetryConfig struct {
@@ -45,7 +62,12 @@ func Retry(label string, cfg RetryConfig, fn func() error) error {
 			return nil
 		}
 
-		if attempt == cfg.MaxAttempts {
+		var nre *NonRetryableError
+		if errors.As(lastErr, &nre) { // 不可重试，立即返回
+			return nre.Err
+		}
+
+		if attempt == cfg.MaxAttempts { // 已到上限，跳出
 			break
 		}
 
@@ -53,7 +75,6 @@ func Retry(label string, cfg RetryConfig, fn func() error) error {
 		if delay > cfg.MaxDelay {
 			delay = cfg.MaxDelay
 		}
-
 		log.Printf("[retry] %s attempt %d/%d failed: %v, retrying in %s",
 			label, attempt, cfg.MaxAttempts, lastErr, delay)
 		time.Sleep(delay)

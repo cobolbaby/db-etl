@@ -17,10 +17,24 @@ import (
 	"db-etl/writer"
 )
 
+// Populated at build time via -ldflags.
+var (
+	Version   = "dev"
+	Commit    = "unknown"
+	BuildTime = "unknown"
+)
+
 func main() {
 
 	configPath := flag.String("config", "config.yaml", "path to config file")
+	showVersion := flag.Bool("version", false, "print version information and exit")
 	flag.Parse()
+
+	if *showVersion {
+		fmt.Printf("db-etl %s (commit %s, built %s, %s/%s)\n",
+			Version, Commit, BuildTime, runtime.GOOS, runtime.GOARCH)
+		return
+	}
 
 	cfg, err := config.LoadConfig(*configPath)
 	if err != nil {

@@ -13,14 +13,19 @@ endif
 
 BIN_NAME := $(APP_NAME)-$(TARGET_OS)-$(TARGET_ARCH)$(EXE_SUFFIX)
 
+VERSION    := $(shell cat VERSION 2>/dev/null || echo dev)
+COMMIT     := $(shell git rev-parse --short HEAD 2>/dev/null || echo unknown)
+BUILD_TIME := $(shell date -u '+%Y-%m-%dT%H:%M:%SZ')
+LDFLAGS    := -X main.Version=$(VERSION) -X main.Commit=$(COMMIT) -X main.BuildTime=$(BUILD_TIME)
+
 .PHONY: all build build-linux build-exe build-windows build-macos clean
 
-all: build-linux
+all: build-linux build-exe build-macos
 
 build:
 	@echo "Cross-compiling $(BIN_NAME) for $(TARGET_OS)/$(TARGET_ARCH)..."
 	@mkdir -p $(BUILD_DIR)
-	@CGO_ENABLED=$(CGO_ENABLED) GOOS=$(TARGET_OS) GOARCH=$(TARGET_ARCH) $(GO) build -o $(BUILD_DIR)/$(BIN_NAME) $(SRC)
+	@CGO_ENABLED=$(CGO_ENABLED) GOOS=$(TARGET_OS) GOARCH=$(TARGET_ARCH) $(GO) build -ldflags "$(LDFLAGS)" -o $(BUILD_DIR)/$(BIN_NAME) $(SRC)
 	@echo "Build complete: $(BUILD_DIR)/$(BIN_NAME)"
 
 build-linux:

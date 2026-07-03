@@ -207,16 +207,16 @@ func (d *pgWriterDialect) writeCopyStream(
 	finishWithError := func(err error) error {
 		_ = pw.CloseWithError(err)
 		if copyErr := <-errCh; copyErr != nil {
-			return copyErr
+			return pgPermanentError(copyErr)
 		}
-		return err
+		return pgPermanentError(err)
 	}
 	finishCopy := func() error {
 		if err := pw.Close(); err != nil {
 			if copyErr := <-errCh; copyErr != nil {
-				return copyErr
+				return pgPermanentError(copyErr)
 			}
-			return err
+			return pgPermanentError(err)
 		}
 
 		log.Printf("COPY %s waiting for completion...", table)
@@ -297,7 +297,7 @@ func (d *pgWriterDialect) writeIncrOnce(in <-chan transform.CSVBatch, target *co
 
 	inserted, err := d.insertTarget(ctx, tx, staging, target)
 	if err != nil {
-		return err
+		return pgPermanentError(err)
 	}
 
 	if source != nil && source.IncrField != "" {
@@ -387,7 +387,7 @@ func (d *pgWriterDialect) writeIncrSegmented(in <-chan transform.CSVBatch, targe
 		inserted, err := d.insertTarget(ctx, currentTx, currentStaging, target)
 		if err != nil {
 			_ = currentTx.Rollback(ctx)
-			return err
+			return pgPermanentError(err)
 		}
 		totalDeleted += deleted
 		totalInserted += inserted
@@ -439,7 +439,7 @@ func (d *pgWriterDialect) writeIncrSegmented(in <-chan transform.CSVBatch, targe
 		case copyErr := <-copyDone:
 			_ = currentTx.Rollback(ctx)
 			if copyErr != nil {
-				return fmt.Errorf("table=%s copy goroutine failed: %w", target.Table, copyErr)
+				return fmt.Errorf("table=%s copy goroutine failed: %w", target.Table, pgPermanentError(copyErr))
 			}
 			return fmt.Errorf("table=%s copy goroutine exited unexpectedly", target.Table)
 		}

@@ -211,24 +211,6 @@ func (d *pgWriterDialect) writeCopyStream(
 		}
 		return pgPermanentError(err)
 	}
-	finishCopy := func() error {
-		if err := pw.Close(); err != nil {
-			if copyErr := <-errCh; copyErr != nil {
-				return pgPermanentError(copyErr)
-			}
-			return pgPermanentError(err)
-		}
-
-		log.Printf("COPY %s waiting for completion...", table)
-
-		if err := <-errCh; err != nil {
-			log.Printf("COPY %s error: %v", table, err)
-			return pgPermanentError(err)
-		}
-
-		log.Printf("COPY %s completed successfully", table)
-		return nil
-	}
 
 	if err := iterFn(writeBatch); err != nil {
 		return finishWithError(err)
@@ -238,7 +220,13 @@ func (d *pgWriterDialect) writeCopyStream(
 		return finishWithError(err)
 	}
 
-	return finishCopy()
+	pw.Close()
+	if err := <-errCh; err != nil {
+		log.Printf("COPY %s error: %v", table, err)
+		return pgPermanentError(err)
+	}
+	log.Printf("COPY %s completed successfully", table)
+	return nil
 }
 
 // TODO: 如何处理 NULL？ COPY 语句里可以指定 NULL ”，表示空字符串会被当作 NULL 处理；

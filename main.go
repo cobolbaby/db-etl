@@ -223,7 +223,7 @@ func runPipeline(src *config.SourceConfig, srcDB config.DBConfig, dstDB config.D
 
 	if err != nil {
 		return fmt.Errorf(
-			"pipeline failed %s -> %s (%s) cost=%s: %v",
+			"pipeline failed %s -> %s (%s) cost=%s: %w",
 			src.DBName,
 			task.Target.DBName,
 			task.Target.Table,

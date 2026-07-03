@@ -82,16 +82,16 @@ type SourceConfig struct {
 	IncrPoint      string        `yaml:"incr_point"` // 增量抽取的起点
 	OrderBy        string        `yaml:"order_by"`   // OrderBy 指定查询排序字段。当 target.commit_batch_size > 0 时必须有序，框架会自动设为 src_incr_field，也可手动指定其他表达式（如 "id ASC"）。
 	// Transforms 定义字段级后处理转换规则（在类型序列化之后执行）。
-	Transforms []FieldTransformDef `yaml:"transforms"`
+	// Transforms []FieldTransformDef `yaml:"transforms"`
 }
 
 // FieldTransformDef defines a single field transformation rule in config.
-type FieldTransformDef struct {
-	Column    string `yaml:"column"`
-	Transform string `yaml:"transform"` // trim, upper, lower, replace, default, prefix, suffix
-	Arg1      string `yaml:"arg1"`
-	Arg2      string `yaml:"arg2"`
-}
+// type FieldTransformDef struct {
+// 	Column    string `yaml:"column"`
+// 	Transform string `yaml:"transform"` // trim, upper, lower, replace, default, prefix, suffix
+// 	Arg1      string `yaml:"arg1"`
+// 	Arg2      string `yaml:"arg2"`
+// }
 
 type FieldsMapping struct {
 	Items map[string]string

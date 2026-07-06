@@ -3,6 +3,7 @@ package reader
 import (
 	"database/sql"
 	"db-etl/config"
+	"db-etl/util"
 	"fmt"
 	"strings"
 	"time"
@@ -59,10 +60,13 @@ func (pgDialect) getColumnHandler(dbType string) ColHandler {
 
 	case "DATETIME", "DATE", "TIME":
 		return func(v any) string {
-			if t, ok := v.(time.Time); ok && !t.IsZero() {
+			if v == nil {
+				return util.NullSentinel
+			}
+			if t, ok := v.(time.Time); ok {
 				return t.Format("2006-01-02 15:04:05.000")
 			}
-			return ""
+			return defaultColumnHandler(v)
 		}
 	default:
 		return defaultColumnHandler

@@ -229,15 +229,15 @@ func (d *pgWriterDialect) writeCopyStream(
 	return nil
 }
 
-// TODO: 如何处理 NULL？ COPY 语句里可以指定 NULL ”，表示空字符串会被当作 NULL 处理；
-// 如果需要区分空字符串和 NULL，可以改用其他不太可能出现的占位符，如 \N，并在写入时将 Go 中的 nil 转换为 \N。
+// 使用保留占位符区分 NULL 与空字符串：
+// nil -> util.NullSentinel（被 COPY 识别为 NULL），空字符串仍为 ""。
 func buildCopySQL(table string, columns []string) string {
 	base := "COPY " + table
 	if len(columns) > 0 {
 		base += "(" + strings.Join(columns, ", ") + ")"
 	}
 
-	return base + " FROM STDIN WITH (FORMAT CSV, DELIMITER ',', QUOTE '\"', ESCAPE '\"', NULL '')"
+	return base + " FROM STDIN WITH (FORMAT CSV, DELIMITER ',', QUOTE '\"', ESCAPE '\"', NULL '" + util.NullSentinel + "')"
 }
 
 func (d *pgWriterDialect) writeMerge(in <-chan transform.CSVBatch, target *config.TargetConfig, source *config.SourceConfig, jobName string) error {

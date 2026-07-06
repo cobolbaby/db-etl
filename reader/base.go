@@ -172,6 +172,11 @@ func (r *BaseReader) buildWhereClause(emptyResult bool) string {
 	return strings.Join(parts, " AND ")
 }
 
+// resolveProjection 生成 SQL SELECT 子句中的列投影部分。
+// - 无字段映射时返回 "*"（查询所有列）
+// - 有字段映射时生成 "col1 AS alias1, col2 AS alias2, ..." 格式
+// 采用回调模式将字段格式化操作下沉到方言层（PostgreSQL/MSSQL），
+// 确保不同数据库的引号规则（" vs []）得以正确应用。
 func (r *BaseReader) resolveProjection() (string, error) {
 	if r.Source == nil {
 		return "*", nil
@@ -191,41 +196,54 @@ func (r *BaseReader) resolveProjection() (string, error) {
 	)
 }
 
+// formatProjectionSource 处理源表列名，区分两种情况：
+//  1. 裸标识符（如 "id"、"user_name"）：交给 quoteIdentifier 加上方言特定的引号（PostgreSQL 用 ""，MSSQL 用 []）
+//  2. 其他（已引用标识符或复杂表达式如 "CAST(x AS INT)"、`"ColumnName"`、"schema.table"）：直接返回
+//     - 已引用标识符：quoteIdentifier 内部会幂等处理，与直接返回结果相同，无需单独分支
+//     - 复杂表达式：不能加引号，否则会破坏表达式结构
 func formatProjectionSource(sourceField string, quoteIdentifier func(string) string) string {
 	sourceField = strings.TrimSpace(sourceField)
 	if sourceField == "" {
 		return ""
 	}
 
-	if isBareIdentifier(sourceField) || isAlreadyQuotedIdentifier(sourceField) {
+	if isBareIdentifier(sourceField) {
 		return quoteIdentifier(sourceField)
 	}
 
+	// 已引用标识符或复杂表达式，保持原样
 	return sourceField
 }
 
+// formatProjectionAlias 处理目标列别名。
+// 别名总是简单标识符（来自配置的 fields_mapping value），不支持复杂表达式，
+// 直接交给 quoteIdentifier 处理——方言内部已做防重复引号检查，无需在此重复判断。
 func formatProjectionAlias(alias string, quoteIdentifier func(string) string) string {
 	alias = strings.TrimSpace(alias)
 	if alias == "" {
-		return ""
-	}
-	if isAlreadyQuotedIdentifier(alias) {
-		return alias
+		return "" // FieldsMapping.Projection 会检查此空值并报错
 	}
 	return quoteIdentifier(alias)
 }
 
+// isBareIdentifier 判断字符串是否为简单标识符（无需额外转义）。
+// SQL 标准定义：首字符必须是字母或下划线，后续字符可以是字母、数字或下划线。
+// 用途：区分 "id"（裸标识符）与 "CAST(x AS INT)" 或 "schema.table"（非裸标识符）。
+// 裸标识符需要加引号以处理含有特殊字符或关键字的情况；
+// 非裸标识符直接返回以保护其语法结构。
 func isBareIdentifier(value string) bool {
 	if value == "" {
 		return false
 	}
 	for index, char := range value {
 		if index == 0 {
+			// 首字符：字母或下划线
 			if (char < 'A' || char > 'Z') && (char < 'a' || char > 'z') && char != '_' {
 				return false
 			}
 			continue
 		}
+		// 后续字符：字母、数字或下划线
 		if (char < 'A' || char > 'Z') && (char < 'a' || char > 'z') && (char < '0' || char > '9') && char != '_' {
 			return false
 		}
@@ -233,14 +251,35 @@ func isBareIdentifier(value string) bool {
 	return true
 }
 
+// isAlreadyQuotedIdentifier 判断字符串是否已被引用，防止重复引号。
+// PostgreSQL 风格引号：`"identifier"`
+// MSSQL 风格引号：`[identifier]`
+// 示例：`"UserId"` 或 `[UserId]` 已被引用，无需再加引号。
 func isAlreadyQuotedIdentifier(value string) bool {
 	return (strings.HasPrefix(value, `"`) && strings.HasSuffix(value, `"`)) ||
 		(strings.HasPrefix(value, "[") && strings.HasSuffix(value, "]"))
 }
 
+// defaultColumnHandler 是列值的通用转换器，负责将数据库查询结果转换为 CSV 格式的字符串。
+//
+// 核心设计：区分 nil（SQL NULL）与空字符串""
+//   - nil 值 → 返回 util.NullSentinel（"__DB_ETL_NULL__"）
+//     在 PostgreSQL COPY 中，此哨兵会被配置的 NULL '__DB_ETL_NULL__' 识别为真正的 SQL NULL
+//   - 非 nil 值 → 通过 SanitizeString 进行 CSV 安全转义
+//     空字符串会被 SanitizeString 返回为 ""（不是 NULL），保持在 COPY 中作为空字符串入库
+//
+// 这样做的原因：
+// 之前的实现把 nil 都转为 ""（空字符串），导致 PostgreSQL 无法区分：
+//
+//	SELECT NULL → "" → COPY 中被当作普通空字符串，对 NOT NULL 约束无益
+//
+// 现在通过哨兵值中间层，确保：
+//
+//	SELECT NULL → NullSentinel → COPY 中被识别为 NULL，正确触发 NOT NULL 约束检查
+//	SELECT '' → "" → COPY 中保持为空字符串，不触发 NOT NULL 约束
 func defaultColumnHandler(v any) string {
 	if v == nil {
-		return ""
+		return util.NullSentinel
 	}
 
 	switch t := v.(type) {

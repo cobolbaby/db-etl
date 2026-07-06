@@ -3,6 +3,7 @@ package reader
 import (
 	"database/sql"
 	"db-etl/config"
+	"db-etl/util"
 	"encoding/hex"
 	"fmt"
 	"strings"
@@ -66,6 +67,9 @@ func (mssqlDialect) getColumnHandler(dbType string) ColHandler {
 	switch strings.ToUpper(dbType) {
 	case "UNIQUEIDENTIFIER":
 		return func(v any) string {
+			if v == nil {
+				return util.NullSentinel
+			}
 			switch t := v.(type) {
 			case []byte:
 				s, _ := MSSQLUUIDToString(t)
@@ -73,23 +77,32 @@ func (mssqlDialect) getColumnHandler(dbType string) ColHandler {
 			case string:
 				return strings.ToUpper(t)
 			default:
-				return ""
+				return defaultColumnHandler(v)
 			}
 		}
 	case "DATETIME", "DATETIME2", "DATE", "TIME":
 		return func(v any) string {
-			if t, ok := v.(time.Time); ok && !t.IsZero() {
+			if v == nil {
+				return util.NullSentinel
+			}
+			if t, ok := v.(time.Time); ok {
 				return t.Format("2006-01-02 15:04:05.000")
 			}
-			return ""
+			return defaultColumnHandler(v)
 		}
 	case "IMAGE", "VARBINARY", "BINARY":
 		// PostgreSQL bytea 在 COPY CSV 中使用 \x 十六进制格式
 		return func(v any) string {
-			if b, ok := v.([]byte); ok && len(b) > 0 {
+			if v == nil {
+				return util.NullSentinel
+			}
+			if b, ok := v.([]byte); ok {
+				if len(b) == 0 {
+					return `\x`
+				}
 				return `\x` + hex.EncodeToString(b)
 			}
-			return ""
+			return defaultColumnHandler(v)
 		}
 	default:
 		return defaultColumnHandler

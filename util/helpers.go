@@ -44,8 +44,7 @@ func SanitizeString(s string) string {
 
 	// Step 2: 保护保留的 NULL 哨兵值（在清洗之前拦截）
 	// nil 值由上层 defaultColumnHandler 编码为 NullSentinel 后才进入此函数，
-	// 此时哨兵值不应被清洗逻辑修改，提前拦截并强制加引号，
-	// 确保作为普通文本入库，而非被 COPY 识别为 SQL NULL
+	// 此时哨兵值不应被清洗逻辑修改，提前拦截并强制加引号，确保作为普通文本入库，而非被 COPY 识别为 SQL NULL
 	if s == NullSentinel {
 		return `"` + s + `"`
 	}

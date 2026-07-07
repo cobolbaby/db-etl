@@ -85,7 +85,7 @@ func (d *pgWriterDialect) writeFull(in <-chan transform.CSVBatch, target *config
 	// 尝试带超时的 TRUNCATE；若锁等待超时则回滚当前事务，开新事务用 DELETE FROM 退避
 	if err := d.tryTruncateWithTimeout(ctx, tx, target); err != nil {
 		if !isLockTimeoutError(err) {
-			return err
+			return pgPermanentError(err)
 		}
 
 		log.Printf("table=%s TRUNCATE lock timeout, falling back to DELETE FROM", target.Table)
@@ -99,7 +99,7 @@ func (d *pgWriterDialect) writeFull(in <-chan transform.CSVBatch, target *config
 		defer tx.Rollback(ctx)
 
 		if _, err := tx.Exec(ctx, fmt.Sprintf("DELETE FROM %s", target.Table)); err != nil {
-			return err
+			return pgPermanentError(err)
 		}
 		log.Printf("table=%s DELETE FROM completed", target.Table)
 	}

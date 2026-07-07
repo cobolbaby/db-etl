@@ -67,9 +67,6 @@ func (mssqlDialect) getColumnHandler(dbType string) ColHandler {
 	switch strings.ToUpper(dbType) {
 	case "UNIQUEIDENTIFIER":
 		return func(v any) string {
-			if v == nil {
-				return util.NullSentinel
-			}
 			switch t := v.(type) {
 			case []byte:
 				s, _ := MSSQLUUIDToString(t)

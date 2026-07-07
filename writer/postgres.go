@@ -44,14 +44,36 @@ func pgPermanentError(err error) error {
 	}
 	var pgErr *pgconn.PgError
 	if errors.As(err, &pgErr) && len(pgErr.Code) >= 2 {
+		// Enrich the error with DETAIL and CONTEXT fields, which are not included
+		// in PgError.Error() but contain the actionable diagnostic information
+		// (e.g. which column and line triggered the error during COPY).
+		enriched := pgEnrichError(err, pgErr)
 		switch pgErr.Code[:2] {
 		case "22", // Data Exception (type mismatches, overflow, …)
 			"23", // Integrity Constraint Violation (not-null, FK, unique, check)
 			"42": // Syntax Error or Access Rule Violation (bad column, bad table, …)
-			return util.NonRetryable(err)
+			return util.NonRetryable(enriched)
 		}
+		return enriched
 	}
 	return err
+}
+
+// pgEnrichError wraps err with the DETAIL and CONTEXT fields from pgErr so that
+// callers printing the error see the full diagnostic context, not just the message.
+// Uses %w to preserve the error chain for errors.Is / errors.As.
+func pgEnrichError(err error, pgErr *pgconn.PgError) error {
+	if pgErr.Detail == "" && pgErr.Where == "" {
+		return err
+	}
+	extra := ""
+	if pgErr.Detail != "" {
+		extra += "; DETAIL: " + pgErr.Detail
+	}
+	if pgErr.Where != "" {
+		extra += "; CONTEXT: " + pgErr.Where
+	}
+	return fmt.Errorf("%w%s", err, extra)
 }
 
 // drainFirstBatch 从 channel 中取出第一个非空 batch，用于获取列信息并启动后续写入。

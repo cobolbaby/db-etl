@@ -11,7 +11,7 @@ ifeq ($(TARGET_OS),windows)
 EXE_SUFFIX := .exe
 endif
 
-BIN_NAME := $(APP_NAME)-$(TARGET_OS)-$(TARGET_ARCH)$(EXE_SUFFIX)
+BIN_NAME := $(APP_NAME)-$(VERSION)-$(TARGET_OS)-$(TARGET_ARCH)$(EXE_SUFFIX)
 
 VERSION    := $(shell cat VERSION 2>/dev/null || echo dev)
 COMMIT     := $(shell git rev-parse --short HEAD 2>/dev/null || echo unknown)

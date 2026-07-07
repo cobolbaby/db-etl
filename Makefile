@@ -11,12 +11,12 @@ ifeq ($(TARGET_OS),windows)
 EXE_SUFFIX := .exe
 endif
 
-BIN_NAME := $(APP_NAME)-$(VERSION)-$(TARGET_OS)-$(TARGET_ARCH)$(EXE_SUFFIX)
-
 VERSION    := $(shell cat VERSION 2>/dev/null || echo dev)
 COMMIT     := $(shell git rev-parse --short HEAD 2>/dev/null || echo unknown)
 BUILD_TIME := $(shell date -u '+%Y-%m-%dT%H:%M:%SZ')
 LDFLAGS    := -X main.Version=$(VERSION) -X main.Commit=$(COMMIT) -X main.BuildTime=$(BUILD_TIME)
+
+BIN_NAME := $(APP_NAME)-$(VERSION)-$(TARGET_OS)-$(TARGET_ARCH)$(EXE_SUFFIX)
 
 .PHONY: all build build-linux build-exe build-windows build-macos clean
 

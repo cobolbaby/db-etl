@@ -45,6 +45,12 @@ type DBConfig struct {
 	// StatementTimeout 写入端单条语句的执行超时（秒），0 表示不限制（默认）。
 	// 通过 PostgreSQL 会话参数 statement_timeout 实现; merge 模式下 DELETE+INSERT 耗时较长，建议设为 0（不限制）或足够大的值。
 	StatementTimeout int `yaml:"statement_timeout"`
+	// TimeZone 固定写入端 PostgreSQL 会话时区（如 "America/Mexico_City"、"UTC"、"+08"）。
+	// 源端 SQL Server DATETIME/DATETIME2 无时区，序列化为无时区字符串后写入 timestamptz 列时，
+	// PostgreSQL 会按会话时区解析。若不固定，会话时区将随运行环境（PGTZ/TZ/服务端默认）漂移，
+	// 导致同一份数据在不同客户端时区下入库为不同的绝对时刻。设置本项以获得确定性行为。
+	// 为空时不注入，保持服务端默认。
+	TimeZone string `yaml:"timezone"`
 }
 
 type DBType string

@@ -25,6 +25,15 @@ func NewWriter(db config.DBConfig, target *config.TargetConfig, jobName string) 
 			cfg.RuntimeParams["statement_timeout"] = fmt.Sprintf("%d", db.StatementTimeout*1000) // ms
 		}
 
+		// 固定会话时区，确保无时区时间字符串写入 timestamptz 列时被确定性解析，
+		// 不随运行环境（PGTZ/TZ/服务端默认）漂移。为空时不注入，保持服务端默认。
+		if db.TimeZone != "" {
+			if cfg.RuntimeParams == nil {
+				cfg.RuntimeParams = make(map[string]string)
+			}
+			cfg.RuntimeParams["TimeZone"] = db.TimeZone
+		}
+
 		pgConn, err := pgx.ConnectConfig(context.Background(), cfg)
 		if err != nil {
 			log.Fatalf("PG connect failed: %v", err)

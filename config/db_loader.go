@@ -8,7 +8,7 @@ import (
 	"github.com/jackc/pgx/v5"
 )
 
-// JobDataSyncRow 对应 manager.job_data_sync_v2 表中的一行记录。
+// JobDataSyncRow 对应 manager.job_data_sync 表中的一行记录。
 type JobDataSyncRow struct {
 	JobName           string
 	SrcConnID         string // 引用 config.yaml 中 databases[].id
@@ -27,7 +27,7 @@ type JobDataSyncRow struct {
 }
 
 // LoadTasksFromDB 连接 metaDB 所指定的 PostgreSQL 数据库，
-// 查询 manager.job_data_sync_v2 表中 job_name = jobName 且 inuse = true 的记录，
+// 查询 manager.job_data_sync 表中 job_name = jobName 且 inuse = true 的记录，
 // 并将结果转换为 []TaskConfig 返回。
 func LoadTasksFromDB(ctx context.Context, metaDB DBConfig, jobName string) ([]TaskConfig, error) {
 
@@ -54,7 +54,7 @@ func LoadTasksFromDB(ctx context.Context, metaDB DBConfig, jobName string) ([]Ta
 			COALESCE(dst_schema_name, '')     AS dst_schema_name,
 			COALESCE(dst_table_name, '')      AS dst_table_name,
 			COALESCE(dst_pk, '')              AS dst_pk
-		FROM manager.job_data_sync_v2
+		FROM manager.job_data_sync
 		WHERE job_name = $1
 		  AND inuse = true
 		  AND sync_mode IN ('full', 'append', 'merge')
@@ -102,7 +102,7 @@ func LoadTasksFromDB(ctx context.Context, metaDB DBConfig, jobName string) ([]Ta
 	}
 
 	if len(tasks) == 0 {
-		return nil, fmt.Errorf("no active tasks found for job_name=%q in manager.job_data_sync_v2", jobName)
+		return nil, fmt.Errorf("no active tasks found for job_name=%q in manager.job_data_sync", jobName)
 	}
 
 	return tasks, nil

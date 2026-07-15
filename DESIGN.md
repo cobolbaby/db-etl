@@ -25,7 +25,7 @@
                                          │ Watermark
                                          ▼
                           ┌────────────────────────────────────┐
-                          │   manager.job_data_sync_v2         │
+                          │   manager.job_data_sync         │
                           └────────────────────────────────────┘
 ```
 
@@ -236,7 +236,7 @@ type Transformer interface {
 
 ### 6.1 存储
 
-水位存储在目标库的 `manager.job_data_sync_v2` 表中，按 (job_name + source identity + target identity) 唯一定位。
+水位存储在目标库的 `manager.job_data_sync` 表中，按 (job_name + source identity + target identity) 唯一定位。
 
 ### 6.2 读取（启动时）
 

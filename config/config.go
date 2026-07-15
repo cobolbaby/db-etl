@@ -17,7 +17,7 @@ type Config struct {
 	Tasks       []TaskConfig `yaml:"tasks"`
 	Name        string       `yaml:"name"`
 	Comment     string       `yaml:"comment"`
-	// MetaDB 指定存放 manager.job_data_sync_v2 配置表的数据库别名（引用 databases[].name）。
+	// MetaDB 指定存放 manager.job_data_sync 配置表的数据库别名（引用 databases[].name）。
 	// 当通过 -job 参数从数据库加载任务列表时必填。
 	MetaDB string `yaml:"meta_db"`
 	// Retry 配置任务失败时的重试策略。
@@ -60,6 +60,23 @@ const (
 	DBTypePG    DBType = "postgres"
 	DBTypeGP    DBType = "greenplum"
 )
+
+var supportedDBTypes = map[DBType]struct{}{
+	DBTypeMSSQL: {},
+	DBTypePG:    {},
+	DBTypeGP:    {},
+}
+
+// dbTypeAliases 将常见的数据库类型写法归一化为标准值。
+var dbTypeAliases = map[string]DBType{
+	"mssql":      DBTypeMSSQL,
+	"sqlserver":  DBTypeMSSQL,
+	"postgres":   DBTypePG,
+	"postgresql": DBTypePG,
+	"pg":         DBTypePG,
+	"greenplum":  DBTypeGP,
+	"gp":         DBTypeGP,
+}
 
 type TaskConfig struct {
 	Name    string          `yaml:"name"`
@@ -404,12 +421,20 @@ func (c *Config) Validate() error {
 
 func (c *Config) validateDatabases() (map[string]DBType, error) {
 	dbTypes := make(map[string]DBType, len(c.Databases))
-	for _, db := range c.Databases {
+	for i := range c.Databases {
+		db := &c.Databases[i]
 		if db.Name == "" {
 			return nil, fmt.Errorf("database name required")
 		}
 		if db.Type == "" {
 			return nil, fmt.Errorf("database type required for %s", db.Name)
+		}
+		db.Type = DBType(strings.ToLower(strings.TrimSpace(string(db.Type))))
+		if canonical, ok := dbTypeAliases[string(db.Type)]; ok {
+			db.Type = canonical
+		}
+		if _, ok := supportedDBTypes[db.Type]; !ok {
+			return nil, fmt.Errorf("unsupported database type %q for %s", db.Type, db.Name)
 		}
 		dbTypes[db.Name] = db.Type
 	}

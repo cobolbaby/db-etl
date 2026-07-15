@@ -63,7 +63,7 @@ func main() {
 			log.Fatalf("meta_db %q not found in databases config", cfg.MetaDB)
 		}
 
-		dbTasks, err := config.LoadTasksFromDB(context.Background(), metaDB, cfg.Name)
+		dbTasks, err := config.LoadTasksFromDB(context.Background(), metaDB, cfg.Name, dbRegistry)
 		if err != nil {
 			log.Fatalf("load tasks from db failed: %v", err)
 		}

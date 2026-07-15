@@ -83,7 +83,7 @@ func (mssqlDialect) getColumnHandler(dbType string) ColHandler {
 				return util.NullSentinel
 			}
 			if t, ok := v.(time.Time); ok {
-				return t.Format("2006-01-02 15:04:05.000")
+				return t.Format("2006-01-02 15:04:05.000000")
 			}
 			return defaultColumnHandler(v)
 		}

@@ -58,13 +58,13 @@ func (pgDialect) quoteIdentifier(identifier string) string {
 func (pgDialect) getColumnHandler(dbType string) ColHandler {
 	switch strings.ToUpper(dbType) {
 
-	case "DATETIME", "DATE", "TIME":
+	case "TIMESTAMP", "TIMESTAMPTZ", "DATETIME", "DATE", "TIME", "TIMETZ":
 		return func(v any) string {
 			if v == nil {
 				return util.NullSentinel
 			}
 			if t, ok := v.(time.Time); ok {
-				return t.Format("2006-01-02 15:04:05.000")
+				return t.Format("2006-01-02 15:04:05.000000")
 			}
 			return defaultColumnHandler(v)
 		}

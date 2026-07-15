@@ -287,6 +287,8 @@ func defaultColumnHandler(v any) string {
 		return util.SanitizeString(string(t))
 	case string:
 		return util.SanitizeString(t)
+	case time.Time:
+		return t.Format("2006-01-02 15:04:05.000000")
 	default:
 		return util.SanitizeString(fmt.Sprintf("%v", t))
 	}

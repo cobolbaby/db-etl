@@ -595,11 +595,12 @@ func (d *pgWriterDialect) updateWatermark(ctx context.Context, tx pgx.Tx, wm str
 			        dst_pk          = $4,
 			        udt             = $5
 			  WHERE job_name        = $6
-			    AND src_rawsql      = $7
-			    AND dst_schema_name = $8
-			    AND dst_table_name  = $9`,
+			    AND COALESCE(src_db_name, '') = $7
+			    AND src_rawsql      = $8
+			    AND dst_schema_name = $9
+			    AND dst_table_name  = $10`,
 			wm, string(target.Mode), source.IncrField, target.PK, now,
-			funcName, src.RawSQL, dst.Schema, dst.Table,
+			funcName, src.Database, src.RawSQL, dst.Schema, dst.Table,
 		)
 	} else {
 		tag, execErr = tx.Exec(
@@ -632,10 +633,10 @@ func (d *pgWriterDialect) updateWatermark(ctx context.Context, tx pgx.Tx, wm str
 		_, err = tx.Exec(
 			ctx,
 			`INSERT INTO manager.job_data_sync
-			    (job_name, src_rawsql, dst_schema_name, dst_table_name,
+			    (job_name, src_db_name, src_rawsql, dst_schema_name, dst_table_name,
 			     incr_point, sync_mode, src_incr_field, dst_pk, cdt, udt)
-			  VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $9)`,
-			funcName, src.RawSQL, dst.Schema, dst.Table,
+			  VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $10)`,
+			funcName, src.Database, src.RawSQL, dst.Schema, dst.Table,
 			wm, string(target.Mode), source.IncrField, target.PK, now,
 		)
 	} else {
@@ -671,11 +672,12 @@ func (d *pgWriterDialect) getWatermark(target *config.TargetConfig, source *conf
 			`SELECT COALESCE(incr_point, '')
 			   FROM manager.job_data_sync
 			  WHERE job_name = $1
-			    AND src_rawsql = $2
-			    AND dst_schema_name = $3
-			    AND dst_table_name = $4
+			    AND COALESCE(src_db_name, '') = $2
+			    AND src_rawsql = $3
+			    AND dst_schema_name = $4
+			    AND dst_table_name = $5
 			  LIMIT 1`,
-			funcName, src.RawSQL, dst.Schema, dst.Table,
+			funcName, src.Database, src.RawSQL, dst.Schema, dst.Table,
 		).Scan(&wm)
 	} else {
 		err = d.conn.QueryRow(

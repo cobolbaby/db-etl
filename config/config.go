@@ -143,6 +143,7 @@ type SourceConfig struct {
 	WhereStatement string        `yaml:"where_statement"` // Table 场景下的附加过滤条件；SQL 场景下会作为外层过滤条件追加
 	BatchSize      int           `yaml:"batch_size"`
 	DBType         DBType        `yaml:"-"`
+	Database       string        `yaml:"-"` // 解析数据源后填充，作为 watermark 的 src_db_name
 	Mode           ModeType      `yaml:"-"`
 	IncrField      string        `yaml:"incr_field"` // 用于增量抽取，指定一个日期/时间字段，配合 Watermark 实现增量抽取
 	IncrPoint      string        `yaml:"incr_point"` // 增量抽取的起点
@@ -566,6 +567,7 @@ func validateSource(source *SourceConfig, target *TargetConfig, resolver DBResol
 	}
 
 	source.DBType = srcDB.Type
+	source.Database = srcDB.Database
 
 	if source.SQL == "" && source.Table == "" {
 		return fmt.Errorf("sql or table must be specified")

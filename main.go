@@ -140,6 +140,7 @@ func runTask(task config.TaskConfig, resolver config.DBResolver, retryCfg util.R
 			return fmt.Errorf("source db not found (conn_id=%q conn_name=%q)", src.ConnID, src.ConnName)
 		}
 		src.DBType = srcDB.Type
+		src.Database = srcDB.Database
 		if err := config.ValidateSourceTableName(src.Table, src.DBType); err != nil {
 			return err
 		}

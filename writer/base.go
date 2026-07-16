@@ -73,11 +73,17 @@ func sourceIdentity(source *config.SourceConfig) (wmSource, error) {
 		if parts.Database != "" && source.DBType != config.DBTypeMSSQL {
 			return wmSource{}, fmt.Errorf("source table %q uses db.schema.table, which is only supported for mssql sources", table)
 		}
-		return wmSource{Database: parts.Database, Schema: parts.Schema, Table: parts.Table}, nil
+		// 三段式表名（MSSQL）以表名内的库名为准，否则回退到数据源连接的库名，
+		// 确保 watermark 的 src_db_name 始终反映真实的源库。
+		db := parts.Database
+		if db == "" {
+			db = strings.TrimSpace(source.Database)
+		}
+		return wmSource{Database: db, Schema: parts.Schema, Table: parts.Table}, nil
 	}
 
 	if sql := strings.TrimSpace(source.SQL); sql != "" {
-		return wmSource{RawSQL: sql}, nil
+		return wmSource{Database: strings.TrimSpace(source.Database), RawSQL: sql}, nil
 	}
 
 	return wmSource{}, fmt.Errorf("source identity is required for watermark")

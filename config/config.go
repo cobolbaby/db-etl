@@ -32,6 +32,9 @@ type RetryPolicy struct {
 }
 
 type DBConfig struct {
+	// ID 是数据源的稳定唯一标识（对应 job_data_sync.src_conn_id）。
+	// 匹配数据源时 ID 优先级高于 Name；Name 可为空。
+	ID       string `yaml:"id"`
 	Name     string `yaml:"name"`
 	Type     DBType `yaml:"type"` // mssql / pg
 	Host     string `yaml:"host"`
@@ -67,6 +70,50 @@ var supportedDBTypes = map[DBType]struct{}{
 	DBTypeGP:    {},
 }
 
+// DBResolver 根据 conn_id（优先）或 name 解析数据库配置。
+// ID 优先级高于 Name，Name 可为空。
+type DBResolver struct {
+	byID   map[string]DBConfig
+	byName map[string]DBConfig
+}
+
+// NewDBResolver 基于 databases 列表构建解析器。
+func NewDBResolver(dbs []DBConfig) DBResolver {
+	r := DBResolver{
+		byID:   make(map[string]DBConfig, len(dbs)),
+		byName: make(map[string]DBConfig, len(dbs)),
+	}
+	for _, db := range dbs {
+		if id := strings.TrimSpace(db.ID); id != "" {
+			r.byID[id] = db
+		}
+		if name := strings.TrimSpace(db.Name); name != "" {
+			r.byName[name] = db
+		}
+	}
+	return r
+}
+
+// Resolve 优先按 connID 匹配，其次按 connName 匹配；都命中不了时返回 false。
+func (r DBResolver) Resolve(connID, connName string) (DBConfig, bool) {
+	if id := strings.TrimSpace(connID); id != "" {
+		if db, ok := r.byID[id]; ok {
+			return db, true
+		}
+	}
+	if name := strings.TrimSpace(connName); name != "" {
+		if db, ok := r.byName[name]; ok {
+			return db, true
+		}
+	}
+	return DBConfig{}, false
+}
+
+// Lookup 以单个 key 解析：先当作 ID，再当作 Name。
+func (r DBResolver) Lookup(key string) (DBConfig, bool) {
+	return r.Resolve(key, key)
+}
+
 // dbTypeAliases 将常见的数据库类型写法归一化为标准值。
 var dbTypeAliases = map[string]DBType{
 	"mssql":      DBTypeMSSQL,
@@ -93,7 +140,8 @@ const (
 )
 
 type SourceConfig struct {
-	DBName         string        `yaml:"dbname"`
+	ConnID         string        `yaml:"conn_id"`   // 优先按 conn_id 匹配数据源，为空时回退到 conn_name
+	ConnName       string        `yaml:"conn_name"` // 引用 databases[].name
 	SQL            string        `yaml:"sql"`
 	Table          string        `yaml:"table"`           // SQL 和 Table 至少要指定一个，SQL 优先级更高
 	FieldsMapping  FieldsMapping `yaml:"fields_mapping"`  // Table 场景下的字段映射，格式为 map[源字段/表达式]目标字段
@@ -330,7 +378,8 @@ func (s *SourceConfig) normalize() {
 }
 
 type TargetConfig struct {
-	DBName    string   `yaml:"dbname"`
+	ConnID    string   `yaml:"conn_id"`   // 优先按 conn_id 匹配数据源，为空时回退到 conn_name
+	ConnName  string   `yaml:"conn_name"` // 引用 databases[].name
 	Table     string   `yaml:"table"`
 	Mode      ModeType `yaml:"mode"`
 	IncrField string
@@ -407,48 +456,67 @@ func (c *Config) Validate() error {
 		return fmt.Errorf("invalid error_policy: %s", c.ErrorPolicy)
 	}
 
-	dbTypes, err := c.validateDatabases()
+	resolver, err := c.validateDatabases()
 	if err != nil {
 		return err
 	}
 
-	if err := c.validateTasks(dbTypes); err != nil {
+	if err := c.validateTasks(resolver); err != nil {
 		return err
 	}
 
 	return nil
 }
 
-func (c *Config) validateDatabases() (map[string]DBType, error) {
-	dbTypes := make(map[string]DBType, len(c.Databases))
+func (c *Config) validateDatabases() (DBResolver, error) {
+	seenIDs := make(map[string]struct{}, len(c.Databases))
+	seenNames := make(map[string]struct{}, len(c.Databases))
 	for i := range c.Databases {
 		db := &c.Databases[i]
-		if db.Name == "" {
-			return nil, fmt.Errorf("database name required")
+		id := strings.TrimSpace(db.ID)
+		name := strings.TrimSpace(db.Name)
+		// ID 优先，Name 可为空；但至少要有一个作为标识。
+		if id == "" && name == "" {
+			return DBResolver{}, fmt.Errorf("database id or name required")
+		}
+		ident := id
+		if ident == "" {
+			ident = name
 		}
 		if db.Type == "" {
-			return nil, fmt.Errorf("database type required for %s", db.Name)
+			return DBResolver{}, fmt.Errorf("database type required for %s", ident)
 		}
 		db.Type = DBType(strings.ToLower(strings.TrimSpace(string(db.Type))))
 		if canonical, ok := dbTypeAliases[string(db.Type)]; ok {
 			db.Type = canonical
 		}
 		if _, ok := supportedDBTypes[db.Type]; !ok {
-			return nil, fmt.Errorf("unsupported database type %q for %s", db.Type, db.Name)
+			return DBResolver{}, fmt.Errorf("unsupported database type %q for %s", db.Type, ident)
 		}
-		dbTypes[db.Name] = db.Type
+		if id != "" {
+			if _, dup := seenIDs[id]; dup {
+				return DBResolver{}, fmt.Errorf("duplicate database id %q", id)
+			}
+			seenIDs[id] = struct{}{}
+		}
+		if name != "" {
+			if _, dup := seenNames[name]; dup {
+				return DBResolver{}, fmt.Errorf("duplicate database name %q", name)
+			}
+			seenNames[name] = struct{}{}
+		}
 	}
-	return dbTypes, nil
+	return NewDBResolver(c.Databases), nil
 }
 
-func (c *Config) validateTasks(dbTypes map[string]DBType) error {
+func (c *Config) validateTasks(resolver DBResolver) error {
 
 	if len(c.Tasks) == 0 && c.MetaDB == "" {
 		return fmt.Errorf("tasks cannot be empty (set 'meta_db' to load tasks from database)")
 	}
 
 	for _, t := range c.Tasks {
-		if err := validateTask(t, dbTypes); err != nil {
+		if err := validateTask(t, resolver); err != nil {
 			return err
 		}
 	}
@@ -456,16 +524,16 @@ func (c *Config) validateTasks(dbTypes map[string]DBType) error {
 	return nil
 }
 
-func validateTask(task TaskConfig, dbTypes map[string]DBType) error {
+func validateTask(task TaskConfig, resolver DBResolver) error {
 	if task.Target == nil {
 		return fmt.Errorf("target must be specified")
 	}
-	if err := validateTarget(task.Target, dbTypes); err != nil {
+	if err := validateTarget(task.Target, resolver); err != nil {
 		return err
 	}
 
 	for _, source := range task.Sources {
-		if err := validateSource(source, task.Target, dbTypes); err != nil {
+		if err := validateSource(source, task.Target, resolver); err != nil {
 			return err
 		}
 	}
@@ -473,12 +541,12 @@ func validateTask(task TaskConfig, dbTypes map[string]DBType) error {
 	return nil
 }
 
-func validateTarget(target *TargetConfig, dbTypes map[string]DBType) error {
-	if target.DBName == "" {
-		return fmt.Errorf("target dbname is required")
+func validateTarget(target *TargetConfig, resolver DBResolver) error {
+	if target.ConnID == "" && target.ConnName == "" {
+		return fmt.Errorf("target conn_id or conn_name is required")
 	}
-	if _, ok := dbTypes[target.DBName]; !ok {
-		return fmt.Errorf("target db not found: %s", target.DBName)
+	if _, ok := resolver.Resolve(target.ConnID, target.ConnName); !ok {
+		return fmt.Errorf("target db not found (conn_id=%q conn_name=%q)", target.ConnID, target.ConnName)
 	}
 	if strings.TrimSpace(target.Table) == "" {
 		return fmt.Errorf("target table is required")
@@ -489,20 +557,20 @@ func validateTarget(target *TargetConfig, dbTypes map[string]DBType) error {
 	return nil
 }
 
-func validateSource(source *SourceConfig, target *TargetConfig, dbTypes map[string]DBType) error {
+func validateSource(source *SourceConfig, target *TargetConfig, resolver DBResolver) error {
 	if source == nil {
 		return fmt.Errorf("source must be specified")
 	}
-	if source.DBName == "" {
-		return fmt.Errorf("source dbname is required")
+	if source.ConnID == "" && source.ConnName == "" {
+		return fmt.Errorf("source conn_id or conn_name is required")
 	}
 
-	dbType, ok := dbTypes[source.DBName]
+	srcDB, ok := resolver.Resolve(source.ConnID, source.ConnName)
 	if !ok {
-		return fmt.Errorf("source db not found: %s", source.DBName)
+		return fmt.Errorf("source db not found (conn_id=%q conn_name=%q)", source.ConnID, source.ConnName)
 	}
 
-	source.DBType = dbType
+	source.DBType = srcDB.Type
 
 	if source.SQL == "" && source.Table == "" {
 		return fmt.Errorf("sql or table must be specified")

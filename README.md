@@ -61,12 +61,12 @@ tasks:
   - name: sample_metric_sync
     type: query
     sources:
-      - dbname: source-mssql
+      - conn_name: source-mssql
         batch_size: 10000
         table: dbo.source_table
         incr_field: updated_at
     target:
-      dbname: target-pg
+      conn_name: target-pg
       table: target_schema.target_metric
       mode: merge
       pk: pk_col_1,pk_col_2
@@ -88,15 +88,16 @@ tasks:
 
 每项字段如下：
 
-| 字段       | 说明                                                      |
-| ---------- | --------------------------------------------------------- |
-| `name`     | 数据库别名，供 `sources[].dbname` 和 `target.dbname` 引用 |
-| `type`     | 数据库类型：`mssql`、`postgres`、`greenplum`              |
-| `host`     | 主机地址                                                  |
-| `port`     | 端口                                                      |
-| `user`     | 用户名                                                    |
-| `password` | 密码                                                      |
-| `database` | 数据库名                                                  |
+| 字段       | 说明                                                                                             |
+| ---------- | ------------------------------------------------------------------------------------------------ |
+| `name`     | 数据库别名，供 `sources[].conn_name` 和 `target.conn_name` 引用                                  |
+| `id`       | 数据库唯一标识（可选），供 `sources[].conn_id` 和 `target.conn_id` 引用；匹配时优先级高于 `name` |
+| `type`     | 数据库类型：`mssql`、`postgres`、`greenplum`                                                     |
+| `host`     | 主机地址                                                                                         |
+| `port`     | 端口                                                                                             |
+| `user`     | 用户名                                                                                           |
+| `password` | 密码                                                                                             |
+| `database` | 数据库名                                                                                         |
 
 ### `tasks`
 
@@ -116,7 +117,8 @@ tasks:
 
 | 字段              | 必填   | 说明                                                                             |
 | ----------------- | ------ | -------------------------------------------------------------------------------- |
-| `dbname`          | ✅     | 引用 `databases[].name`                                                          |
+| `conn_id`         | 二选一 | 引用 `databases[].id`；与 `conn_name` 至少填一个，优先级高于 `conn_name`         |
+| `conn_name`       | 二选一 | 引用 `databases[].name`                                                          |
 | `sql`             | 二选一 | 自定义查询语句                                                                   |
 | `table`           | 二选一 | 直接读取的表名，格式 `schema.table`；仅 SQL Server 支持 `db.schema.table`        |
 | `where_statement` |        | 附加过滤条件；使用 `table` 时直接拼到 `WHERE`，使用 `sql` 时作为外层过滤条件追加 |
@@ -144,7 +146,8 @@ tasks:
 
 | 字段                | 必填         | 说明                                                                                                                       |
 | ------------------- | ------------ | -------------------------------------------------------------------------------------------------------------------------- |
-| `dbname`            | ✅           | 引用 `databases[].name`                                                                                                    |
+| `conn_id`           | 二选一       | 引用 `databases[].id`；与 `conn_name` 至少填一个，优先级高于 `conn_name`                                                   |
+| `conn_name`         | 二选一       | 引用 `databases[].name`                                                                                                    |
 | `table`             | ✅           | 目标表，建议使用 `schema.table` 格式                                                                                       |
 | `mode`              | ✅           | 写入模式，见下节                                                                                                           |
 | `pk`                | merge 时必填 | 主键列列表，多列用逗号分隔，如 `id` 或 `id,tenant_id`                                                                      |
@@ -168,11 +171,11 @@ name: etl_copy_demo
 tasks:
   - type: query
     sources:
-      - dbname: source-mssql
+      - conn_name: source-mssql
         batch_size: 10000
         sql: "SELECT * FROM [dbo].[source_table]"
     target:
-      dbname: target-pg
+      conn_name: target-pg
       table: target_schema.target_table_1
       mode: copy
 ```
@@ -184,7 +187,7 @@ name: etl_table_copy
 tasks:
   - type: query
     sources:
-      - dbname: source-mssql
+      - conn_name: source-mssql
         batch_size: 10000
         table: "dbo.source_table_2"
         where_statement: "is_deleted = 0"
@@ -193,7 +196,7 @@ tasks:
           CustomerName: customer_name
           updated_at: updated_at
     target:
-      dbname: target-pg
+      conn_name: target-pg
       table: target_schema.target_table_2
       mode: copy
 ```
@@ -206,12 +209,12 @@ tasks:
   - name: order_sync
     type: query
     sources:
-      - dbname: source-mssql
+      - conn_name: source-mssql
         batch_size: 10000
         table: dbo.orders
         incr_field: updated_at
     target:
-      dbname: target-pg
+      conn_name: target-pg
       table: ods.orders
       mode: merge
       pk: order_id
@@ -225,13 +228,13 @@ tasks:
   - name: big_table_sync
     type: query
     sources:
-      - dbname: source-mssql
+      - conn_name: source-mssql
         batch_size: 10000
         table: dbo.big_table
         incr_field: updated_at
         # order_by 可省略，自动补为 "updated_at ASC"
     target:
-      dbname: target-pg
+      conn_name: target-pg
       table: ods.big_table
       mode: merge
       pk: id

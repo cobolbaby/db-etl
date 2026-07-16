@@ -42,13 +42,10 @@ func main() {
 	}
 
 	// --------------------------------
-	// 1. 构建 DB Registry
+	// 1. 构建 DB Resolver（conn_id 优先，name 回退）
 	// --------------------------------
 
-	dbRegistry := map[string]config.DBConfig{}
-	for _, db := range cfg.Databases {
-		dbRegistry[db.Name] = db
-	}
+	resolver := config.NewDBResolver(cfg.Databases)
 
 	// --------------------------------
 	// 2. 确定 Task 列表
@@ -58,12 +55,12 @@ func main() {
 
 	if cfg.MetaDB != "" {
 		// 从数据库加载任务列表，job_name 取自 config.yaml 的 name 字段
-		metaDB, ok := dbRegistry[cfg.MetaDB]
+		metaDB, ok := resolver.Lookup(cfg.MetaDB)
 		if !ok {
 			log.Fatalf("meta_db %q not found in databases config", cfg.MetaDB)
 		}
 
-		dbTasks, err := config.LoadTasksFromDB(context.Background(), metaDB, cfg.Name, dbRegistry)
+		dbTasks, err := config.LoadTasksFromDB(context.Background(), metaDB, cfg.Name, resolver)
 		if err != nil {
 			log.Fatalf("load tasks from db failed: %v", err)
 		}
@@ -118,7 +115,7 @@ func main() {
 				if task.Name == "" {
 					task.Name = cfg.Name
 				}
-				if err := runTask(task, dbRegistry, retryCfg); err != nil {
+				if err := runTask(task, resolver, retryCfg); err != nil {
 					log.Printf("task failed: %v", err)
 					if cfg.ErrorPolicy == "abort" {
 						log.Fatal(err)
@@ -134,25 +131,25 @@ func main() {
 
 }
 
-func runTask(task config.TaskConfig, dbRegistry map[string]config.DBConfig, retryCfg util.RetryConfig) error {
+func runTask(task config.TaskConfig, resolver config.DBResolver, retryCfg util.RetryConfig) error {
 
 	for _, src := range task.Sources {
 
-		srcDB, ok := dbRegistry[src.DBName]
+		srcDB, ok := resolver.Resolve(src.ConnID, src.ConnName)
 		if !ok {
-			return fmt.Errorf("source db not found: %s", src.DBName)
+			return fmt.Errorf("source db not found (conn_id=%q conn_name=%q)", src.ConnID, src.ConnName)
 		}
 		src.DBType = srcDB.Type
 		if err := config.ValidateSourceTableName(src.Table, src.DBType); err != nil {
 			return err
 		}
 
-		dstDB, ok := dbRegistry[task.Target.DBName]
+		dstDB, ok := resolver.Resolve(task.Target.ConnID, task.Target.ConnName)
 		if !ok {
-			return fmt.Errorf("target db not found: %s", task.Target.DBName)
+			return fmt.Errorf("target db not found (conn_id=%q conn_name=%q)", task.Target.ConnID, task.Target.ConnName)
 		}
 
-		label := fmt.Sprintf("%s → %s (%s)", src.DBName, task.Target.DBName, task.Target.Table)
+		label := fmt.Sprintf("%s → %s (%s)", srcDB.Name, dstDB.Name, task.Target.Table)
 		err := util.Retry(label, retryCfg, func() error {
 			return runPipeline(src, srcDB, dstDB, task)
 		})
@@ -168,7 +165,7 @@ func runTask(task config.TaskConfig, dbRegistry map[string]config.DBConfig, retr
 func runPipeline(src *config.SourceConfig, srcDB config.DBConfig, dstDB config.DBConfig, task config.TaskConfig) error {
 
 	// mc := metrics.Default()
-	// pm := mc.NewPipelineMetrics(src.DBName, task.Target.DBName, task.Target.Table, string(task.Target.Mode))
+	// pm := mc.NewPipelineMetrics(src.ConnName, task.Target.ConnName, task.Target.Table, string(task.Target.Mode))
 
 	// -----------------------------
 	// Writer
@@ -213,8 +210,8 @@ func runPipeline(src *config.SourceConfig, srcDB config.DBConfig, dstDB config.D
 	startedAt := time.Now()
 	log.Printf(
 		"pipeline start %s -> %s (%s)",
-		src.DBName,
-		task.Target.DBName,
+		src.ConnName,
+		task.Target.ConnName,
 		task.Target.Table,
 	)
 
@@ -224,8 +221,8 @@ func runPipeline(src *config.SourceConfig, srcDB config.DBConfig, dstDB config.D
 	if err != nil {
 		return fmt.Errorf(
 			"pipeline failed %s -> %s (%s) cost=%s: %w",
-			src.DBName,
-			task.Target.DBName,
+			src.ConnName,
+			task.Target.ConnName,
 			task.Target.Table,
 			time.Since(startedAt).Round(time.Millisecond),
 			err,
@@ -235,8 +232,8 @@ func runPipeline(src *config.SourceConfig, srcDB config.DBConfig, dstDB config.D
 
 	log.Printf(
 		"pipeline finished %s -> %s (%s) cost=%s",
-		src.DBName,
-		task.Target.DBName,
+		src.ConnName,
+		task.Target.ConnName,
 		task.Target.Table,
 		time.Since(startedAt).Round(time.Millisecond),
 	)

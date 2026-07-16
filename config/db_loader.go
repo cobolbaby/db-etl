@@ -29,7 +29,7 @@ type JobDataSyncRow struct {
 // LoadTasksFromDB 连接 metaDB 所指定的 PostgreSQL 数据库，
 // 查询 manager.job_data_sync 表中 job_name = jobName 且 inuse = true 的记录，
 // 并将结果转换为 []TaskConfig 返回。
-func LoadTasksFromDB(ctx context.Context, metaDB DBConfig, jobName string, dbRegistry map[string]DBConfig) ([]TaskConfig, error) {
+func LoadTasksFromDB(ctx context.Context, metaDB DBConfig, jobName string, resolver DBResolver) ([]TaskConfig, error) {
 
 	dsn := metaDB.DSN()
 	conn, err := pgx.Connect(ctx, dsn)
@@ -89,7 +89,7 @@ func LoadTasksFromDB(ctx context.Context, metaDB DBConfig, jobName string, dbReg
 			return nil, fmt.Errorf("scan job_data_sync row failed: %w", err)
 		}
 
-		task, err := rowToTaskConfig(r, metaDB.Name, dbRegistry)
+		task, err := rowToTaskConfig(r, metaDB, resolver)
 		if err != nil {
 			return nil, fmt.Errorf("convert row to task config failed (job=%s src=%s.%s): %w",
 				r.JobName, r.SrcSchemaName, r.SrcTableName, err)
@@ -115,7 +115,7 @@ func LoadTasksFromDB(ctx context.Context, metaDB DBConfig, jobName string, dbReg
 //  2. 否则使用 src_schema_name.src_table_name 作为 source.Table（MSSQL 源时在前面加 src_db_name 前缀）；
 //     并将 src_where_statement / fields_mapping
 //     写入 source.WhereStatement / source.FieldsMapping，留到 reader 阶段再拼装查询。
-func rowToTaskConfig(r JobDataSyncRow, defaultDstDB string, dbRegistry map[string]DBConfig) (TaskConfig, error) {
+func rowToTaskConfig(r JobDataSyncRow, metaDB DBConfig, resolver DBResolver) (TaskConfig, error) {
 
 	if r.SrcConnName == "" && r.SrcConnID == "" {
 		return TaskConfig{}, fmt.Errorf("src_conn_name and src_conn_id are empty")
@@ -124,10 +124,10 @@ func rowToTaskConfig(r JobDataSyncRow, defaultDstDB string, dbRegistry map[strin
 		return TaskConfig{}, fmt.Errorf("dst_schema_name / dst_table_name is empty")
 	}
 
-	// TODO: 访问 DTS HTTP 接口，传入 SrcConnID，获取对应的数据库连接配置（DBConfig），并将 DBConfig.Name 赋值给 SrcConnName。
-
 	src := &SourceConfig{
-		DBName:         r.SrcConnName,
+		// src_conn_id 优先匹配数据源；src_conn_name 作为向后兼容的回退。
+		ConnID:         r.SrcConnID,
+		ConnName:       r.SrcConnName,
 		BatchSize:      10000,
 		IncrField:      r.SrcIncrField,
 		WhereStatement: strings.TrimSpace(r.SrcWhereStatement),
@@ -151,7 +151,7 @@ func rowToTaskConfig(r JobDataSyncRow, defaultDstDB string, dbRegistry map[strin
 			return TaskConfig{}, fmt.Errorf("src_schema_name / src_table_name is empty and no sql provided")
 		}
 		srcDBName := strings.TrimSpace(r.SrcDBName)
-		srcDB, ok := dbRegistry[r.SrcConnName]
+		srcDB, ok := resolver.Resolve(r.SrcConnID, r.SrcConnName)
 		if srcDBName != "" && ok && srcDB.Type == DBTypeMSSQL {
 			src.Table = srcDBName + "." + r.SrcSchemaName + "." + r.SrcTableName
 		} else {
@@ -161,10 +161,11 @@ func rowToTaskConfig(r JobDataSyncRow, defaultDstDB string, dbRegistry map[strin
 
 	target := &TargetConfig{
 		// job_data_sync 表暂无 dst_instance 字段，默认使用 meta_db 作为目标库
-		DBName: defaultDstDB,
-		Table:  r.DstSchemaName + "." + r.DstTableName,
-		Mode:   ModeType(r.SyncMode),
-		PK:     r.DstPK,
+		ConnID:   metaDB.ID,
+		ConnName: metaDB.Name,
+		Table:    r.DstSchemaName + "." + r.DstTableName,
+		Mode:     ModeType(r.SyncMode),
+		PK:       r.DstPK,
 	}
 
 	return TaskConfig{

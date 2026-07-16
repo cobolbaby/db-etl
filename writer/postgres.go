@@ -595,7 +595,7 @@ func (d *pgWriterDialect) updateWatermark(ctx context.Context, tx pgx.Tx, wm str
 			        dst_pk          = $4,
 			        udt             = $5
 			  WHERE job_name        = $6
-			    AND COALESCE(src_db_name, '') = $7
+			    AND src_db_name     = $7
 			    AND src_rawsql      = $8
 			    AND dst_schema_name = $9
 			    AND dst_table_name  = $10`,
@@ -612,7 +612,7 @@ func (d *pgWriterDialect) updateWatermark(ctx context.Context, tx pgx.Tx, wm str
 			        dst_pk          = $4,
 			        udt             = $5
 			  WHERE job_name        = $6
-			    AND COALESCE(src_db_name, '') = $7
+			    AND src_db_name     = $7
 			    AND src_schema_name = $8
 			    AND src_table_name  = $9
 			    AND dst_schema_name = $10
@@ -672,7 +672,7 @@ func (d *pgWriterDialect) getWatermark(target *config.TargetConfig, source *conf
 			`SELECT COALESCE(incr_point, '')
 			   FROM manager.job_data_sync
 			  WHERE job_name = $1
-			    AND COALESCE(src_db_name, '') = $2
+			    AND src_db_name = $2
 			    AND src_rawsql = $3
 			    AND dst_schema_name = $4
 			    AND dst_table_name = $5
@@ -685,7 +685,7 @@ func (d *pgWriterDialect) getWatermark(target *config.TargetConfig, source *conf
 			`SELECT COALESCE(incr_point, '')
 			   FROM manager.job_data_sync
 			  WHERE job_name = $1
-			    AND COALESCE(src_db_name, '') = $2
+			    AND src_db_name = $2
 			    AND src_schema_name = $3
 			    AND src_table_name = $4
 			    AND dst_schema_name = $5

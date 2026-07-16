@@ -489,6 +489,9 @@ func (c *Config) validateDatabases() (DBResolver, error) {
 		if _, ok := supportedDBTypes[db.Type]; !ok {
 			return DBResolver{}, fmt.Errorf("unsupported database type %q for %s", db.Type, ident)
 		}
+		if strings.TrimSpace(db.Database) == "" {
+			return DBResolver{}, fmt.Errorf("database is required for %s", ident)
+		}
 		if id != "" {
 			if _, dup := seenIDs[id]; dup {
 				return DBResolver{}, fmt.Errorf("duplicate database id %q", id)

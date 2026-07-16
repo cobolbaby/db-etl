@@ -109,11 +109,6 @@ func (r DBResolver) Resolve(connID, connName string) (DBConfig, bool) {
 	return DBConfig{}, false
 }
 
-// Lookup 以单个 key 解析：先当作 ID，再当作 Name。
-func (r DBResolver) Lookup(key string) (DBConfig, bool) {
-	return r.Resolve(key, key)
-}
-
 // dbTypeAliases 将常见的数据库类型写法归一化为标准值。
 var dbTypeAliases = map[string]DBType{
 	"mssql":      DBTypeMSSQL,

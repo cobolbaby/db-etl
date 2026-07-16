@@ -55,7 +55,7 @@ func main() {
 
 	if cfg.MetaDB != "" {
 		// 从数据库加载任务列表，job_name 取自 config.yaml 的 name 字段
-		metaDB, ok := resolver.Lookup(cfg.MetaDB)
+		metaDB, ok := resolver.Resolve(cfg.MetaDB, cfg.MetaDB)
 		if !ok {
 			log.Fatalf("meta_db %q not found in databases config", cfg.MetaDB)
 		}

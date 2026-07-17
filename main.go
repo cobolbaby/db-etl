@@ -149,7 +149,7 @@ func runTask(task config.TaskConfig, resolver config.DBResolver, retryCfg util.R
 			return fmt.Errorf("target db not found (conn_id=%q conn_name=%q)", task.Target.ConnID, task.Target.ConnName)
 		}
 
-		label := fmt.Sprintf("%s → %s (%s)", srcDB.Name, dstDB.Name, task.Target.Table)
+		label := fmt.Sprintf("%s (%s) → %s (%s)", srcDB.Name, src.Table, dstDB.Name, task.Target.Table)
 		err := util.Retry(label, retryCfg, func() error {
 			return runPipeline(src, srcDB, dstDB, task)
 		})
@@ -209,9 +209,10 @@ func runPipeline(src *config.SourceConfig, srcDB config.DBConfig, dstDB config.D
 
 	startedAt := time.Now()
 	log.Printf(
-		"pipeline start %s -> %s (%s)",
-		src.ConnName,
-		task.Target.ConnName,
+		"pipeline start %s (%s) -> %s (%s)",
+		srcDB.Name,
+		src.Table,
+		dstDB.Name,
 		task.Target.Table,
 	)
 
@@ -220,9 +221,10 @@ func runPipeline(src *config.SourceConfig, srcDB config.DBConfig, dstDB config.D
 
 	if err != nil {
 		return fmt.Errorf(
-			"pipeline failed %s -> %s (%s) cost=%s: %w",
-			src.ConnName,
-			task.Target.ConnName,
+			"pipeline failed %s (%s) -> %s (%s) cost=%s: %w",
+			srcDB.Name,
+			src.Table,
+			dstDB.Name,
 			task.Target.Table,
 			time.Since(startedAt).Round(time.Millisecond),
 			err,
@@ -231,9 +233,10 @@ func runPipeline(src *config.SourceConfig, srcDB config.DBConfig, dstDB config.D
 	}
 
 	log.Printf(
-		"pipeline finished %s -> %s (%s) cost=%s",
-		src.ConnName,
-		task.Target.ConnName,
+		"pipeline finished %s (%s) -> %s (%s) cost=%s",
+		srcDB.Name,
+		src.Table,
+		dstDB.Name,
 		task.Target.Table,
 		time.Since(startedAt).Round(time.Millisecond),
 	)

@@ -1,4 +1,4 @@
 *.yaml
-bin
+dist
 __debug*
 *.bak

@@ -1,5 +1,5 @@
 APP_NAME := db-etl
-BUILD_DIR := bin
+BUILD_DIR := dist
 SRC := main.go
 GO ?= go
 CGO_ENABLED ?= 0

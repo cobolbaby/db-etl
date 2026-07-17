@@ -19,6 +19,7 @@ type JobDataSyncRow struct {
 	SrcWhereStatement string
 	FieldsMapping     string
 	SrcIncrField      string
+	SrcIncrPoint      string
 	SyncMode          string
 	DstSchemaName     string
 	DstTableName      string
@@ -48,6 +49,7 @@ func LoadTasksFromDB(ctx context.Context, metaDB DBConfig, jobName string, resol
 			COALESCE(src_where_statement, '') AS src_where_statement,
 			COALESCE(fields_mapping::text, '') AS fields_mapping,
 			COALESCE(src_incr_field, '')      AS src_incr_field,
+			COALESCE(incr_point, '')          AS incr_point,
 			COALESCE(sync_mode, '')           AS sync_mode,
 			COALESCE(dst_schema_name, '')     AS dst_schema_name,
 			COALESCE(dst_table_name, '')      AS dst_table_name,
@@ -78,6 +80,7 @@ func LoadTasksFromDB(ctx context.Context, metaDB DBConfig, jobName string, resol
 			&r.SrcWhereStatement,
 			&r.FieldsMapping,
 			&r.SrcIncrField,
+			&r.SrcIncrPoint,
 			&r.SyncMode,
 			&r.DstSchemaName,
 			&r.DstTableName,
@@ -135,6 +138,7 @@ func rowToTaskConfig(r JobDataSyncRow, metaDB DBConfig, resolver DBResolver) (Ta
 		BatchSize:      10000,
 		Mode:           ModeType(r.SyncMode),
 		IncrField:      r.SrcIncrField,
+		IncrPoint:      strings.TrimSpace(r.SrcIncrPoint),
 	}
 
 	fieldsMapping := strings.TrimSpace(r.FieldsMapping)

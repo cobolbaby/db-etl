@@ -6,7 +6,6 @@ import (
 	"db-etl/config"
 	"db-etl/util"
 	"fmt"
-	"log"
 	"strings"
 	"time"
 )
@@ -22,27 +21,31 @@ type BaseReader struct {
 	Source       *config.SourceConfig
 	QueryTimeout time.Duration // 0 表示不限制
 	dialect      readerDialect
+	err          error // ReadBatch 异步执行期间捕获的错误，通过 Err() 暴露
 }
 
-// queryContext 返回一个带超时的 context，若 QueryTimeout == 0 则返回 background context。
-func (r *BaseReader) queryContext() (context.Context, context.CancelFunc) {
+// Err 返回 ReadBatch 异步读取期间发生的错误，应在 channel 耗尽后调用。
+func (r *BaseReader) Err() error { return r.err }
+
+// queryContext 基于 parent 返回一个带超时的 context，若 QueryTimeout == 0 则直接返回 parent。
+func (r *BaseReader) queryContext(parent context.Context) (context.Context, context.CancelFunc) {
 	if r.QueryTimeout > 0 {
-		return context.WithTimeout(context.Background(), r.QueryTimeout)
+		return context.WithTimeout(parent, r.QueryTimeout)
 	}
-	return context.Background(), func() {}
+	return parent, func() {}
 }
 
-func (r *BaseReader) GetColumnHandlers() []ColHandler {
+func (r *BaseReader) GetColumnHandlers() ([]ColHandler, error) {
 	colTypes, err := r.getColumnTypes()
 	if err != nil {
-		log.Fatalf("get column types: %v", err)
+		return nil, err
 	}
 
 	handlers := make([]ColHandler, len(colTypes))
 	for i, ct := range colTypes {
 		handlers[i] = r.dialect.getColumnHandler(ct.DatabaseTypeName())
 	}
-	return handlers
+	return handlers, nil
 }
 
 func (r *BaseReader) getColumnTypes() ([]*sql.ColumnType, error) {
@@ -51,7 +54,7 @@ func (r *BaseReader) getColumnTypes() ([]*sql.ColumnType, error) {
 		return nil, err
 	}
 
-	ctx, cancel := r.queryContext()
+	ctx, cancel := r.queryContext(context.Background())
 	defer cancel()
 
 	rows, err := r.DB.QueryContext(ctx, query)
@@ -63,24 +66,34 @@ func (r *BaseReader) getColumnTypes() ([]*sql.ColumnType, error) {
 	return rows.ColumnTypes()
 }
 
-func (r *BaseReader) ReadBatch() <-chan RowBatch {
+func (r *BaseReader) ReadBatch(ctx context.Context, cancel context.CancelFunc) <-chan RowBatch {
 	out := make(chan RowBatch, 8)
 	go func() {
 		defer close(out)
 
+		// fail 记录错误并 cancel：后者会令 writer 正在进行的事务以 context.Canceled
+		// 中止并回滚，避免在 full/copy 等模式下提交被截断的部分数据。
+		fail := func(err error) {
+			r.err = err
+			cancel()
+		}
+
 		query, err := r.buildReadQuery()
 		if err != nil {
-			log.Fatalf("build query: %v，sql: %s", err, query)
+			// 构建查询失败属于配置错误，重试无益，标记为不可重试。
+			fail(util.NonRetryable(fmt.Errorf("build query: %w，sql: %s", err, query)))
+			return
 		}
 
 		// log.Println("query: ", query)
 
-		ctx, cancel := r.queryContext()
-		defer cancel()
+		qctx, qcancel := r.queryContext(ctx)
+		defer qcancel()
 
-		rows, err := r.DB.QueryContext(ctx, query)
+		rows, err := r.DB.QueryContext(qctx, query)
 		if err != nil {
-			log.Fatalf("execute query: %v，sql: %s", err, query)
+			fail(util.WrapPgError(fmt.Errorf("execute query: %w，sql: %s", err, query)))
+			return
 		}
 		defer rows.Close()
 
@@ -88,7 +101,8 @@ func (r *BaseReader) ReadBatch() <-chan RowBatch {
 
 		cols, err := rows.Columns()
 		if err != nil {
-			log.Fatalf("get columns: %v，sql: %s", err, query)
+			fail(util.WrapPgError(fmt.Errorf("get columns: %w，sql: %s", err, query)))
+			return
 		}
 
 		for {
@@ -100,19 +114,27 @@ func (r *BaseReader) ReadBatch() <-chan RowBatch {
 					valuePtrs[i] = &values[i]
 				}
 				if err := rows.Scan(valuePtrs...); err != nil {
-					log.Fatalf("scan row: %v，sql: %s", err, query)
+					fail(util.WrapPgError(fmt.Errorf("scan row: %w，sql: %s", err, query)))
+					return
 				}
 				batch = append(batch, values)
 			}
 
 			if err := rows.Err(); err != nil {
-				log.Fatalf("iterate rows: %v，sql: %s", err, query)
+				fail(util.WrapPgError(fmt.Errorf("iterate rows: %w，sql: %s", err, query)))
+				return
 			}
 
 			if len(batch) == 0 {
 				break
 			}
-			out <- RowBatch{Columns: cols, Rows: batch}
+
+			// 监听 ctx：若下游（writer/transform）已失败并 cancel，及时退出避免 goroutine 泄漏。
+			select {
+			case out <- RowBatch{Columns: cols, Rows: batch}:
+			case <-ctx.Done():
+				return
+			}
 		}
 	}()
 	return out
@@ -131,6 +153,11 @@ func (r *BaseReader) buildReadQuery() (string, error) {
 	if hasPlaceholder {
 		if strings.Contains(query, "${SRC_INCR_FIELD}") && r.Source.IncrField == "" {
 			return "", fmt.Errorf("query uses ${SRC_INCR_FIELD} but incr_field is empty")
+		}
+		// IncrPoint 为空时替换会产出形如 `> ''` 的非法 SQL（数据库随后报 22P02）。
+		// 空值通常意味着未设 incr_field（watermark/默认值链路被跳过），属配置错误，直接失败。
+		if strings.Contains(query, "${INCR_POINT}") && r.Source.IncrPoint == "" {
+			return "", fmt.Errorf("query uses ${INCR_POINT} but incr_point is empty; set incr_field for watermark tracking or provide an initial incr_point")
 		}
 		query = strings.ReplaceAll(query, "${SRC_INCR_FIELD}", r.Source.IncrField)
 		query = strings.ReplaceAll(query, "${INCR_POINT}", r.Source.IncrPoint)

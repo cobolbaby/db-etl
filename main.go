@@ -177,14 +177,18 @@ func runPipeline(src *config.SourceConfig, srcDB config.DBConfig, dstDB config.D
 	// 所以在这里把 Mode 同步到 SourceConfig 里，Reader 和 Writer 都可以访问到
 	src.Mode = task.Target.Mode
 
-	// 增量抽取需要知道上次抽取的 Watermark 位置，这个位置存在目标数据库里
+	// 增量抽取需要知道上次抽取的 Watermark 位置。
+	// IncrPoint 非空说明启动时已从 job_data_sync（db_loader）或配置文件加载到水位，直接复用，省一次查询；
+	// 仅当为空（首次运行、尚无水位）时才查库，走 job_data_sync → MAX(incr_field) → 默认值 的兜底链。
 	if src.Mode != config.ModeTypeFull && src.IncrField != "" {
 
-		incrPoint, err := w.GetWatermark(src)
-		if err != nil {
-			return fmt.Errorf("failed to get incr point: %v", err)
+		if src.IncrPoint == "" {
+			incrPoint, err := w.GetWatermark(src)
+			if err != nil {
+				return fmt.Errorf("failed to get incr point: %v", err)
+			}
+			src.IncrPoint = incrPoint
 		}
-		src.IncrPoint = incrPoint
 		log.Printf("incr extraction mode, target table: %s, field: %s, point: %s", task.Target.Table, src.IncrField, src.IncrPoint)
 	}
 
@@ -198,7 +202,10 @@ func runPipeline(src *config.SourceConfig, srcDB config.DBConfig, dstDB config.D
 	// Transformer
 	// -----------------------------
 
-	handlers := r.GetColumnHandlers()
+	handlers, err := r.GetColumnHandlers()
+	if err != nil {
+		return fmt.Errorf("get column handlers: %w", err)
+	}
 	t := &transform.DefaultTransformer{
 		Handlers: handlers,
 	}
@@ -216,7 +223,7 @@ func runPipeline(src *config.SourceConfig, srcDB config.DBConfig, dstDB config.D
 		task.Target.Table,
 	)
 
-	err := pipeline.RunPipeline(src, r, t, w)
+	err = pipeline.RunPipeline(src, r, t, w)
 	// mc.Finish(pm, err)
 
 	if err != nil {

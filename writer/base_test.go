@@ -1,6 +1,7 @@
 package writer
 
 import (
+	"context"
 	"strings"
 	"testing"
 
@@ -12,22 +13,22 @@ type stubWriterDialect struct {
 	called string
 }
 
-func (d *stubWriterDialect) writeCopy(in <-chan transform.CSVBatch, target *config.TargetConfig) error {
+func (d *stubWriterDialect) writeCopy(ctx context.Context, in <-chan transform.CSVBatch, target *config.TargetConfig) error {
 	d.called = "copy"
 	return nil
 }
 
-func (d *stubWriterDialect) writeFull(in <-chan transform.CSVBatch, target *config.TargetConfig) error {
+func (d *stubWriterDialect) writeFull(ctx context.Context, in <-chan transform.CSVBatch, target *config.TargetConfig) error {
 	d.called = "full"
 	return nil
 }
 
-func (d *stubWriterDialect) writeAppend(in <-chan transform.CSVBatch, target *config.TargetConfig, source *config.SourceConfig, jobName string) error {
+func (d *stubWriterDialect) writeAppend(ctx context.Context, in <-chan transform.CSVBatch, target *config.TargetConfig, source *config.SourceConfig, jobName string) error {
 	d.called = "append"
 	return nil
 }
 
-func (d *stubWriterDialect) writeMerge(in <-chan transform.CSVBatch, target *config.TargetConfig, source *config.SourceConfig, jobName string) error {
+func (d *stubWriterDialect) writeMerge(ctx context.Context, in <-chan transform.CSVBatch, target *config.TargetConfig, source *config.SourceConfig, jobName string) error {
 	d.called = "merge"
 	return nil
 }
@@ -89,7 +90,7 @@ func TestBaseWriterDispatchesFullMode(t *testing.T) {
 	in := make(chan transform.CSVBatch)
 	close(in)
 
-	if err := writer.WriteBatch(nil, in); err != nil {
+	if err := writer.WriteBatch(context.Background(), nil, in); err != nil {
 		t.Fatalf("WriteBatch returned error: %v", err)
 	}
 

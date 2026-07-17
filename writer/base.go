@@ -1,6 +1,7 @@
 package writer
 
 import (
+	"context"
 	"db-etl/config"
 	"db-etl/transform"
 	"fmt"
@@ -8,10 +9,10 @@ import (
 )
 
 type writerDialect interface {
-	writeCopy(in <-chan transform.CSVBatch, target *config.TargetConfig) error
-	writeFull(in <-chan transform.CSVBatch, target *config.TargetConfig) error
-	writeAppend(in <-chan transform.CSVBatch, target *config.TargetConfig, source *config.SourceConfig, jobName string) error
-	writeMerge(in <-chan transform.CSVBatch, target *config.TargetConfig, source *config.SourceConfig, jobName string) error
+	writeCopy(ctx context.Context, in <-chan transform.CSVBatch, target *config.TargetConfig) error
+	writeFull(ctx context.Context, in <-chan transform.CSVBatch, target *config.TargetConfig) error
+	writeAppend(ctx context.Context, in <-chan transform.CSVBatch, target *config.TargetConfig, source *config.SourceConfig, jobName string) error
+	writeMerge(ctx context.Context, in <-chan transform.CSVBatch, target *config.TargetConfig, source *config.SourceConfig, jobName string) error
 	getWatermark(target *config.TargetConfig, source *config.SourceConfig, jobName string) (string, error)
 }
 
@@ -21,23 +22,23 @@ type BaseWriter struct {
 	dialect writerDialect
 }
 
-func (w *BaseWriter) WriteBatch(source *config.SourceConfig, in <-chan transform.CSVBatch) error {
+func (w *BaseWriter) WriteBatch(ctx context.Context, source *config.SourceConfig, in <-chan transform.CSVBatch) error {
 	if w.Target == nil {
 		return fmt.Errorf("target config is required")
 	}
 
 	switch w.Target.Mode {
 	case config.ModeTypeCopy:
-		return w.dialect.writeCopy(in, w.Target)
+		return w.dialect.writeCopy(ctx, in, w.Target)
 	case config.ModeTypeFull:
-		return w.dialect.writeFull(in, w.Target)
+		return w.dialect.writeFull(ctx, in, w.Target)
 	case config.ModeTypeAppend:
-		return w.dialect.writeAppend(in, w.Target, source, w.JobName)
+		return w.dialect.writeAppend(ctx, in, w.Target, source, w.JobName)
 	case config.ModeTypeMerge:
 		if w.Target.PK == "" {
 			return fmt.Errorf("pk is required for merge mode")
 		}
-		return w.dialect.writeMerge(in, w.Target, source, w.JobName)
+		return w.dialect.writeMerge(ctx, in, w.Target, source, w.JobName)
 	default:
 		return fmt.Errorf("unsupported mode: %s", w.Target.Mode)
 	}

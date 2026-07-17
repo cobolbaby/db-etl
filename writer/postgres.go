@@ -46,7 +46,7 @@ func drainFirstBatch(in <-chan transform.CSVBatch) (transform.CSVBatch, bool) {
 	return transform.CSVBatch{}, false
 }
 
-func (d *pgWriterDialect) writeFull(in <-chan transform.CSVBatch, target *config.TargetConfig) error {
+func (d *pgWriterDialect) writeFull(ctx context.Context, in <-chan transform.CSVBatch, target *config.TargetConfig) error {
 
 	firstBatch, foundRows := drainFirstBatch(in)
 
@@ -54,8 +54,6 @@ func (d *pgWriterDialect) writeFull(in <-chan transform.CSVBatch, target *config
 		log.Printf("table=%s full refresh finished: no rows to load", target.Table)
 		return nil
 	}
-
-	ctx := context.Background()
 
 	tx, err := d.conn.Begin(ctx)
 	if err != nil {
@@ -86,7 +84,7 @@ func (d *pgWriterDialect) writeFull(in <-chan transform.CSVBatch, target *config
 	}
 
 	// 使用事务所在连接执行 COPY，确保 COPY 与清表操作在同一事务内原子提交。
-	if err := d.writeCopyWithFirstBatch(firstBatch, in, target.Table, tx.Conn()); err != nil {
+	if err := d.writeCopyWithFirstBatch(ctx, firstBatch, in, target.Table, tx.Conn()); err != nil {
 		return err
 	}
 
@@ -94,7 +92,7 @@ func (d *pgWriterDialect) writeFull(in <-chan transform.CSVBatch, target *config
 	return tx.Commit(ctx)
 }
 
-func (d *pgWriterDialect) writeCopy(in <-chan transform.CSVBatch, target *config.TargetConfig) error {
+func (d *pgWriterDialect) writeCopy(ctx context.Context, in <-chan transform.CSVBatch, target *config.TargetConfig) error {
 	firstBatch, foundRows := drainFirstBatch(in)
 
 	if !foundRows {
@@ -102,11 +100,11 @@ func (d *pgWriterDialect) writeCopy(in <-chan transform.CSVBatch, target *config
 		return nil
 	}
 
-	return d.writeCopyWithFirstBatch(firstBatch, in, target.Table, d.conn)
+	return d.writeCopyWithFirstBatch(ctx, firstBatch, in, target.Table, d.conn)
 }
 
-func (d *pgWriterDialect) writeCopyWithFirstBatch(firstBatch transform.CSVBatch, in <-chan transform.CSVBatch, table string, conn *pgx.Conn) error {
-	return d.writeCopyStream(table, firstBatch.Columns, conn, func(write func(transform.CSVBatch) error) error {
+func (d *pgWriterDialect) writeCopyWithFirstBatch(ctx context.Context, firstBatch transform.CSVBatch, in <-chan transform.CSVBatch, table string, conn *pgx.Conn) error {
+	return d.writeCopyStream(ctx, table, firstBatch.Columns, conn, func(write func(transform.CSVBatch) error) error {
 		if err := write(firstBatch); err != nil {
 			return err
 		}
@@ -123,6 +121,7 @@ func (d *pgWriterDialect) writeCopyWithFirstBatch(firstBatch transform.CSVBatch,
 // columns 用于构建 COPY SQL；conn 为执行 COPY 的连接（可传入 tx.Conn() 以确保在同一事务内）；
 // iterFn 负责逐个传递所有 batch。
 func (d *pgWriterDialect) writeCopyStream(
+	ctx context.Context,
 	table string,
 	columns []string,
 	conn *pgx.Conn,
@@ -135,7 +134,7 @@ func (d *pgWriterDialect) writeCopyStream(
 
 	var copyTag pgconn.CommandTag
 	go func() {
-		tag, err := conn.PgConn().CopyFrom(context.Background(), pr, copySQL)
+		tag, err := conn.PgConn().CopyFrom(ctx, pr, copySQL)
 		copyTag = tag
 		if err != nil {
 			_ = pr.CloseWithError(err)
@@ -216,31 +215,29 @@ func buildCopySQL(table string, columns []string) string {
 	return base + " FROM STDIN WITH (FORMAT CSV, DELIMITER ',', QUOTE '\"', ESCAPE '\"', NULL '" + util.NullSentinel + "')"
 }
 
-func (d *pgWriterDialect) writeAppend(in <-chan transform.CSVBatch, target *config.TargetConfig, source *config.SourceConfig, jobName string) error {
+func (d *pgWriterDialect) writeAppend(ctx context.Context, in <-chan transform.CSVBatch, target *config.TargetConfig, source *config.SourceConfig, jobName string) error {
 	if target.CommitBatchSize > 0 {
-		return d.writeIncrChunked(in, target, source, jobName, false)
+		return d.writeIncrChunked(ctx, in, target, source, jobName, false)
 	}
-	return d.writeIncrOnce(in, target, source, jobName, false)
+	return d.writeIncrOnce(ctx, in, target, source, jobName, false)
 }
 
-func (d *pgWriterDialect) writeMerge(in <-chan transform.CSVBatch, target *config.TargetConfig, source *config.SourceConfig, jobName string) error {
+func (d *pgWriterDialect) writeMerge(ctx context.Context, in <-chan transform.CSVBatch, target *config.TargetConfig, source *config.SourceConfig, jobName string) error {
 	if target.CommitBatchSize > 0 {
-		return d.writeIncrChunked(in, target, source, jobName, true)
+		return d.writeIncrChunked(ctx, in, target, source, jobName, true)
 	}
-	return d.writeIncrOnce(in, target, source, jobName, true)
+	return d.writeIncrOnce(ctx, in, target, source, jobName, true)
 }
 
 // writeIncrOnce 在单个事务中完成增量写入（append / merge 共用）。
 // needDelete=true 时先按 PK 从目标表删除重复行（merge 语义），false 时仅追加（append 语义）。
-func (d *pgWriterDialect) writeIncrOnce(in <-chan transform.CSVBatch, target *config.TargetConfig, source *config.SourceConfig, jobName string, needDelete bool) error {
+func (d *pgWriterDialect) writeIncrOnce(ctx context.Context, in <-chan transform.CSVBatch, target *config.TargetConfig, source *config.SourceConfig, jobName string, needDelete bool) error {
 	firstBatch, foundRows := drainFirstBatch(in)
 
 	if !foundRows {
 		log.Printf("table=%s no incremental rows, skip", target.Table)
 		return nil
 	}
-
-	ctx := context.Background()
 
 	tx, err := d.conn.Begin(ctx)
 	if err != nil {
@@ -254,7 +251,7 @@ func (d *pgWriterDialect) writeIncrOnce(in <-chan transform.CSVBatch, target *co
 		return err
 	}
 
-	if err := d.writeCopyWithFirstBatch(firstBatch, in, staging, tx.Conn()); err != nil {
+	if err := d.writeCopyWithFirstBatch(ctx, firstBatch, in, staging, tx.Conn()); err != nil {
 		return err
 	}
 
@@ -297,8 +294,7 @@ func (d *pgWriterDialect) writeIncrOnce(in <-chan transform.CSVBatch, target *co
 // writeIncrChunked 将增量写入拆成若干块，每 CommitBatchSize 个 batch 提交一次事务并更新水位。
 // needDelete=true 时每块先 DELETE 再 INSERT（merge），false 时仅 INSERT（append）。
 // 适用于超大表：中断后重启可从上次已提交的水位断点继续，而不必从头同步。
-func (d *pgWriterDialect) writeIncrChunked(in <-chan transform.CSVBatch, target *config.TargetConfig, source *config.SourceConfig, jobName string, needDelete bool) error {
-	ctx := context.Background()
+func (d *pgWriterDialect) writeIncrChunked(ctx context.Context, in <-chan transform.CSVBatch, target *config.TargetConfig, source *config.SourceConfig, jobName string, needDelete bool) error {
 	var totalDeleted, totalInserted int64
 	chunkIdx := 0
 
@@ -327,7 +323,7 @@ func (d *pgWriterDialect) writeIncrChunked(in <-chan transform.CSVBatch, target 
 		feedCh = make(chan transform.CSVBatch, 1)
 		copyDone = make(chan error, 1)
 		go func(txConn *pgx.Conn) {
-			copyDone <- d.writeCopyStream(staging, columns, txConn, func(write func(transform.CSVBatch) error) error {
+			copyDone <- d.writeCopyStream(ctx, staging, columns, txConn, func(write func(transform.CSVBatch) error) error {
 				for b := range feedCh {
 					if err := write(b); err != nil {
 						return err

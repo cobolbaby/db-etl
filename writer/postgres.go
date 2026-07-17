@@ -6,7 +6,6 @@ import (
 	"db-etl/config"
 	"db-etl/transform"
 	"db-etl/util"
-	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -34,46 +33,6 @@ func NewPGWriter(conn *pgx.Conn, target *config.TargetConfig, jobName string) Wr
 	base.dialect = &pgWriterDialect{conn: conn}
 
 	return &PGWriter{BaseWriter: base}
-}
-
-// pgPermanentError returns util.NonRetryable(err) for PostgreSQL error classes that
-// cannot be resolved by retrying (data exceptions, integrity constraints, syntax errors).
-func pgPermanentError(err error) error {
-	if err == nil {
-		return nil
-	}
-	var pgErr *pgconn.PgError
-	if errors.As(err, &pgErr) && len(pgErr.Code) >= 2 {
-		// Enrich the error with DETAIL and CONTEXT fields, which are not included
-		// in PgError.Error() but contain the actionable diagnostic information
-		// (e.g. which column and line triggered the error during COPY).
-		enriched := pgEnrichError(err, pgErr)
-		switch pgErr.Code[:2] {
-		case "22", // Data Exception (type mismatches, overflow, …)
-			"23", // Integrity Constraint Violation (not-null, FK, unique, check)
-			"42": // Syntax Error or Access Rule Violation (bad column, bad table, …)
-			return util.NonRetryable(enriched)
-		}
-		return enriched
-	}
-	return err
-}
-
-// pgEnrichError wraps err with the DETAIL and CONTEXT fields from pgErr so that
-// callers printing the error see the full diagnostic context, not just the message.
-// Uses %w to preserve the error chain for errors.Is / errors.As.
-func pgEnrichError(err error, pgErr *pgconn.PgError) error {
-	if pgErr.Detail == "" && pgErr.Where == "" {
-		return err
-	}
-	extra := ""
-	if pgErr.Detail != "" {
-		extra += "; DETAIL: " + pgErr.Detail
-	}
-	if pgErr.Where != "" {
-		extra += "; CONTEXT: " + pgErr.Where
-	}
-	return fmt.Errorf("%w%s", err, extra)
 }
 
 // drainFirstBatch 从 channel 中取出第一个非空 batch，用于获取列信息并启动后续写入。
@@ -106,8 +65,8 @@ func (d *pgWriterDialect) writeFull(in <-chan transform.CSVBatch, target *config
 
 	// 尝试带超时的 TRUNCATE；若锁等待超时则回滚当前事务，开新事务用 DELETE FROM 退避
 	if err := d.tryTruncateWithTimeout(ctx, tx, target); err != nil {
-		if !isLockTimeoutError(err) {
-			return pgPermanentError(err)
+		if !util.IsPgLockTimeout(err) {
+			return util.WrapPgError(err)
 		}
 
 		log.Printf("table=%s TRUNCATE lock timeout, falling back to DELETE FROM", target.Table)
@@ -121,7 +80,7 @@ func (d *pgWriterDialect) writeFull(in <-chan transform.CSVBatch, target *config
 		defer tx.Rollback(ctx)
 
 		if _, err := tx.Exec(ctx, fmt.Sprintf("DELETE FROM %s", target.Table)); err != nil {
-			return pgPermanentError(err)
+			return util.WrapPgError(err)
 		}
 		log.Printf("table=%s DELETE FROM completed", target.Table)
 	}
@@ -224,9 +183,9 @@ func (d *pgWriterDialect) writeCopyStream(
 	finishWithError := func(err error) error {
 		_ = pw.CloseWithError(err)
 		if copyErr := <-errCh; copyErr != nil {
-			return pgPermanentError(copyErr)
+			return util.WrapPgError(copyErr)
 		}
-		return pgPermanentError(err)
+		return util.WrapPgError(err)
 	}
 
 	if err := iterFn(writeBatch); err != nil {
@@ -240,7 +199,7 @@ func (d *pgWriterDialect) writeCopyStream(
 	pw.Close()
 	if err := <-errCh; err != nil {
 		log.Printf("COPY %s error: %v", table, err)
-		return pgPermanentError(err)
+		return util.WrapPgError(err)
 	}
 	log.Printf("COPY %s completed successfully, rows=%d", table, copyTag.RowsAffected())
 	return nil
@@ -309,7 +268,7 @@ func (d *pgWriterDialect) writeIncrOnce(in <-chan transform.CSVBatch, target *co
 
 	inserted, err := d.insertTarget(ctx, tx, staging, target)
 	if err != nil {
-		return pgPermanentError(err)
+		return util.WrapPgError(err)
 	}
 
 	watermark := ""
@@ -386,7 +345,7 @@ func (d *pgWriterDialect) writeIncrChunked(in <-chan transform.CSVBatch, target 
 		// 必须等待 COPY goroutine 完全结束，才能在同一连接上执行后续 SQL
 		if copyErr := <-copyDone; copyErr != nil {
 			_ = currentTx.Rollback(ctx)
-			return fmt.Errorf("table=%s COPY failed: %w", target.Table, pgPermanentError(copyErr))
+			return fmt.Errorf("table=%s COPY failed: %w", target.Table, util.WrapPgError(copyErr))
 		}
 
 		var deleted int64
@@ -402,7 +361,7 @@ func (d *pgWriterDialect) writeIncrChunked(in <-chan transform.CSVBatch, target 
 		inserted, err := d.insertTarget(ctx, currentTx, currentStaging, target)
 		if err != nil {
 			_ = currentTx.Rollback(ctx)
-			return pgPermanentError(err)
+			return util.WrapPgError(err)
 		}
 		totalDeleted += deleted
 		totalInserted += inserted
@@ -447,7 +406,7 @@ func (d *pgWriterDialect) writeIncrChunked(in <-chan transform.CSVBatch, target 
 		case copyErr := <-copyDone:
 			_ = currentTx.Rollback(ctx)
 			if copyErr != nil {
-				return fmt.Errorf("table=%s copy goroutine failed: %w", target.Table, pgPermanentError(copyErr))
+				return fmt.Errorf("table=%s copy goroutine failed: %w", target.Table, util.WrapPgError(copyErr))
 			}
 			return fmt.Errorf("table=%s copy goroutine exited unexpectedly", target.Table)
 		}
@@ -510,12 +469,6 @@ func (d *pgWriterDialect) tryTruncateWithTimeout(ctx context.Context, tx pgx.Tx,
 
 	_, err := tx.Exec(ctx, fmt.Sprintf("TRUNCATE TABLE %s", target.Table))
 	return err
-}
-
-// isLockTimeoutError 判断是否为 PostgreSQL lock_timeout 触发的错误（错误码 55P03）。
-func isLockTimeoutError(err error) bool {
-	var pgErr *pgconn.PgError
-	return errors.As(err, &pgErr) && pgErr.Code == "55P03"
 }
 
 func (d *pgWriterDialect) deleteTarget(

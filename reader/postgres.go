@@ -40,14 +40,6 @@ func (pgDialect) buildBaseQuery(source *config.SourceConfig, projection string, 
 	return query, nil
 }
 
-func (pgDialect) formatIncrValue(v string) string {
-	s := strings.TrimSpace(v)
-	if isNumericLiteral(s) {
-		return s
-	}
-	return "'" + s + "'"
-}
-
 func (pgDialect) quoteIdentifier(identifier string) string {
 	if isAlreadyQuotedIdentifier(identifier) {
 		return identifier

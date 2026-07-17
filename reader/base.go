@@ -7,7 +7,6 @@ import (
 	"db-etl/util"
 	"fmt"
 	"log"
-	"strconv"
 	"strings"
 	"time"
 )
@@ -15,8 +14,6 @@ import (
 type readerDialect interface {
 	buildBaseQuery(source *config.SourceConfig, projection string, whereClause string) (string, error)
 	getColumnHandler(dbType string) ColHandler
-	// formatIncrValue 将增量水位字符串格式化为可直接嵌入 SQL 的字面量或函数调用。
-	formatIncrValue(v string) string
 	quoteIdentifier(identifier string) string
 }
 
@@ -59,7 +56,7 @@ func (r *BaseReader) getColumnTypes() ([]*sql.ColumnType, error) {
 
 	rows, err := r.DB.QueryContext(ctx, query)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("%w，sql: %s", err, query)
 	}
 	defer rows.Close()
 
@@ -291,33 +288,4 @@ func defaultColumnHandler(v any) string {
 	default:
 		return util.SanitizeString(fmt.Sprintf("%v", t))
 	}
-}
-
-func isNumericLiteral(s string) bool {
-	if _, err := strconv.ParseInt(s, 10, 64); err == nil {
-		return true
-	}
-	if _, err := strconv.ParseFloat(s, 64); err == nil {
-		return true
-	}
-	return false
-}
-
-// isDateTimeLiteral 判断字符串是否为日期/时间字面量。
-// 支持 "2006-01-02 15:04:05"、"2006-01-02 15:04:05.999999999" 等常见格式。
-func isDateTimeLiteral(s string) bool {
-	formats := []string{
-		"2006-01-02 15:04:05",
-		"2006-01-02 15:04:05.999999999",
-		"2006-01-02T15:04:05",
-		"2006-01-02T15:04:05.999999999",
-		"2006-01-02T15:04:05Z07:00",
-		"2006-01-02T15:04:05.999999999Z07:00",
-	}
-	for _, f := range formats {
-		if _, err := time.Parse(f, s); err == nil {
-			return true
-		}
-	}
-	return false
 }

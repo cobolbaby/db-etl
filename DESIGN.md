@@ -47,7 +47,7 @@ Reader 和 Writer 均采用 **Base + Dialect** 结构：
 
 ```
 BaseReader { DB, Source, dialect readerDialect }
-  ├── MSSQLDialect   → buildBaseQuery / getColumnHandler / formatIncrValue / quoteIdentifier
+  ├── MSSQLDialect   → buildBaseQuery / getColumnHandler / quoteIdentifier
   └── PGDialect      → ...
 
 BaseWriter { Target, JobName, dialect writerDialect }

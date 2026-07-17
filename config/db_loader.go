@@ -120,13 +120,21 @@ func rowToTaskConfig(r JobDataSyncRow, metaDB DBConfig, resolver DBResolver) (Ta
 	if r.DstSchemaName == "" || r.DstTableName == "" {
 		return TaskConfig{}, fmt.Errorf("dst_schema_name / dst_table_name is empty")
 	}
+	// src_db_name 作为 watermark 的 src_db_name，正常不应为空；为空会导致水位定位不准确。
+	if strings.TrimSpace(r.SrcDBName) == "" {
+		return TaskConfig{}, fmt.Errorf("src_db_name is empty")
+	}
 
 	src := &SourceConfig{
 		// 通过 src_conn_id 匹配数据源。
-		ConnID:         r.SrcConnID,
-		BatchSize:      10000,
-		IncrField:      r.SrcIncrField,
+		ConnID: r.SrcConnID,
+		// Database 直接取自 job_data_sync 的 src_db_name，作为 watermark 的 src_db_name。
+		// 它反映真实的源库（可能与数据源连接默认库不同），后续流程不得用连接配置的库名覆盖。
+		Database:       strings.TrimSpace(r.SrcDBName),
 		WhereStatement: strings.TrimSpace(r.SrcWhereStatement),
+		BatchSize:      10000,
+		Mode:           ModeType(r.SyncMode),
+		IncrField:      r.SrcIncrField,
 	}
 
 	fieldsMapping := strings.TrimSpace(r.FieldsMapping)

@@ -135,13 +135,6 @@ func (d *pgWriterDialect) writeFull(in <-chan transform.CSVBatch, target *config
 	return tx.Commit(ctx)
 }
 
-func (d *pgWriterDialect) writeAppend(in <-chan transform.CSVBatch, target *config.TargetConfig, source *config.SourceConfig, jobName string) error {
-	if target.CommitBatchSize > 0 {
-		return d.writeIncrSegmented(in, target, source, jobName, false)
-	}
-	return d.writeIncrOnce(in, target, source, jobName, false)
-}
-
 func (d *pgWriterDialect) writeCopy(in <-chan transform.CSVBatch, target *config.TargetConfig) error {
 	firstBatch, foundRows := drainFirstBatch(in)
 
@@ -181,8 +174,10 @@ func (d *pgWriterDialect) writeCopyStream(
 	errCh := make(chan error, 1)
 	copySQL := buildCopySQL(table, columns)
 
+	var copyTag pgconn.CommandTag
 	go func() {
-		_, err := conn.PgConn().CopyFrom(context.Background(), pr, copySQL)
+		tag, err := conn.PgConn().CopyFrom(context.Background(), pr, copySQL)
+		copyTag = tag
 		if err != nil {
 			_ = pr.CloseWithError(err)
 		} else {
@@ -247,7 +242,7 @@ func (d *pgWriterDialect) writeCopyStream(
 		log.Printf("COPY %s error: %v", table, err)
 		return pgPermanentError(err)
 	}
-	log.Printf("COPY %s completed successfully", table)
+	log.Printf("COPY %s completed successfully, rows=%d", table, copyTag.RowsAffected())
 	return nil
 }
 
@@ -262,9 +257,16 @@ func buildCopySQL(table string, columns []string) string {
 	return base + " FROM STDIN WITH (FORMAT CSV, DELIMITER ',', QUOTE '\"', ESCAPE '\"', NULL '" + util.NullSentinel + "')"
 }
 
+func (d *pgWriterDialect) writeAppend(in <-chan transform.CSVBatch, target *config.TargetConfig, source *config.SourceConfig, jobName string) error {
+	if target.CommitBatchSize > 0 {
+		return d.writeIncrChunked(in, target, source, jobName, false)
+	}
+	return d.writeIncrOnce(in, target, source, jobName, false)
+}
+
 func (d *pgWriterDialect) writeMerge(in <-chan transform.CSVBatch, target *config.TargetConfig, source *config.SourceConfig, jobName string) error {
 	if target.CommitBatchSize > 0 {
-		return d.writeIncrSegmented(in, target, source, jobName, true)
+		return d.writeIncrChunked(in, target, source, jobName, true)
 	}
 	return d.writeIncrOnce(in, target, source, jobName, true)
 }
@@ -310,6 +312,7 @@ func (d *pgWriterDialect) writeIncrOnce(in <-chan transform.CSVBatch, target *co
 		return pgPermanentError(err)
 	}
 
+	watermark := ""
 	if source != nil && source.IncrField != "" {
 		maxWM, err := d.computeWatermark(ctx, tx, staging, source)
 		if err != nil {
@@ -319,26 +322,28 @@ func (d *pgWriterDialect) writeIncrOnce(in <-chan transform.CSVBatch, target *co
 		if err := d.updateWatermark(ctx, tx, maxWM, target, source, jobName); err != nil {
 			return err
 		}
+
+		watermark = " watermark=" + maxWM
 	}
 
 	if needDelete {
-		log.Printf("table=%s deleted=%d inserted=%d\n", target.Table, deleted, inserted)
+		log.Printf("table=%s deleted=%d inserted=%d%s", target.Table, deleted, inserted, watermark)
 	} else {
-		log.Printf("table=%s appended=%d\n", target.Table, inserted)
+		log.Printf("table=%s appended=%d%s", target.Table, inserted, watermark)
 	}
 
 	return tx.Commit(ctx)
 }
 
-// writeIncrSegmented 将增量写入拆成若干段，每 CommitBatchSize 个 batch 提交一次事务并更新水位。
-// needDelete=true 时每段先 DELETE 再 INSERT（merge），false 时仅 INSERT（append）。
+// writeIncrChunked 将增量写入拆成若干块，每 CommitBatchSize 个 batch 提交一次事务并更新水位。
+// needDelete=true 时每块先 DELETE 再 INSERT（merge），false 时仅 INSERT（append）。
 // 适用于超大表：中断后重启可从上次已提交的水位断点继续，而不必从头同步。
-func (d *pgWriterDialect) writeIncrSegmented(in <-chan transform.CSVBatch, target *config.TargetConfig, source *config.SourceConfig, jobName string, needDelete bool) error {
+func (d *pgWriterDialect) writeIncrChunked(in <-chan transform.CSVBatch, target *config.TargetConfig, source *config.SourceConfig, jobName string, needDelete bool) error {
 	ctx := context.Background()
 	var totalDeleted, totalInserted int64
-	segmentIdx := 0
+	chunkIdx := 0
 
-	// 当前段的状态
+	// 当前块的状态
 	var (
 		currentTx      pgx.Tx
 		currentStaging string
@@ -347,8 +352,8 @@ func (d *pgWriterDialect) writeIncrSegmented(in <-chan transform.CSVBatch, targe
 		batchCount     int
 	)
 
-	startSegment := func(columns []string) error {
-		segmentIdx++
+	startChunk := func(columns []string) error {
+		chunkIdx++
 		tx, err := d.conn.Begin(ctx)
 		if err != nil {
 			return err
@@ -375,7 +380,7 @@ func (d *pgWriterDialect) writeIncrSegmented(in <-chan transform.CSVBatch, targe
 		return nil
 	}
 
-	commitSegment := func() error {
+	commitChunk := func() error {
 		close(feedCh)
 
 		// 必须等待 COPY goroutine 完全结束，才能在同一连接上执行后续 SQL
@@ -402,6 +407,7 @@ func (d *pgWriterDialect) writeIncrSegmented(in <-chan transform.CSVBatch, targe
 		totalDeleted += deleted
 		totalInserted += inserted
 
+		watermark := ""
 		if source != nil && source.IncrField != "" {
 			maxWM, err := d.computeWatermark(ctx, currentTx, currentStaging, source)
 			if err != nil {
@@ -412,21 +418,13 @@ func (d *pgWriterDialect) writeIncrSegmented(in <-chan transform.CSVBatch, targe
 				_ = currentTx.Rollback(ctx)
 				return err
 			}
-			if needDelete {
-				log.Printf("table=%s segment#%d: deleted=%d inserted=%d watermark=%s",
-					target.Table, segmentIdx, deleted, inserted, maxWM)
-			} else {
-				log.Printf("table=%s segment#%d: appended=%d watermark=%s",
-					target.Table, segmentIdx, inserted, maxWM)
-			}
+			watermark = " watermark=" + maxWM
+		}
+
+		if needDelete {
+			log.Printf("table=%s chunk#%d: deleted=%d inserted=%d%s", target.Table, chunkIdx, deleted, inserted, watermark)
 		} else {
-			if needDelete {
-				log.Printf("table=%s segment#%d: deleted=%d inserted=%d",
-					target.Table, segmentIdx, deleted, inserted)
-			} else {
-				log.Printf("table=%s segment#%d: appended=%d",
-					target.Table, segmentIdx, inserted)
-			}
+			log.Printf("table=%s chunk#%d: appended=%d%s", target.Table, chunkIdx, inserted, watermark)
 		}
 		return currentTx.Commit(ctx)
 	}
@@ -436,7 +434,7 @@ func (d *pgWriterDialect) writeIncrSegmented(in <-chan transform.CSVBatch, targe
 			continue
 		}
 		if batchCount == 0 {
-			if err := startSegment(batch.Columns); err != nil {
+			if err := startChunk(batch.Columns); err != nil {
 				return err
 			}
 		}
@@ -455,7 +453,7 @@ func (d *pgWriterDialect) writeIncrSegmented(in <-chan transform.CSVBatch, targe
 		}
 
 		if batchCount >= target.CommitBatchSize {
-			if err := commitSegment(); err != nil {
+			if err := commitChunk(); err != nil {
 				return err
 			}
 			batchCount = 0
@@ -463,19 +461,19 @@ func (d *pgWriterDialect) writeIncrSegmented(in <-chan transform.CSVBatch, targe
 	}
 
 	if batchCount > 0 {
-		if err := commitSegment(); err != nil {
+		if err := commitChunk(); err != nil {
 			return err
 		}
 	}
 
-	if segmentIdx == 0 {
+	if chunkIdx == 0 {
 		log.Printf("table=%s no incremental rows, skip", target.Table)
 	} else if needDelete {
-		log.Printf("table=%s total: deleted=%d inserted=%d segments=%d",
-			target.Table, totalDeleted, totalInserted, segmentIdx)
+		log.Printf("table=%s total: deleted=%d inserted=%d chunks=%d",
+			target.Table, totalDeleted, totalInserted, chunkIdx)
 	} else {
-		log.Printf("table=%s total: appended=%d segments=%d",
-			target.Table, totalInserted, segmentIdx)
+		log.Printf("table=%s total: appended=%d chunks=%d",
+			target.Table, totalInserted, chunkIdx)
 	}
 
 	return nil

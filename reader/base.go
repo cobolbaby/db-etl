@@ -127,20 +127,21 @@ func (r *BaseReader) buildReadQuery() (string, error) {
 		return "", err
 	}
 
-	if r.Source.Mode == config.ModeTypeFull || r.Source.IncrField == "" {
-		return query, nil
-	}
-
-	if strings.Contains(query, "${SRC_INCR_FIELD}") ||
-		strings.Contains(query, "${INCR_POINT}") {
+	// 占位符一旦出现就必须替换，否则残留的 ${...} 会被数据库当成非法语法（syntax error at or near "$"）。
+	// 这与同步模式无关：即便是 full/copy 模式，只要 where 里写了占位符也要替换掉。
+	hasPlaceholder := strings.Contains(query, "${SRC_INCR_FIELD}") ||
+		strings.Contains(query, "${INCR_POINT}")
+	if hasPlaceholder {
+		if strings.Contains(query, "${SRC_INCR_FIELD}") && r.Source.IncrField == "" {
+			return "", fmt.Errorf("query uses ${SRC_INCR_FIELD} but incr_field is empty")
+		}
 		query = strings.ReplaceAll(query, "${SRC_INCR_FIELD}", r.Source.IncrField)
 		query = strings.ReplaceAll(query, "${INCR_POINT}", r.Source.IncrPoint)
-		// 占位符模式下用户 SQL 自行控制排序，不再追加
-		return query, nil
 	}
 
-	cond := fmt.Sprintf("%s > %s", r.Source.IncrField, r.dialect.formatIncrValue(r.Source.IncrPoint))
-	query = query + " AND " + cond
+	if r.Source.Mode == config.ModeTypeFull {
+		return query, nil
+	}
 
 	if r.Source.OrderBy != "" {
 		query += " ORDER BY " + r.Source.OrderBy
@@ -164,12 +165,10 @@ func (r *BaseReader) buildWhereClause(emptyResult bool) string {
 		return "1=0"
 	}
 
-	parts := make([]string, 0, 2)
 	if cond := strings.TrimSpace(r.Source.WhereStatement); cond != "" {
-		parts = append(parts, fmt.Sprintf("(%s)", cond))
+		return cond
 	}
-	parts = append(parts, "1=1")
-	return strings.Join(parts, " AND ")
+	return "1=1"
 }
 
 // resolveProjection 生成 SQL SELECT 子句中的列投影部分。

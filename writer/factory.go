@@ -3,18 +3,19 @@ package writer
 import (
 	"context"
 	"db-etl/config"
+	"db-etl/util"
 	"fmt"
-	"log"
 
 	"github.com/jackc/pgx/v5"
 )
 
-func NewWriter(db config.DBConfig, target *config.TargetConfig, jobName string) Writer {
+func NewWriter(db config.DBConfig, target *config.TargetConfig, jobName string) (Writer, error) {
 	switch db.Type {
 	case config.DBTypePG, config.DBTypeGP:
 		cfg, err := pgx.ParseConfig(db.DSN())
 		if err != nil {
-			log.Fatalf("PG parse config failed: %v", err)
+			// DSN 解析失败属配置错误，重试无益。
+			return nil, util.NonRetryable(fmt.Errorf("PG parse config failed: %w", err))
 		}
 
 		// statement_timeout 配置为 0 时不注入，保持服务器默认值
@@ -34,13 +35,14 @@ func NewWriter(db config.DBConfig, target *config.TargetConfig, jobName string) 
 			cfg.RuntimeParams["TimeZone"] = db.TimeZone
 		}
 
+		// ConnectConfig 会真正建连；「连不上」返回可重试错误，交由上层重试机制处理。
 		pgConn, err := pgx.ConnectConfig(context.Background(), cfg)
 		if err != nil {
-			log.Fatalf("PG connect failed: %v", err)
+			return nil, fmt.Errorf("PG connect failed: %w", err)
 		}
-		return NewPGWriter(pgConn, target, jobName)
+		return NewPGWriter(pgConn, target, jobName), nil
 	default:
-		log.Fatalf("unsupported target db type: %s", db.Type)
+		// 不支持的类型属配置错误，重试无益。
+		return nil, util.NonRetryable(fmt.Errorf("unsupported target db type: %s", db.Type))
 	}
-	return nil
 }

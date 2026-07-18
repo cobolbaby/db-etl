@@ -30,6 +30,14 @@ type BaseReader struct {
 // Err 返回 ReadBatch 异步读取期间发生的错误，应在 channel 耗尽后调用。
 func (r *BaseReader) Err() error { return r.err }
 
+// Close 释放底层数据库连接。
+func (r *BaseReader) Close() error {
+	if r.DB != nil {
+		return r.DB.Close()
+	}
+	return nil
+}
+
 // queryContext 基于 parent 返回一个带超时的 context，若 QueryTimeout == 0 则直接返回 parent。
 func (r *BaseReader) queryContext(parent context.Context) (context.Context, context.CancelFunc) {
 	if r.QueryTimeout > 0 {

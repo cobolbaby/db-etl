@@ -35,6 +35,14 @@ func NewPGWriter(conn *pgx.Conn, target *config.TargetConfig, jobName string) Wr
 	return &PGWriter{BaseWriter: base}
 }
 
+// close 关闭 pgx 连接。
+func (d *pgWriterDialect) close(ctx context.Context) error {
+	if d.conn == nil {
+		return nil
+	}
+	return d.conn.Close(ctx)
+}
+
 // drainFirstBatch 从 channel 中取出第一个非空 batch，用于获取列信息并启动后续写入。
 func drainFirstBatch(in <-chan transform.CSVBatch) (transform.CSVBatch, bool) {
 	for batch := range in {

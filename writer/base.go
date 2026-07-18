@@ -14,6 +14,8 @@ type writerDialect interface {
 	writeAppend(ctx context.Context, in <-chan transform.CSVBatch, target *config.TargetConfig, source *config.SourceConfig, jobName string) error
 	writeMerge(ctx context.Context, in <-chan transform.CSVBatch, target *config.TargetConfig, source *config.SourceConfig, jobName string) error
 	getWatermark(target *config.TargetConfig, source *config.SourceConfig, jobName string) (string, error)
+	// close 释放底层连接。
+	close(ctx context.Context) error
 }
 
 type BaseWriter struct {
@@ -46,6 +48,14 @@ func (w *BaseWriter) WriteBatch(ctx context.Context, source *config.SourceConfig
 
 func (w *BaseWriter) GetWatermark(source *config.SourceConfig) (string, error) {
 	return w.dialect.getWatermark(w.Target, source, w.JobName)
+}
+
+// Close 释放底层数据库连接。
+func (w *BaseWriter) Close() error {
+	if w.dialect == nil {
+		return nil
+	}
+	return w.dialect.close(context.Background())
 }
 
 func watermarkJobName(jobName string) string {

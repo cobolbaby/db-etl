@@ -171,7 +171,12 @@ func runPipeline(src *config.SourceConfig, srcDB config.DBConfig, dstDB config.D
 	// Writer
 	// -----------------------------
 
-	w := writer.NewWriter(dstDB, task.Target, task.Name)
+	w, err := writer.NewWriter(dstDB, task.Target, task.Name)
+	if err != nil {
+		return fmt.Errorf("create writer: %w", err)
+	}
+	// 每次 pipeline（含重试的每一轮）结束都关闭连接，避免重试重建连接时泄漏。
+	defer w.Close()
 
 	// 同步方式定义在 Writer 端，但又会影响 Reader 端的抽取逻辑（增量抽取需要从目标端获取上次抽取的 Watermark 位置），
 	// 所以在这里把 Mode 同步到 SourceConfig 里，Reader 和 Writer 都可以访问到
@@ -196,7 +201,11 @@ func runPipeline(src *config.SourceConfig, srcDB config.DBConfig, dstDB config.D
 	// Reader
 	// -----------------------------
 
-	r := reader.NewReader(srcDB, src)
+	r, err := reader.NewReader(srcDB, src)
+	if err != nil {
+		return fmt.Errorf("create reader: %w", err)
+	}
+	defer r.Close()
 
 	// -----------------------------
 	// Transformer

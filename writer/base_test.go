@@ -37,6 +37,11 @@ func (d *stubWriterDialect) getWatermark(target *config.TargetConfig, source *co
 	return "", nil
 }
 
+func (d *stubWriterDialect) close(ctx context.Context) error {
+	d.called = "close"
+	return nil
+}
+
 func TestSourceIdentityAllowsThreePartTableForMSSQL(t *testing.T) {
 	source := &config.SourceConfig{
 		Table:  "sales.dbo.orders",

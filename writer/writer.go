@@ -19,4 +19,8 @@ type WatermarkStore interface {
 type Writer interface {
 	BatchWriter
 	WatermarkStore
+
+	// Close 释放底层数据库连接。应在每次 pipeline 结束（含重试的每一轮）后调用，
+	// 避免重试重建连接时泄漏。
+	Close() error
 }

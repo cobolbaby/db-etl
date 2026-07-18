@@ -135,6 +135,16 @@ tasks:
 - 使用 `table` 时，优先保留 `table` 形态，`where_statement` / `fields_mapping` 在 reader 阶段再拼装查询，不会在配置加载阶段改写成 SQL。
 - 使用 `sql` 时，watermark 的源标识使用 SQL 文本本身（写入 `manager.job_data_sync.src_rawsql`）。
 
+### `fields_mapping` 源字段的引号规则
+
+`fields_mapping` 的 key（源字段）会按启发式自动加引号：
+
+- **纯列名**（含空格、中文、斜杠等，如 `Analysis Result Judge`、`故障DC/LC`、`Cost Saving`）会自动用方言引号包裹（MSSQL 用 `[]`，PostgreSQL 用 `""`）。
+- **SQL 表达式 / 限定名**（含圆括号或点号，如 `GETDATE()`、`CAST(x AS INT)`、`dbo.sourceId`）会原样透传，不加引号。
+- **已显式引用的标识符**（如 `[Price(USD)]`、`"OrderID"`）会原样保留，不会二次加引号。
+
+> ⚠️ **含圆括号的列名需手动引用。** 由于 `Price(USD)`（列名）与 `GETDATE()`（函数）在词法上无法区分，含圆括号的列名（如 `Price(USD)`、`等級(Level)`、`故障原廠MPN(Material MPN)`）会被当作表达式而不加引号，导致 SQL 语法错误。这类列名必须在配置中预先自行引用（MSSQL 写成 `[Price(USD)]`，PostgreSQL 写成 `"Price(USD)"`），或改用 `sql` / `src_rawsql` 手写查询。
+
 ### 增量抽取约束
 
 当配置了 `incr_field` 时，必须满足：

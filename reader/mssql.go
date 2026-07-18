@@ -50,6 +50,10 @@ func (mssqlDialect) quoteIdentifier(identifier string) string {
 	return "[" + identifier + "]"
 }
 
+func (mssqlDialect) wrapError(err error) error {
+	return util.WrapMSSQLError(err)
+}
+
 func (mssqlDialect) getColumnHandler(dbType string) ColHandler {
 	switch strings.ToUpper(dbType) {
 	case "UNIQUEIDENTIFIER":

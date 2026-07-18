@@ -160,6 +160,19 @@ type SourceConfig struct {
 // 	Arg2      string `yaml:"arg2"`
 // }
 
+func normalizeFieldsMappingItems(items map[string]string) map[string]string {
+	if len(items) == 0 {
+		return nil
+	}
+
+	normalized := make(map[string]string, len(items))
+	for key, value := range items {
+		normalized[strings.TrimSpace(key)] = strings.TrimSpace(value)
+	}
+
+	return normalized
+}
+
 type FieldsMapping struct {
 	Items map[string]string
 }
@@ -222,21 +235,23 @@ func (m FieldsMapping) Projection(formatSource func(string) string, formatTarget
 	return "*", nil
 }
 
-func (m FieldsMapping) IsEmpty() bool {
-	return len(m.Items) == 0
+// TargetColumn 返回源字段在目标表中的列名。
+// 配置了 fields_mapping 且能匹配到该源字段时返回映射后的目标列名；
+// 否则（无映射或未匹配，如透传 "*" 场景）返回原字段名。
+// 用于对目标/暂存表按列名做聚合（如 MAX(incr_field)），
+// 避免源字段被改名后仍用源名去查目标表而报列不存在。
+func (m FieldsMapping) TargetColumn(sourceField string) string {
+	sourceField = strings.TrimSpace(sourceField)
+	if target, ok := m.Items[sourceField]; ok {
+		if trimmed := strings.TrimSpace(target); trimmed != "" {
+			return trimmed
+		}
+	}
+	return sourceField
 }
 
-func normalizeFieldsMappingItems(items map[string]string) map[string]string {
-	if len(items) == 0 {
-		return nil
-	}
-
-	normalized := make(map[string]string, len(items))
-	for key, value := range items {
-		normalized[strings.TrimSpace(key)] = strings.TrimSpace(value)
-	}
-
-	return normalized
+func (m FieldsMapping) IsEmpty() bool {
+	return len(m.Items) == 0
 }
 
 func (m FieldsMapping) Validate() error {
@@ -261,7 +276,7 @@ func (m FieldsMapping) Validate() error {
 		if isReservedKeyword(target) {
 			return fmt.Errorf("fields_mapping target field %q is a reserved keyword", target)
 		}
-		if !looksLikeExpression(source) && !isAllowedFieldName(source) {
+		if !isAllowedFieldName(source) && !looksLikeExpression(source) {
 			log.Printf("warning: fields_mapping source field %q contains special characters; only letters, digits, and underscore are recommended", source)
 		}
 	}
@@ -597,7 +612,9 @@ func validateSource(source *SourceConfig, target *TargetConfig, resolver DBResol
 			return fmt.Errorf("incr_field is required when commit_batch_size > 0")
 		}
 		if source.OrderBy == "" {
-			source.OrderBy = source.IncrField + " ASC"
+			// 用占位符而非裸字段名：交由 reader 的占位符替换按方言加引号，
+			// 避免含空格/中文的字段名（如 "Test Finish Date"）拼进 ORDER BY 触发语法错误。
+			source.OrderBy = "${SRC_INCR_FIELD} ASC"
 		}
 	}
 

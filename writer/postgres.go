@@ -506,9 +506,12 @@ func (d *pgWriterDialect) insertTarget(ctx context.Context, tx pgx.Tx, staging s
 }
 
 func (d *pgWriterDialect) computeWatermark(ctx context.Context, tx pgx.Tx, staging string, source *config.SourceConfig) (string, error) {
+	// 暂存表结构 LIKE 目标表，列名为映射后的目标名；
+	// 若增量字段经 fields_mapping 改名，须用目标列名聚合，否则报列不存在。
+	incrColumn := source.FieldsMapping.TargetColumn(source.IncrField)
 	sql := fmt.Sprintf(
 		`SELECT COALESCE(MAX(%s)::text, '') FROM %s`,
-		source.IncrField,
+		incrColumn,
 		staging,
 	)
 
@@ -649,13 +652,15 @@ func (d *pgWriterDialect) getWatermark(target *config.TargetConfig, source *conf
 	// 如果 job_data_sync 中没有记录或 incr_point 为空，回退到从目标表查增量字段最大值
 	if wm == "" && source.IncrField != "" {
 		ctx := context.Background()
-		fallbackSQL := fmt.Sprintf(`SELECT COALESCE(MAX(%s)::text, '') FROM %s`, source.IncrField, target.Table)
+		// 目标表列名为映射后的目标名，须用目标列名聚合，否则源字段改名后会报列不存在。
+		incrColumn := source.FieldsMapping.TargetColumn(source.IncrField)
+		fallbackSQL := fmt.Sprintf(`SELECT COALESCE(MAX(%s)::text, '') FROM %s`, incrColumn, target.Table)
 		var fallback string
 		if err := d.conn.QueryRow(ctx, fallbackSQL).Scan(&fallback); err != nil {
 			return "", fmt.Errorf("fallback watermark query failed: %w", err)
 		}
 		if fallback != "" {
-			log.Printf("watermark fallback: using MAX(%s)=%s from table %s", source.IncrField, fallback, target.Table)
+			log.Printf("watermark fallback: using MAX(%s)=%s from table %s", incrColumn, fallback, target.Table)
 			return fallback, nil
 		}
 		// 目标表也无数据，根据字段名推算兜底值
@@ -705,7 +710,7 @@ func buildJoinCondition(t1, t2 string, dstpk string) string {
 	cols := strings.Split(dstpk, ",")
 	for _, c := range cols {
 		parts = append(parts,
-			fmt.Sprintf("%s.%s=%s.%s", t1, strings.Trim(c, " "), t2, strings.Trim(c, " ")))
+			fmt.Sprintf("%s.%s=%s.%s", t1, strings.TrimSpace(c), t2, strings.TrimSpace(c)))
 	}
 
 	return strings.Join(parts, " AND ")

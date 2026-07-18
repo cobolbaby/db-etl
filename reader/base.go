@@ -14,6 +14,9 @@ type readerDialect interface {
 	buildBaseQuery(source *config.SourceConfig, projection string, whereClause string) (string, error)
 	getColumnHandler(dbType string) ColHandler
 	quoteIdentifier(identifier string) string
+	// wrapError 按方言对底层驱动错误做归一化，将无法通过重试解决的错误
+	//（语法错误、无效列名、约束冲突等）标记为 NonRetryable。
+	wrapError(err error) error
 }
 
 type BaseReader struct {
@@ -59,7 +62,7 @@ func (r *BaseReader) getColumnTypes() ([]*sql.ColumnType, error) {
 
 	rows, err := r.DB.QueryContext(ctx, query)
 	if err != nil {
-		return nil, fmt.Errorf("%w，sql: %s", err, query)
+		return nil, r.dialect.wrapError(fmt.Errorf("%w，sql: %s", err, query))
 	}
 	defer rows.Close()
 
@@ -92,7 +95,7 @@ func (r *BaseReader) ReadBatch(ctx context.Context, cancel context.CancelFunc) <
 
 		rows, err := r.DB.QueryContext(qctx, query)
 		if err != nil {
-			fail(util.WrapPgError(fmt.Errorf("execute query: %w，sql: %s", err, query)))
+			fail(r.dialect.wrapError(fmt.Errorf("execute query: %w，sql: %s", err, query)))
 			return
 		}
 		defer rows.Close()
@@ -101,7 +104,7 @@ func (r *BaseReader) ReadBatch(ctx context.Context, cancel context.CancelFunc) <
 
 		cols, err := rows.Columns()
 		if err != nil {
-			fail(util.WrapPgError(fmt.Errorf("get columns: %w，sql: %s", err, query)))
+			fail(r.dialect.wrapError(fmt.Errorf("get columns: %w，sql: %s", err, query)))
 			return
 		}
 
@@ -114,14 +117,14 @@ func (r *BaseReader) ReadBatch(ctx context.Context, cancel context.CancelFunc) <
 					valuePtrs[i] = &values[i]
 				}
 				if err := rows.Scan(valuePtrs...); err != nil {
-					fail(util.WrapPgError(fmt.Errorf("scan row: %w，sql: %s", err, query)))
+					fail(r.dialect.wrapError(fmt.Errorf("scan row: %w，sql: %s", err, query)))
 					return
 				}
 				batch = append(batch, values)
 			}
 
 			if err := rows.Err(); err != nil {
-				fail(util.WrapPgError(fmt.Errorf("iterate rows: %w，sql: %s", err, query)))
+				fail(r.dialect.wrapError(fmt.Errorf("iterate rows: %w，sql: %s", err, query)))
 				return
 			}
 
@@ -146,6 +149,12 @@ func (r *BaseReader) buildReadQuery() (string, error) {
 		return "", err
 	}
 
+	// ORDER BY 在占位符替换之前拼接，使 order_by 中的 ${SRC_INCR_FIELD}
+	// 与 WHERE 中的占位符共用同一套方言加引号逻辑（full 模式不排序）。
+	if r.Source.Mode != config.ModeTypeFull && r.Source.OrderBy != "" {
+		query += " ORDER BY " + r.Source.OrderBy
+	}
+
 	// 占位符一旦出现就必须替换，否则残留的 ${...} 会被数据库当成非法语法（syntax error at or near "$"）。
 	// 这与同步模式无关：即便是 full/copy 模式，只要 where 里写了占位符也要替换掉。
 	hasPlaceholder := strings.Contains(query, "${SRC_INCR_FIELD}") ||
@@ -159,16 +168,11 @@ func (r *BaseReader) buildReadQuery() (string, error) {
 		if strings.Contains(query, "${INCR_POINT}") && r.Source.IncrPoint == "" {
 			return "", fmt.Errorf("query uses ${INCR_POINT} but incr_point is empty; set incr_field for watermark tracking or provide an initial incr_point")
 		}
-		query = strings.ReplaceAll(query, "${SRC_INCR_FIELD}", r.Source.IncrField)
+		// SRC_INCR_FIELD 是列引用，与投影一样按方言加引号，
+		// 否则含空格/中文等的字段名（如 "Test Finish Date"）拼进 WHERE 会触发语法错误。
+		incrField := formatProjectionSource(r.Source.IncrField, r.dialect.quoteIdentifier)
+		query = strings.ReplaceAll(query, "${SRC_INCR_FIELD}", incrField)
 		query = strings.ReplaceAll(query, "${INCR_POINT}", r.Source.IncrPoint)
-	}
-
-	if r.Source.Mode == config.ModeTypeFull {
-		return query, nil
-	}
-
-	if r.Source.OrderBy != "" {
-		query += " ORDER BY " + r.Source.OrderBy
 	}
 
 	return query, nil
@@ -230,11 +234,17 @@ func formatProjectionSource(sourceField string, quoteIdentifier func(string) str
 		return ""
 	}
 
-	if isBareIdentifier(sourceField) {
+	// 已被引用的标识符（[x] 或 "x"）直接返回：外层绝不能再套一层引号，
+	// 否则会产出 [[x]] / ""x"" 这类非法标识符。
+	if isAlreadyQuotedIdentifier(sourceField) {
+		return sourceField
+	}
+
+	if isColumnIdentifier(sourceField) {
 		return quoteIdentifier(sourceField)
 	}
 
-	// 已引用标识符或复杂表达式，保持原样
+	// SQL 表达式（如 GETDATE()、CAST(...)）或限定名（如 dbo.tbl），保持原样
 	return sourceField
 }
 
@@ -249,29 +259,22 @@ func formatProjectionAlias(alias string, quoteIdentifier func(string) string) st
 	return quoteIdentifier(alias)
 }
 
-// isBareIdentifier 判断字符串是否为简单标识符（无需额外转义）。
-// SQL 标准定义：首字符必须是字母或下划线，后续字符可以是字母、数字或下划线。
-// 用途：区分 "id"（裸标识符）与 "CAST(x AS INT)" 或 "schema.table"（非裸标识符）。
-// 裸标识符需要加引号以处理含有特殊字符或关键字的情况；
-// 非裸标识符直接返回以保护其语法结构。
-func isBareIdentifier(value string) bool {
+// isColumnIdentifier 判断 source 字段是否应作为“列标识符”整体加引号。
+// 调用前 formatProjectionSource 已把「已被引用的标识符」提前返回，故此处只需区分
+// 「纯列名」与「SQL 表达式/限定名」。采用保守启发式：只要不含 SQL 表达式特征字符
+// （圆括号、点号），就视为纯列名并加引号——这样即可覆盖含空格、非 ASCII 字符（如中文）、
+// 斜杠等的列名，例如 "Analysis Result Judge"、"故障DC/LC"、"Cost Saving"。
+// 反之：
+//   - 含 "(" 或 ")"：视为函数调用/表达式（如 GETDATE()、CAST(x AS INT)），保持原样不加引号；
+//   - 含 "."：视为限定名（如 dbo.tbl、schema.column），保持原样。
+//
+// 注意：含圆括号的列名（如 "Price(USD)"、"等級(Level)"）会被当作表达式而不加引号，
+// 这类列名需在配置中预先自行引用（如写成 "[Price(USD)]"）或改用 src_rawsql。
+func isColumnIdentifier(value string) bool {
 	if value == "" {
 		return false
 	}
-	for index, char := range value {
-		if index == 0 {
-			// 首字符：字母或下划线
-			if (char < 'A' || char > 'Z') && (char < 'a' || char > 'z') && char != '_' {
-				return false
-			}
-			continue
-		}
-		// 后续字符：字母、数字或下划线
-		if (char < 'A' || char > 'Z') && (char < 'a' || char > 'z') && (char < '0' || char > '9') && char != '_' {
-			return false
-		}
-	}
-	return true
+	return !strings.ContainsAny(value, "().")
 }
 
 // isAlreadyQuotedIdentifier 判断字符串是否已被引用，防止重复引号。

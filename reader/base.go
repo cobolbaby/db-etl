@@ -6,6 +6,7 @@ import (
 	"db-etl/config"
 	"db-etl/util"
 	"fmt"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -275,11 +276,17 @@ func formatProjectionAlias(alias string, quoteIdentifier func(string) string) st
 // 反之：
 //   - 含 "(" 或 ")"：视为函数调用/表达式（如 GETDATE()、CAST(x AS INT)），保持原样不加引号；
 //   - 含 "."：视为限定名（如 dbo.tbl、schema.column），保持原样。
+//   - 整数常量（如 "1"、"-1"）：保持原样不加引号（不支持纯数字列名）。
 //
 // 注意：含圆括号的列名（如 "Price(USD)"、"等級(Level)"）会被当作表达式而不加引号，
 // 这类列名需在配置中预先自行引用（如写成 "[Price(USD)]"）或改用 src_rawsql。
 func isColumnIdentifier(value string) bool {
 	if value == "" {
+		return false
+	}
+	// 整数常量不作为列名加引号，否则形如 `${SRC_INCR_FIELD} > '${INCR_POINT}'`
+	// 当 incr_field=1 时，1 就会被视为列名，触发 `column "1" does not exist`。
+	if _, err := strconv.ParseInt(value, 10, 64); err == nil {
 		return false
 	}
 	return !strings.ContainsAny(value, "().")

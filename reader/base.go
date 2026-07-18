@@ -180,6 +180,10 @@ func (r *BaseReader) buildReadQuery() (string, error) {
 		// SRC_INCR_FIELD 是列引用，与投影一样按方言加引号，
 		// 否则含空格/中文等的字段名（如 "Test Finish Date"）拼进 WHERE 会触发语法错误。
 		incrField := formatProjectionSource(r.Source.IncrField, r.dialect.quoteIdentifier)
+		// 兼容 where_statement 作者已把占位符包在引号里的历史写法（"${SRC_INCR_FIELD}" / [${SRC_INCR_FIELD}]）：
+		// 框架已对字段自动加引号，若再叠加引号会产出 ""x"" / [[x]] 这类非法标识符。故先整体替换带引号的占位符，再处理裸占位符。
+		query = strings.ReplaceAll(query, `"${SRC_INCR_FIELD}"`, incrField)
+		query = strings.ReplaceAll(query, "[${SRC_INCR_FIELD}]", incrField)
 		query = strings.ReplaceAll(query, "${SRC_INCR_FIELD}", incrField)
 		query = strings.ReplaceAll(query, "${INCR_POINT}", r.Source.IncrPoint)
 	}

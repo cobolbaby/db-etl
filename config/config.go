@@ -45,9 +45,16 @@ type DBConfig struct {
 	// QueryTimeout 单条查询语句的超时（秒），0 表示不限制（默认）。
 	// 仅影响读取端 SELECT 查询; 写入端的 COPY 不受此限制。
 	QueryTimeout int `yaml:"query_timeout"`
-	// StatementTimeout 写入端单条语句的执行超时（秒），0 表示不限制（默认）。
-	// 通过 PostgreSQL 会话参数 statement_timeout 实现; merge 模式下 DELETE+INSERT 耗时较长，建议设为 0（不限制）或足够大的值。
+	// StatementTimeout 单条语句的执行超时（秒），0 表示不限制（默认）。
+	// 通过 PostgreSQL 会话参数 statement_timeout 实现，写入端与源端 full/copy 全量回填均适用。
+	// merge 模式下 DELETE+INSERT 、大表全量顺扫耗时较长，建议设为 0（不限制）或足够大的值。
 	StatementTimeout int `yaml:"statement_timeout"`
+	// LockTimeout 源端读取会话在 full/copy 全量回填时的“等锁”超时（秒）。
+	// 仅对 PostgreSQL 源生效，通过会话参数 lock_timeout 实现：一旦源表被 DDL / 长事务
+	// 持有的锁阻塞，到时立即以 55P03（lock_not_available）失败并交由重试机制处理，
+	// 从而避免在 statement_timeout=0（允许长时间顺扫）时被锁死而无限干等。
+	// <=0 时不注入。仅影响 full/copy；增量模式不注入。
+	LockTimeout int `yaml:"lock_timeout"`
 	// TimeZone 固定写入端 PostgreSQL 会话时区（如 "America/Mexico_City"、"UTC"、"+08"）。
 	// 源端 SQL Server DATETIME/DATETIME2 无时区，序列化为无时区字符串后写入 timestamptz 列时，
 	// PostgreSQL 会按会话时区解析。若不固定，会话时区将随运行环境（PGTZ/TZ/服务端默认）漂移，
@@ -401,8 +408,22 @@ type TargetConfig struct {
 	CommitBatchSize int `yaml:"commit_batch_size"`
 	// TruncateTimeout full 模式下 TRUNCATE 尝试获取锁的超时时间（秒）。
 	// 超时后自动退避为 DELETE FROM，以避免长时间阻塞下游。
-	// 0 表示使用默认值（30 秒），负值表示不设超时（不退避）。
+	// 0 表示使用默认值（defaultTruncateTimeoutSec 秒）。
 	TruncateTimeout int `yaml:"truncate_timeout"`
+}
+
+// defaultTruncateTimeoutSec 是 full 模式下 TRUNCATE 等锁超时的默认值（秒）。
+// TargetConfig.TruncateTimeout==0 时采用此默认。
+const defaultTruncateTimeoutSec = 30
+
+// EffectiveTruncateTimeout 返回 TRUNCATE 等锁超时的有效秒数：
+// 0 时使用内置默认值 defaultTruncateTimeoutSec，其余（含负值）原样返回。
+// 负值语义为“不设超时”，由调用方判断。
+func (t *TargetConfig) EffectiveTruncateTimeout() int {
+	if t.TruncateTimeout == 0 {
+		return defaultTruncateTimeoutSec
+	}
+	return t.TruncateTimeout
 }
 
 type ModeType string
@@ -643,7 +664,13 @@ func ValidateSourceTableName(table string, dbType DBType) error {
 
 /*
 DSN
-返回数据库连接字符串
+返回数据库连接字符串。
+
+对 PostgreSQL 源，在基础连接串上按需追加会话级调优：
+  - lock_timeout：被表锁阻塞时快速失败（55P03），交由重试机制处理，避免无限干等；
+  - statement_timeout：给大表全量顺扫设置执行上限；
+
+两者均仅在 DBConfig 对应字段 >0 时才注入；都未配置时不追加任何 options，保持服务端默认。
 */
 func (db *DBConfig) DSN() string {
 
@@ -660,7 +687,7 @@ func (db *DBConfig) DSN() string {
 		)
 
 	case DBTypePG, DBTypeGP:
-		return fmt.Sprintf(
+		base := fmt.Sprintf(
 			"host=%s port=%d user=%s password=%s dbname=%s sslmode=disable",
 			db.Host,
 			db.Port,
@@ -668,6 +695,19 @@ func (db *DBConfig) DSN() string {
 			db.Password,
 			db.Database,
 		)
+
+		var opts []string
+		if db.LockTimeout > 0 {
+			opts = append(opts, fmt.Sprintf("-c lock_timeout=%d", db.LockTimeout*1000))
+		}
+		if db.StatementTimeout > 0 {
+			opts = append(opts, fmt.Sprintf("-c statement_timeout=%d", db.StatementTimeout*1000))
+		}
+		if len(opts) == 0 {
+			return base
+		}
+		// libpq options 值含空格，须用单引号包裹；pgx 按 libpq 规则解析。
+		return base + fmt.Sprintf(" options='%s'", strings.Join(opts, " "))
 
 	default:
 		panic("unsupported db type: " + db.Type)

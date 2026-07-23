@@ -185,7 +185,8 @@ func runPipeline(src *config.SourceConfig, srcDB config.DBConfig, dstDB config.D
 	// 增量抽取需要知道上次抽取的 Watermark 位置。
 	// IncrPoint 非空说明启动时已从 job_data_sync（db_loader）或配置文件加载到水位，直接复用，省一次查询；
 	// 仅当为空（首次运行、尚无水位）时才查库，走 job_data_sync → MAX(incr_field) → 默认值 的兜底链。
-	if src.Mode != config.ModeTypeFull && src.IncrField != "" {
+	// 仅增量模式（append/merge）需要水位；全量模式（full/initial）为一次性覆盖/回填，不做水位追踪。
+	if (src.Mode == config.ModeTypeAppend || src.Mode == config.ModeTypeMerge) && src.IncrField != "" {
 
 		if src.IncrPoint == "" {
 			incrPoint, err := w.GetWatermark(src)

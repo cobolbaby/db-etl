@@ -144,9 +144,13 @@ func (r *BaseReader) buildReadQuery() (string, error) {
 	}
 
 	// ORDER BY 在占位符替换之前拼接，使 order_by 中的 ${SRC_INCR_FIELD}
-	// 与 WHERE 中的占位符共用同一套方言加引号逻辑（full 模式不排序）。
-	if r.Source.Mode != config.ModeTypeFull && r.Source.OrderBy != "" {
-		query += " ORDER BY " + r.Source.OrderBy
+	// 与 WHERE 中的占位符共用同一套方言加引号逻辑。
+	// 仅增量模式（append/merge）需要有序读取以配合水位/断点续传；
+	// 全量模式（full/initial）无需排序，避免大表顺扫叠加排序开销。
+	if r.Source.Mode == config.ModeTypeAppend || r.Source.Mode == config.ModeTypeMerge {
+		if r.Source.OrderBy != "" {
+			query += " ORDER BY " + r.Source.OrderBy
+		}
 	}
 
 	// 占位符一旦出现就必须替换，否则残留的 ${...} 会被数据库当成非法语法（syntax error at or near "$"）。

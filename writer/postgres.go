@@ -273,7 +273,7 @@ func (d *pgWriterDialect) writeIncrOnce(ctx context.Context, in <-chan transform
 
 	inserted, err := d.insertTarget(ctx, tx, staging, target)
 	if err != nil {
-		return util.WrapPgError(err)
+		return err
 	}
 
 	watermark := ""
@@ -365,7 +365,7 @@ func (d *pgWriterDialect) writeIncrChunked(ctx context.Context, in <-chan transf
 		inserted, err := d.insertTarget(ctx, currentTx, currentStaging, target)
 		if err != nil {
 			_ = currentTx.Rollback(ctx)
-			return util.WrapPgError(err)
+			return err
 		}
 		totalDeleted += deleted
 		totalInserted += inserted
@@ -453,7 +453,9 @@ func (d *pgWriterDialect) createTempTable(ctx context.Context, tx pgx.Tx, stagin
 
 	_, err := tx.Exec(ctx, sql)
 
-	return err
+	// CREATE TEMP TABLE ... (LIKE target) 会引用目标表：目标表不存在等结构性错误（42xxx）
+	// 重试无益，交给 WrapPgError 归一化为 NonRetryable，避免无谓重试。
+	return util.WrapPgError(err)
 }
 
 // tryTruncateWithTimeout 尝试在事务内执行带 lock_timeout 的 TRUNCATE。
@@ -488,7 +490,8 @@ func (d *pgWriterDialect) deleteTarget(
 
 	tag, err := tx.Exec(ctx, sql)
 	if err != nil {
-		return 0, err
+		// 结构性错误（如目标表不存在 42P01）重试无益，归一化为 NonRetryable。
+		return 0, util.WrapPgError(err)
 	}
 
 	return tag.RowsAffected(), nil
@@ -504,7 +507,8 @@ func (d *pgWriterDialect) insertTarget(ctx context.Context, tx pgx.Tx, staging s
 
 	tag, err := tx.Exec(ctx, sql)
 	if err != nil {
-		return 0, err
+		// 结构性错误（如目标表不存在 42P01）重试无益，归一化为 NonRetryable。
+		return 0, util.WrapPgError(err)
 	}
 
 	return tag.RowsAffected(), nil
@@ -522,7 +526,7 @@ func (d *pgWriterDialect) computeWatermark(ctx context.Context, tx pgx.Tx, stagi
 
 	var wm string
 	err := tx.QueryRow(ctx, sql).Scan(&wm)
-	return wm, err
+	return wm, util.WrapPgError(err)
 }
 
 func (d *pgWriterDialect) updateWatermark(ctx context.Context, tx pgx.Tx, wm string, target *config.TargetConfig, source *config.SourceConfig, jobName string) error {
@@ -577,7 +581,7 @@ func (d *pgWriterDialect) updateWatermark(ctx context.Context, tx pgx.Tx, wm str
 		)
 	}
 	if execErr != nil {
-		return execErr
+		return util.WrapPgError(execErr)
 	}
 
 	if tag.RowsAffected() > 0 {
@@ -605,7 +609,7 @@ func (d *pgWriterDialect) updateWatermark(ctx context.Context, tx pgx.Tx, wm str
 			wm, string(target.Mode), source.IncrField, target.PK, now,
 		)
 	}
-	return err
+	return util.WrapPgError(err)
 }
 
 func (d *pgWriterDialect) getWatermark(target *config.TargetConfig, source *config.SourceConfig, jobName string) (string, error) {

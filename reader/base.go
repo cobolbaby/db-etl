@@ -52,7 +52,7 @@ func (r *BaseReader) GetColumnHandlers() ([]ColHandler, error) {
 }
 
 func (r *BaseReader) getColumnTypes() ([]*sql.ColumnType, error) {
-	query, err := r.buildBaseQuery(true)
+	query, err := r.buildReadQuery(true)
 	if err != nil {
 		return nil, err
 	}
@@ -78,7 +78,7 @@ func (r *BaseReader) ReadBatch(ctx context.Context, cancel context.CancelFunc) <
 			cancel()
 		}
 
-		query, err := r.buildReadQuery()
+		query, err := r.buildReadQuery(false)
 		if err != nil {
 			// 构建查询失败属于配置错误，重试无益，标记为不可重试。
 			fail(util.NonRetryable(fmt.Errorf("build query: %w，sql: %s", err, query)))
@@ -137,24 +137,30 @@ func (r *BaseReader) ReadBatch(ctx context.Context, cancel context.CancelFunc) <
 	return out
 }
 
-func (r *BaseReader) buildReadQuery() (string, error) {
-	query, err := r.buildBaseQuery(false)
+func (r *BaseReader) buildReadQuery(emptyResult bool) (string, error) {
+	projection, err := r.resolveProjection()
 	if err != nil {
 		return "", err
 	}
 
-	// ORDER BY 在占位符替换之前拼接，使 order_by 中的 ${SRC_INCR_FIELD}
-	// 与 WHERE 中的占位符共用同一套方言加引号逻辑。
-	// 仅增量模式（append/merge）需要有序读取以配合水位/断点续传；
+	whereClause := r.buildWhereClause(emptyResult)
+	query, err := r.dialect.buildBaseQuery(r.Source, projection, whereClause)
+	if err != nil {
+		return "", err
+	}
+
+	// 仅实际抽取数据（非元数据探测 emptyResult）、增量模式（append/merge）才需要有序读取：
+	// 增量小批次依赖 ORDER BY 才能按水位/断点续传稳定推进，table 与 sql（rawsql）源都需要；
 	// 全量模式（full/initial）无需排序，避免大表顺扫叠加排序开销。
-	if r.Source.Mode == config.ModeTypeAppend || r.Source.Mode == config.ModeTypeMerge {
-		if r.Source.OrderBy != "" {
-			query += " ORDER BY " + r.Source.OrderBy
-		}
+	// ORDER BY 在占位符替换之前拼接，使 order_by 中的 ${SRC_INCR_FIELD} 与 WHERE 中的占位符共用同一套方言加引号逻辑。
+	if !emptyResult &&
+		(r.Source.Mode == config.ModeTypeAppend || r.Source.Mode == config.ModeTypeMerge) &&
+		r.Source.OrderBy != "" {
+		query += " ORDER BY " + r.Source.OrderBy
 	}
 
 	// 占位符一旦出现就必须替换，否则残留的 ${...} 会被数据库当成非法语法（syntax error at or near "$"）。
-	// 这与同步模式无关：即便是 full/copy 模式，只要 where 里写了占位符也要替换掉。
+	// 这与同步模式无关：即便是 full/initial 模式，只要 SQL/where 里写了占位符也要替换掉；
 	hasPlaceholder := strings.Contains(query, "${SRC_INCR_FIELD}") ||
 		strings.Contains(query, "${INCR_POINT}")
 	if hasPlaceholder {
@@ -178,16 +184,6 @@ func (r *BaseReader) buildReadQuery() (string, error) {
 	}
 
 	return query, nil
-}
-
-func (r *BaseReader) buildBaseQuery(emptyResult bool) (string, error) {
-	projection, err := r.resolveProjection()
-	if err != nil {
-		return "", err
-	}
-
-	whereClause := r.buildWhereClause(emptyResult)
-	return r.dialect.buildBaseQuery(r.Source, projection, whereClause)
 }
 
 func (r *BaseReader) buildWhereClause(emptyResult bool) string {

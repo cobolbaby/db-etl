@@ -13,8 +13,8 @@ type stubWriterDialect struct {
 	called string
 }
 
-func (d *stubWriterDialect) writeCopy(ctx context.Context, in <-chan transform.CSVBatch, target *config.TargetConfig) error {
-	d.called = "copy"
+func (d *stubWriterDialect) writeInitial(ctx context.Context, in <-chan transform.CSVBatch, target *config.TargetConfig) error {
+	d.called = "initial"
 	return nil
 }
 

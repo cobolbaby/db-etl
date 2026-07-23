@@ -21,11 +21,10 @@ type readerDialect interface {
 }
 
 type BaseReader struct {
-	DB           *sql.DB
-	Source       *config.SourceConfig
-	QueryTimeout time.Duration // 0 表示不限制
-	dialect      readerDialect
-	err          error // ReadBatch 异步执行期间捕获的错误，通过 Err() 暴露
+	DB      *sql.DB
+	Source  *config.SourceConfig
+	dialect readerDialect
+	err     error // ReadBatch 异步执行期间捕获的错误，通过 Err() 暴露
 }
 
 // Err 返回 ReadBatch 异步读取期间发生的错误，应在 channel 耗尽后调用。
@@ -37,14 +36,6 @@ func (r *BaseReader) Close() error {
 		return r.DB.Close()
 	}
 	return nil
-}
-
-// queryContext 基于 parent 返回一个带超时的 context，若 QueryTimeout == 0 则直接返回 parent。
-func (r *BaseReader) queryContext(parent context.Context) (context.Context, context.CancelFunc) {
-	if r.QueryTimeout > 0 {
-		return context.WithTimeout(parent, r.QueryTimeout)
-	}
-	return parent, func() {}
 }
 
 func (r *BaseReader) GetColumnHandlers() ([]ColHandler, error) {
@@ -66,10 +57,7 @@ func (r *BaseReader) getColumnTypes() ([]*sql.ColumnType, error) {
 		return nil, err
 	}
 
-	ctx, cancel := r.queryContext(context.Background())
-	defer cancel()
-
-	rows, err := r.DB.QueryContext(ctx, query)
+	rows, err := r.DB.QueryContext(context.Background(), query)
 	if err != nil {
 		return nil, r.dialect.wrapError(fmt.Errorf("%w，sql: %s", err, query))
 	}
@@ -99,10 +87,7 @@ func (r *BaseReader) ReadBatch(ctx context.Context, cancel context.CancelFunc) <
 
 		// log.Println("query: ", query)
 
-		qctx, qcancel := r.queryContext(ctx)
-		defer qcancel()
-
-		rows, err := r.DB.QueryContext(qctx, query)
+		rows, err := r.DB.QueryContext(ctx, query)
 		if err != nil {
 			fail(r.dialect.wrapError(fmt.Errorf("execute query: %w，sql: %s", err, query)))
 			return

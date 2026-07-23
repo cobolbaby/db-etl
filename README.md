@@ -165,12 +165,12 @@ tasks:
 
 ### 支持的 `mode`
 
-| 值       | 说明                                                            |
-| -------- | --------------------------------------------------------------- |
-| `copy`   | 直接 COPY 到目标表，不清空已有数据，仅执行追加写入              |
-| `full`   | 先清空目标表，再将本次抽取结果全量覆盖写入                      |
-| `append` | 与 `copy` 一样追加写入，但要求 `incr_field`，并在写入后更新水位 |
-| `merge`  | 先写入临时表，再按 `pk` 做 DELETE + INSERT（支持增量 upsert）   |
+| 值        | 说明                                                                                                                                                            |
+| --------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `initial` | 首次全量回填：直接 COPY 到目标表，不清空已有数据，仅执行追加写入；上下游会话超时默认放宽至 2 小时（约可覆盖 2 亿行以内的同步），可通过 `statement_timeout` 覆盖 |
+| `full`    | 先清空目标表，再将本次抽取结果全量覆盖写入                                                                                                                      |
+| `append`  | 与 `initial` 一样追加写入，但要求 `incr_field`，并在写入后更新水位                                                                                              |
+| `merge`   | 先写入临时表，再按 `pk` 做 DELETE + INSERT（支持增量 upsert）                                                                                                   |
 
 ## 示例
 
@@ -187,7 +187,7 @@ tasks:
     target:
       conn_name: target-pg
       table: target_schema.target_table_1
-      mode: copy
+      mode: initial
 ```
 
 ### 2. Table → Target Copy
@@ -208,7 +208,7 @@ tasks:
     target:
       conn_name: target-pg
       table: target_schema.target_table_2
-      mode: copy
+      mode: initial
 ```
 
 ### 3. Table → Target Merge（增量）

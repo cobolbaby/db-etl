@@ -19,11 +19,17 @@ func NewWriter(db config.DBConfig, target *config.TargetConfig, jobName string) 
 		}
 
 		// statement_timeout 配置为 0 时不注入，保持服务器默认值
-		if db.StatementTimeout > 0 {
+		statementTimeout := db.StatementTimeout
+		// initial（首次全量）模式单次可能写入上亿行，COPY 耗时较长。
+		// 未显式配置 statement_timeout（0）时，采用 2 小时的宽松默认，避免误触发超时。
+		if target != nil && target.Mode == config.ModeTypeInitial && statementTimeout == 0 {
+			statementTimeout = config.InitialModeDefaultTimeoutSec
+		}
+		if statementTimeout > 0 {
 			if cfg.RuntimeParams == nil {
 				cfg.RuntimeParams = make(map[string]string)
 			}
-			cfg.RuntimeParams["statement_timeout"] = fmt.Sprintf("%d", db.StatementTimeout*1000) // ms
+			cfg.RuntimeParams["statement_timeout"] = fmt.Sprintf("%d", statementTimeout*1000) // ms
 		}
 
 		// 固定会话时区，确保无时区时间字符串写入 timestamptz 列时被确定性解析，

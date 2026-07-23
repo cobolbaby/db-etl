@@ -16,7 +16,12 @@ import (
 const pingTimeout = 10 * time.Second
 
 func NewReader(db config.DBConfig, src *config.SourceConfig) (Reader, error) {
-	queryTimeout := time.Duration(db.QueryTimeout) * time.Second
+	// initial（首次全量）模式单次可能回填上亿行，顺扫耗时较长。
+	// 未显式配置 statement_timeout（0）时，采用 2 小时的宽松默认，避免误触发超时；
+	// 其他模式不覆盖，延用数据库端默认配置。
+	if src != nil && src.Mode == config.ModeTypeInitial && db.StatementTimeout == 0 {
+		db.StatementTimeout = config.InitialModeDefaultTimeoutSec
+	}
 
 	var (
 		driver string
@@ -25,10 +30,10 @@ func NewReader(db config.DBConfig, src *config.SourceConfig) (Reader, error) {
 	switch db.Type {
 	case config.DBTypeMSSQL:
 		driver = "sqlserver"
-		build = func(conn *sql.DB) Reader { return NewMSSQLReader(conn, src, queryTimeout) }
+		build = func(conn *sql.DB) Reader { return NewMSSQLReader(conn, src) }
 	case config.DBTypePG, config.DBTypeGP:
 		driver = "pgx"
-		build = func(conn *sql.DB) Reader { return NewPGReader(conn, src, queryTimeout) }
+		build = func(conn *sql.DB) Reader { return NewPGReader(conn, src) }
 	default:
 		// 不支持的类型属配置错误，重试无益。
 		return nil, util.NonRetryable(fmt.Errorf("unsupported source db type: %s", db.Type))

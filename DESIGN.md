@@ -51,7 +51,7 @@ BaseReader { DB, Source, dialect readerDialect }
   └── PGDialect      → ...
 
 BaseWriter { Target, JobName, dialect writerDialect }
-  └── pgWriterDialect → writeCopy / writeFull / writeAppend / writeMerge / getWatermark
+  └── pgWriterDialect → writeInitial / writeFull / writeAppend / writeMerge / getWatermark
 ```
 
 - `Base*` 实现通用流程（batch 循环、query context、模式路由）。

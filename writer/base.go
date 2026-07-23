@@ -9,7 +9,7 @@ import (
 )
 
 type writerDialect interface {
-	writeCopy(ctx context.Context, in <-chan transform.CSVBatch, target *config.TargetConfig) error
+	writeInitial(ctx context.Context, in <-chan transform.CSVBatch, target *config.TargetConfig) error
 	writeFull(ctx context.Context, in <-chan transform.CSVBatch, target *config.TargetConfig) error
 	writeAppend(ctx context.Context, in <-chan transform.CSVBatch, target *config.TargetConfig, source *config.SourceConfig, jobName string) error
 	writeMerge(ctx context.Context, in <-chan transform.CSVBatch, target *config.TargetConfig, source *config.SourceConfig, jobName string) error
@@ -30,8 +30,8 @@ func (w *BaseWriter) WriteBatch(ctx context.Context, source *config.SourceConfig
 	}
 
 	switch w.Target.Mode {
-	case config.ModeTypeCopy:
-		return w.dialect.writeCopy(ctx, in, w.Target)
+	case config.ModeTypeInitial:
+		return w.dialect.writeInitial(ctx, in, w.Target)
 	case config.ModeTypeFull:
 		return w.dialect.writeFull(ctx, in, w.Target)
 	case config.ModeTypeAppend:

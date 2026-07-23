@@ -100,7 +100,7 @@ func (d *pgWriterDialect) writeFull(ctx context.Context, in <-chan transform.CSV
 	return tx.Commit(ctx)
 }
 
-func (d *pgWriterDialect) writeCopy(ctx context.Context, in <-chan transform.CSVBatch, target *config.TargetConfig) error {
+func (d *pgWriterDialect) writeInitial(ctx context.Context, in <-chan transform.CSVBatch, target *config.TargetConfig) error {
 	firstBatch, foundRows := drainFirstBatch(in)
 
 	if !foundRows {

@@ -42,18 +42,17 @@ type DBConfig struct {
 	User     string `yaml:"user"`
 	Password string `yaml:"password"`
 	Database string `yaml:"database"`
-	// QueryTimeout 单条查询语句的超时（秒），0 表示不限制（默认）。
-	// 仅影响读取端 SELECT 查询; 写入端的 COPY 不受此限制。
-	QueryTimeout int `yaml:"query_timeout"`
 	// StatementTimeout 单条语句的执行超时（秒），0 表示不限制（默认）。
-	// 通过 PostgreSQL 会话参数 statement_timeout 实现，写入端与源端 full/copy 全量回填均适用。
+	// 写入端（PostgreSQL/Greenplum）通过会话参数 statement_timeout 由服务端强制中断；
+	// 读取端（MSSQL / PostgreSQL）则以此为客户端 context 超时上限。
 	// merge 模式下 DELETE+INSERT 、大表全量顺扫耗时较长，建议设为 0（不限制）或足够大的值。
 	StatementTimeout int `yaml:"statement_timeout"`
-	// LockTimeout 源端读取会话在 full/copy 全量回填时的“等锁”超时（秒）。
-	// 仅对 PostgreSQL 源生效，通过会话参数 lock_timeout 实现：一旦源表被 DDL / 长事务
-	// 持有的锁阻塞，到时立即以 55P03（lock_not_available）失败并交由重试机制处理，
-	// 从而避免在 statement_timeout=0（允许长时间顺扫）时被锁死而无限干等。
-	// <=0 时不注入。仅影响 full/copy；增量模式不注入。
+	// LockTimeout PostgreSQL/Greenplum 会话的“等锁”超时（秒）。
+	// 仅对 PostgreSQL/Greenplum 生效，通过连接串注入会话参数 lock_timeout：
+	// 一旦所需的表锁被 DDL / 长事务持有并阻塞，到时立即以 55P03（lock_not_available）
+	// 失败并交由重试机制处理，从而避免在 statement_timeout=0（允许长时间顺扫）时被锁死而无限干等。
+	// 该参数在建连时注入，读取端（source）与写入端（target）连接均生效，与同步模式无关。
+	// <=0 时不注入，保持服务端默认。
 	LockTimeout int `yaml:"lock_timeout"`
 	// TimeZone 固定写入端 PostgreSQL 会话时区（如 "America/Mexico_City"、"UTC"、"+08"）。
 	// 源端 SQL Server DATETIME/DATETIME2 无时区，序列化为无时区字符串后写入 timestamptz 列时，
@@ -414,7 +413,7 @@ type TargetConfig struct {
 
 // defaultTruncateTimeoutSec 是 full 模式下 TRUNCATE 等锁超时的默认值（秒）。
 // TargetConfig.TruncateTimeout==0 时采用此默认。
-const defaultTruncateTimeoutSec = 30
+const defaultTruncateTimeoutSec = 10
 
 // EffectiveTruncateTimeout 返回 TRUNCATE 等锁超时的有效秒数：
 // 0 时使用内置默认值 defaultTruncateTimeoutSec，其余（含负值）原样返回。
@@ -429,18 +428,24 @@ func (t *TargetConfig) EffectiveTruncateTimeout() int {
 type ModeType string
 
 const (
-	ModeTypeCopy   ModeType = "copy"
-	ModeTypeFull   ModeType = "full"
-	ModeTypeAppend ModeType = "append"
-	ModeTypeMerge  ModeType = "merge"
+	ModeTypeInitial ModeType = "initial"
+	ModeTypeFull    ModeType = "full"
+	ModeTypeAppend  ModeType = "append"
+	ModeTypeMerge   ModeType = "merge"
 )
 
 var supportedTargetModes = map[ModeType]struct{}{
-	ModeTypeCopy:   {},
-	ModeTypeFull:   {},
-	ModeTypeAppend: {},
-	ModeTypeMerge:  {},
+	ModeTypeInitial: {},
+	ModeTypeFull:    {},
+	ModeTypeAppend:  {},
+	ModeTypeMerge:   {},
 }
+
+// InitialModeDefaultTimeoutSec 是 initial（首次全量）模式下，源端查询与目标端写入
+// 会话超时的默认秒数（2 小时）。该模式用于一次性回填历史数据，单次可能同步上亿行，
+// 顺扫与 COPY 写入耗时较长，因此在未显式配置 statement_timeout 时
+// 采用较宽松的默认，避免误触发超时中断。经验上 2 小时可覆盖 2 亿行以内的同步。
+const InitialModeDefaultTimeoutSec = 7200
 
 /*
 LoadConfig
@@ -666,9 +671,9 @@ func ValidateSourceTableName(table string, dbType DBType) error {
 DSN
 返回数据库连接字符串。
 
-对 PostgreSQL 源，在基础连接串上按需追加会话级调优：
+对 PostgreSQL/Greenplum（读取端与写入端连接均使用本函数），在基础连接串上按需追加会话级调优：
   - lock_timeout：被表锁阻塞时快速失败（55P03），交由重试机制处理，避免无限干等；
-  - statement_timeout：给大表全量顺扫设置执行上限；
+  - statement_timeout：给大表全量顺扫 / 写入设置执行上限；
 
 两者均仅在 DBConfig 对应字段 >0 时才注入；都未配置时不追加任何 options，保持服务端默认。
 */

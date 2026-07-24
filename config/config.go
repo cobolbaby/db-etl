@@ -594,6 +594,11 @@ func validateTarget(target *TargetConfig, resolver DBResolver) error {
 	if _, ok := supportedTargetModes[target.Mode]; !ok {
 		return fmt.Errorf("unsupported target mode: %s", target.Mode)
 	}
+	// merge 模式依赖主键做 DELETE + INSERT，pk 为空属于结构性配置错误，
+	// 必须在加载阶段就 fail-fast，避免跑到 writer 才报错并被无谓重试。
+	if target.Mode == ModeTypeMerge && strings.TrimSpace(target.PK) == "" {
+		return fmt.Errorf("pk is required for merge mode (target table %q)", target.Table)
+	}
 	return nil
 }
 

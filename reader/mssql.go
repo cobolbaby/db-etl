@@ -32,7 +32,13 @@ func (mssqlDialect) buildBaseQuery(source *config.SourceConfig, projection strin
 	var query string
 
 	if source.SQL != "" {
-		query = fmt.Sprintf("SELECT %s FROM (%s) t WHERE %s", projection, source.SQL, whereClause)
+		// Stored procedures (EXEC/EXECUTE) cannot be wrapped in subquery like SELECT * FROM (EXEC ...) t
+		// because SQL Server doesn't support this syntax. Execute them directly without wrapping.
+		if isStoredProcedure(source.SQL) {
+			query = source.SQL
+		} else {
+			query = fmt.Sprintf("SELECT %s FROM (%s) t WHERE %s", projection, source.SQL, whereClause)
+		}
 	} else if source.Table != "" {
 		query = fmt.Sprintf("SELECT %s FROM %s WITH (NOLOCK) WHERE %s", projection, source.Table, whereClause)
 	} else {
@@ -40,6 +46,13 @@ func (mssqlDialect) buildBaseQuery(source *config.SourceConfig, projection strin
 	}
 
 	return query, nil
+}
+
+// isStoredProcedure checks if the SQL statement is a stored procedure call (starts with EXEC or EXECUTE).
+func isStoredProcedure(sql string) bool {
+	sql = strings.TrimSpace(sql)
+	return strings.HasPrefix(strings.ToUpper(sql), "EXEC") ||
+		strings.HasPrefix(strings.ToUpper(sql), "EXECUTE")
 }
 
 func (mssqlDialect) quoteIdentifier(identifier string) string {

@@ -12,30 +12,16 @@ import (
 func NewWriter(db config.DBConfig, target *config.TargetConfig, jobName string) (Writer, error) {
 	switch db.Type {
 	case config.DBTypePG, config.DBTypeGP:
-		cfg, err := pgx.ParseConfig(db.DSN())
-		if err != nil {
-			// DSN 解析失败属配置错误，重试无益。
-			return nil, util.NonRetryable(fmt.Errorf("PG parse config failed: %w", err))
-		}
-
-		// statement_timeout 配置为 0 时不注入，保持服务器默认值
-		statementTimeout := db.StatementTimeout
 		// initial（首次全量）模式单次可能写入上亿行，COPY 耗时较长。
 		// 未显式配置 statement_timeout（0）时，采用 2 小时的宽松默认，避免误触发超时。
-		if target != nil && target.Mode == config.ModeTypeInitial && statementTimeout == 0 {
-			statementTimeout = config.InitialModeDefaultTimeoutSec
-		}
-		if statementTimeout > 0 {
-			if cfg.RuntimeParams == nil {
-				cfg.RuntimeParams = make(map[string]string)
-			}
-			cfg.RuntimeParams["statement_timeout"] = fmt.Sprintf("%d", statementTimeout*1000) // ms
+		// 该参数已通过 db.DSN() 注入到连接串中。
+		if target != nil && target.Mode == config.ModeTypeInitial && db.StatementTimeout == 0 {
+			db.StatementTimeout = config.InitialModeDefaultTimeoutSec
 		}
 
-		// TimeZone 已通过 db.DSN() 注入，此处不再重复设置
-
-		// ConnectConfig 会真正建连；「连不上」返回可重试错误，交由上层重试机制处理。
-		pgConn, err := pgx.ConnectConfig(context.Background(), cfg)
+		// pgx.Connect 直接接受 DSN 字符串，所有参数（lock_timeout、statement_timeout、TimeZone）
+		// 均已在 db.DSN() 中注入，此处无需额外处理。
+		pgConn, err := pgx.Connect(context.Background(), db.DSN())
 		if err != nil {
 			return nil, fmt.Errorf("PG connect failed: %w", err)
 		}

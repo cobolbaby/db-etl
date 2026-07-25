@@ -21,7 +21,7 @@ type mssqlDialect struct{}
 func NewMSSQLReader(db *sql.DB, src *config.SourceConfig) Reader {
 	return &MSSQLReader{
 		BaseReader: &BaseReader{
-			DB:      db,
+			conn:    db,
 			Source:  src,
 			dialect: mssqlDialect{},
 		},

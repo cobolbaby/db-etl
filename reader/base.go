@@ -21,7 +21,7 @@ type readerDialect interface {
 }
 
 type BaseReader struct {
-	DB      *sql.DB
+	conn    *sql.DB
 	Source  *config.SourceConfig
 	dialect readerDialect
 	err     error // ReadBatch 异步执行期间捕获的错误，通过 Err() 暴露
@@ -32,8 +32,8 @@ func (r *BaseReader) Err() error { return r.err }
 
 // Close 释放底层数据库连接。
 func (r *BaseReader) Close() error {
-	if r.DB != nil {
-		return r.DB.Close()
+	if r.conn != nil {
+		return r.conn.Close()
 	}
 	return nil
 }
@@ -57,7 +57,7 @@ func (r *BaseReader) getColumnTypes() ([]*sql.ColumnType, error) {
 		return nil, err
 	}
 
-	rows, err := r.DB.QueryContext(context.Background(), query)
+	rows, err := r.conn.QueryContext(context.Background(), query)
 	if err != nil {
 		return nil, r.dialect.wrapError(fmt.Errorf("%w，sql: %s", err, query))
 	}
@@ -87,7 +87,7 @@ func (r *BaseReader) ReadBatch(ctx context.Context, cancel context.CancelFunc) <
 
 		// log.Println("query: ", query)
 
-		rows, err := r.DB.QueryContext(ctx, query)
+		rows, err := r.conn.QueryContext(ctx, query)
 		if err != nil {
 			fail(r.dialect.wrapError(fmt.Errorf("execute query: %w，sql: %s", err, query)))
 			return

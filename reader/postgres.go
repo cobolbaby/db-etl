@@ -18,7 +18,7 @@ type pgDialect struct{}
 func NewPGReader(db *sql.DB, src *config.SourceConfig) Reader {
 	return &PGReader{
 		BaseReader: &BaseReader{
-			DB:      db,
+			conn:    db,
 			Source:  src,
 			dialect: pgDialect{},
 		},

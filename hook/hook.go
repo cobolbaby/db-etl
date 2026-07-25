@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"log"
 	"time"
 
 	"db-etl/config"
@@ -82,9 +83,18 @@ func (e *DBExecutor) Execute(ctx context.Context, spec map[string]any) error {
 		return fmt.Errorf("ping db failed: %w", err)
 	}
 
+	log.Printf("[hook] executing on %s: %s", connName, shortenSQL(sqlStmt))
 	_, err = db.ExecContext(ctx, sqlStmt)
 	if err != nil {
 		return fmt.Errorf("exec failed: %w", err)
 	}
+	log.Printf("[hook] completed on %s", connName)
 	return nil
+}
+
+func shortenSQL(sql string) string {
+	if len(sql) <= 100 {
+		return sql
+	}
+	return sql[:100] + "..."
 }

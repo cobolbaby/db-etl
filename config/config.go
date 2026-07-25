@@ -24,6 +24,12 @@ type Config struct {
 	Retry *RetryPolicy `yaml:"retry"`
 }
 
+// ErrorPolicy constants.
+const (
+	ErrorPolicyAbort    = "abort"
+	ErrorPolicyContinue = "continue"
+)
+
 // RetryPolicy configures retry behavior for source-level failures.
 type RetryPolicy struct {
 	MaxAttempts     int `yaml:"max_attempts"`      // Max attempts including the first. Default 3.
@@ -506,8 +512,8 @@ func (c *Config) Validate() error {
 
 	// ErrorPolicy 只能是 "abort" 或 "continue"，默认为 "abort"
 	if c.ErrorPolicy == "" {
-		c.ErrorPolicy = "abort"
-	} else if c.ErrorPolicy != "abort" && c.ErrorPolicy != "continue" {
+		c.ErrorPolicy = ErrorPolicyContinue
+	} else if c.ErrorPolicy != ErrorPolicyAbort && c.ErrorPolicy != ErrorPolicyContinue {
 		return fmt.Errorf("invalid error_policy: %s", c.ErrorPolicy)
 	}
 

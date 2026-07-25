@@ -118,7 +118,7 @@ func main() {
 				}
 				if err := runTask(task, resolver, retryCfg); err != nil {
 					log.Printf("task failed: %v", err)
-					if cfg.ErrorPolicy == "abort" {
+					if cfg.ErrorPolicy == config.ErrorPolicyAbort {
 						log.Fatal(err)
 					}
 				}

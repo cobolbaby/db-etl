@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"db-etl/config"
+	"db-etl/hook"
 	"db-etl/pipeline"
 	"db-etl/reader"
 	"db-etl/transform"
@@ -132,7 +133,17 @@ func main() {
 }
 
 func runTask(task config.TaskConfig, resolver config.DBResolver, retryCfg util.RetryConfig) error {
+	hookExec := hook.NewExecutor(resolver)
 
+	// 执行前置 hook
+	if task.Hooks != nil && len(task.Hooks.Pre) > 0 {
+		if err := hookExec.RunPreHooks(task.Hooks.Pre); err != nil {
+			return fmt.Errorf("run pre-hooks failed: %w", err)
+		}
+	}
+
+	// 执行数据同步
+	var lastErr error
 	for _, src := range task.Sources {
 
 		srcDB, ok := resolver.Resolve(src.ConnID, src.ConnName)
@@ -155,11 +166,19 @@ func runTask(task config.TaskConfig, resolver config.DBResolver, retryCfg util.R
 		})
 		if err != nil {
 			log.Printf("pipeline failed %s after retries: %v", label, err)
+			lastErr = err
 			continue
 		}
 	}
 
-	return nil
+	// 执行后置 hook
+	if task.Hooks != nil && len(task.Hooks.Post) > 0 {
+		if err := hookExec.RunPostHooks(task.Hooks.Post); err != nil {
+			return fmt.Errorf("run post-hooks failed: %w", err)
+		}
+	}
+
+	return lastErr
 }
 
 func runPipeline(src *config.SourceConfig, srcDB config.DBConfig, dstDB config.DBConfig, task config.TaskConfig) error {

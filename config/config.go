@@ -131,6 +131,19 @@ type TaskConfig struct {
 	Type    TaskType        `yaml:"type"`
 	Sources []*SourceConfig `yaml:"sources"`
 	Target  *TargetConfig   `yaml:"target"`
+	Hooks   *Hooks          `yaml:"hooks"`
+}
+
+// Hooks 定义任务的前置和后置 SQL hook。
+type Hooks struct {
+	Pre  []HookConfig `yaml:"pre"`
+	Post []HookConfig `yaml:"post"`
+}
+
+// HookConfig 定义单个 SQL hook。
+type HookConfig struct {
+	ConnName string `yaml:"conn_name"` // 引用 databases[].name，必填
+	SQL      string `yaml:"sql"`
 }
 
 type TaskType string
@@ -572,12 +585,46 @@ func validateTask(task TaskConfig, resolver DBResolver) error {
 		return err
 	}
 
+	if err := validateHooks(task.Hooks, resolver); err != nil {
+		return err
+	}
+
 	for _, source := range task.Sources {
 		if err := validateSource(source, task.Target, resolver); err != nil {
 			return err
 		}
 	}
 
+	return nil
+}
+
+func validateHooks(hooks *Hooks, resolver DBResolver) error {
+	if hooks == nil {
+		return nil
+	}
+
+	for i, h := range hooks.Pre {
+		if strings.TrimSpace(h.ConnName) == "" {
+			return fmt.Errorf("hooks.pre[%d].conn_name is required", i)
+		}
+		if strings.TrimSpace(h.SQL) == "" {
+			return fmt.Errorf("hooks.pre[%d].sql is empty", i)
+		}
+		if _, ok := resolver.Resolve("", h.ConnName); !ok {
+			return fmt.Errorf("hooks.pre[%d].conn_name %q not found", i, h.ConnName)
+		}
+	}
+	for i, h := range hooks.Post {
+		if strings.TrimSpace(h.ConnName) == "" {
+			return fmt.Errorf("hooks.post[%d].conn_name is required", i)
+		}
+		if strings.TrimSpace(h.SQL) == "" {
+			return fmt.Errorf("hooks.post[%d].sql is empty", i)
+		}
+		if _, ok := resolver.Resolve("", h.ConnName); !ok {
+			return fmt.Errorf("hooks.post[%d].conn_name %q not found", i, h.ConnName)
+		}
+	}
 	return nil
 }
 
@@ -712,6 +759,10 @@ func (db *DBConfig) DSN() string {
 		}
 		if db.StatementTimeout > 0 {
 			opts = append(opts, fmt.Sprintf("-c statement_timeout=%d", db.StatementTimeout*1000))
+		}
+		// 固定会话时区，确保时间字符串写入 timestamptz 列时被确定性解析。
+		if db.TimeZone != "" {
+			opts = append(opts, fmt.Sprintf("-c TimeZone=%s", db.TimeZone))
 		}
 		if len(opts) == 0 {
 			return base

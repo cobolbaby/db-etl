@@ -32,14 +32,7 @@ func NewWriter(db config.DBConfig, target *config.TargetConfig, jobName string) 
 			cfg.RuntimeParams["statement_timeout"] = fmt.Sprintf("%d", statementTimeout*1000) // ms
 		}
 
-		// 固定会话时区，确保无时区时间字符串写入 timestamptz 列时被确定性解析，
-		// 不随运行环境（PGTZ/TZ/服务端默认）漂移。为空时不注入，保持服务端默认。
-		if db.TimeZone != "" {
-			if cfg.RuntimeParams == nil {
-				cfg.RuntimeParams = make(map[string]string)
-			}
-			cfg.RuntimeParams["TimeZone"] = db.TimeZone
-		}
+		// TimeZone 已通过 db.DSN() 注入，此处不再重复设置
 
 		// ConnectConfig 会真正建连；「连不上」返回可重试错误，交由上层重试机制处理。
 		pgConn, err := pgx.ConnectConfig(context.Background(), cfg)

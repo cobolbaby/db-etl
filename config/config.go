@@ -60,7 +60,14 @@ type DBConfig struct {
 	// 导致同一份数据在不同客户端时区下入库为不同的绝对时刻。设置本项以获得确定性行为。
 	// 为空时不注入，保持服务端默认。
 	TimeZone string `yaml:"timezone"`
+	// PingTimeout 建连时探活超时（秒），默认 10 秒。
+	// 仅在 reader/hook 工厂的主动探活场景生效（writer 的 pgx.Connect 不走此参数）。
+	// 0 或负值时使用内置默认值 10 秒。
+	PingTimeout int `yaml:"ping_timeout"`
 }
+
+// DefaultPingTimeout 是探活超时的默认值（秒）。
+const DefaultPingTimeout = 10
 
 type DBType string
 
@@ -140,11 +147,20 @@ type Hooks struct {
 	Post []HookConfig `yaml:"post"`
 }
 
-// HookConfig 定义单个 SQL hook。
+// HookConfig 定义单个 hook。
 type HookConfig struct {
-	ConnName string `yaml:"conn_name"` // 引用 databases[].name，必填
-	SQL      string `yaml:"sql"`
+	// Type hook 类型，默认 sql。
+	Type HookType `yaml:"type"`
+	// Spec 类型特定的配置。
+	// SQL 模式：{ "conn_name": "xxx", "sql": "SELECT 1" }
+	Spec map[string]any `yaml:"spec"`
 }
+
+type HookType string
+
+const (
+	HookTypeSQL HookType = "sql"
+)
 
 type TaskType string
 
@@ -425,18 +441,7 @@ type TargetConfig struct {
 }
 
 // defaultTruncateTimeoutSec 是 full 模式下 TRUNCATE 等锁超时的默认值（秒）。
-// TargetConfig.TruncateTimeout==0 时采用此默认。
 const defaultTruncateTimeoutSec = 10
-
-// EffectiveTruncateTimeout 返回 TRUNCATE 等锁超时的有效秒数：
-// 0 时使用内置默认值 defaultTruncateTimeoutSec，其余（含负值）原样返回。
-// 负值语义为“不设超时”，由调用方判断。
-func (t *TargetConfig) EffectiveTruncateTimeout() int {
-	if t.TruncateTimeout == 0 {
-		return defaultTruncateTimeoutSec
-	}
-	return t.TruncateTimeout
-}
 
 type ModeType string
 
@@ -546,6 +551,10 @@ func (c *Config) validateDatabases() (DBResolver, error) {
 		if strings.TrimSpace(db.Database) == "" {
 			return DBResolver{}, fmt.Errorf("database is required for %s", ident)
 		}
+		// PingTimeout 未配置时使用默认值
+		if db.PingTimeout == 0 {
+			db.PingTimeout = DefaultPingTimeout
+		}
 		if id != "" {
 			if _, dup := seenIDs[id]; dup {
 				return DBResolver{}, fmt.Errorf("duplicate database id %q", id)
@@ -604,25 +613,41 @@ func validateHooks(hooks *Hooks, resolver DBResolver) error {
 	}
 
 	for i, h := range hooks.Pre {
-		if strings.TrimSpace(h.ConnName) == "" {
-			return fmt.Errorf("hooks.pre[%d].conn_name is required", i)
+		if h.Type == "" {
+			h.Type = HookTypeSQL
 		}
-		if strings.TrimSpace(h.SQL) == "" {
-			return fmt.Errorf("hooks.pre[%d].sql is empty", i)
+		if h.Type != HookTypeSQL {
+			return fmt.Errorf("hooks.pre[%d]: unsupported hook type %q", i, h.Type)
 		}
-		if _, ok := resolver.Resolve("", h.ConnName); !ok {
-			return fmt.Errorf("hooks.pre[%d].conn_name %q not found", i, h.ConnName)
+		connName, _ := h.Spec["conn_name"].(string)
+		sql, _ := h.Spec["sql"].(string)
+		if strings.TrimSpace(connName) == "" {
+			return fmt.Errorf("hooks.pre[%d].spec.conn_name is required", i)
+		}
+		if strings.TrimSpace(sql) == "" {
+			return fmt.Errorf("hooks.pre[%d].spec.sql is empty", i)
+		}
+		if _, ok := resolver.Resolve("", connName); !ok {
+			return fmt.Errorf("hooks.pre[%d].spec.conn_name %q not found", i, connName)
 		}
 	}
 	for i, h := range hooks.Post {
-		if strings.TrimSpace(h.ConnName) == "" {
-			return fmt.Errorf("hooks.post[%d].conn_name is required", i)
+		if h.Type == "" {
+			h.Type = HookTypeSQL
 		}
-		if strings.TrimSpace(h.SQL) == "" {
-			return fmt.Errorf("hooks.post[%d].sql is empty", i)
+		if h.Type != HookTypeSQL {
+			return fmt.Errorf("hooks.post[%d]: unsupported hook type %q", i, h.Type)
 		}
-		if _, ok := resolver.Resolve("", h.ConnName); !ok {
-			return fmt.Errorf("hooks.post[%d].conn_name %q not found", i, h.ConnName)
+		connName, _ := h.Spec["conn_name"].(string)
+		sql, _ := h.Spec["sql"].(string)
+		if strings.TrimSpace(connName) == "" {
+			return fmt.Errorf("hooks.post[%d].spec.conn_name is required", i)
+		}
+		if strings.TrimSpace(sql) == "" {
+			return fmt.Errorf("hooks.post[%d].spec.sql is empty", i)
+		}
+		if _, ok := resolver.Resolve("", connName); !ok {
+			return fmt.Errorf("hooks.post[%d].spec.conn_name %q not found", i, connName)
 		}
 	}
 	return nil
@@ -645,6 +670,10 @@ func validateTarget(target *TargetConfig, resolver DBResolver) error {
 	// 必须在加载阶段就 fail-fast，避免跑到 writer 才报错并被无谓重试。
 	if target.Mode == ModeTypeMerge && strings.TrimSpace(target.PK) == "" {
 		return fmt.Errorf("pk is required for merge mode (target table %q)", target.Table)
+	}
+	// TruncateTimeout 未配置时使用默认值
+	if target.TruncateTimeout == 0 {
+		target.TruncateTimeout = defaultTruncateTimeoutSec
 	}
 	return nil
 }
@@ -773,5 +802,17 @@ func (db *DBConfig) DSN() string {
 	default:
 		panic("unsupported db type: " + db.Type)
 
+	}
+}
+
+// Driver 返回数据库连接所使用的 driver 名称。
+func (db *DBConfig) Driver() string {
+	switch db.Type {
+	case DBTypeMSSQL:
+		return "sqlserver"
+	case DBTypePG, DBTypeGP:
+		return "pgx"
+	default:
+		panic("unsupported db type: " + db.Type)
 	}
 }

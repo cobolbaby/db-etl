@@ -460,9 +460,9 @@ func (d *pgWriterDialect) createTempTable(ctx context.Context, tx pgx.Tx, stagin
 
 // tryTruncateWithTimeout 尝试在事务内执行带 lock_timeout 的 TRUNCATE。
 // 若 TRUNCATE 因锁等待超时失败，返回 lock_timeout 错误（55P03），由调用方决定后续退避策略。
-// 超时秒数由 target.EffectiveTruncateTimeout() 决定：正值设置 lock_timeout，负值不设超时直接 TRUNCATE。
+// timeout > 0 时设置 lock_timeout，timeout <= 0 时不设超时直接 TRUNCATE。
 func (d *pgWriterDialect) tryTruncateWithTimeout(ctx context.Context, tx pgx.Tx, target *config.TargetConfig) error {
-	timeout := target.EffectiveTruncateTimeout()
+	timeout := target.TruncateTimeout
 
 	if timeout > 0 {
 		if _, err := tx.Exec(ctx, fmt.Sprintf("SET LOCAL lock_timeout = '%ds'", timeout)); err != nil {

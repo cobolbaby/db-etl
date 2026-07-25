@@ -133,11 +133,9 @@ func main() {
 }
 
 func runTask(task config.TaskConfig, resolver config.DBResolver, retryCfg util.RetryConfig) error {
-	hookExec := hook.NewExecutor(resolver)
-
 	// 执行前置 hook
 	if task.Hooks != nil && len(task.Hooks.Pre) > 0 {
-		if err := hookExec.RunPreHooks(task.Hooks.Pre); err != nil {
+		if err := hook.RunPreHooks(task.Hooks.Pre, resolver); err != nil {
 			return fmt.Errorf("run pre-hooks failed: %w", err)
 		}
 	}
@@ -173,7 +171,7 @@ func runTask(task config.TaskConfig, resolver config.DBResolver, retryCfg util.R
 
 	// 执行后置 hook
 	if task.Hooks != nil && len(task.Hooks.Post) > 0 {
-		if err := hookExec.RunPostHooks(task.Hooks.Post); err != nil {
+		if err := hook.RunPostHooks(task.Hooks.Post, resolver); err != nil {
 			return fmt.Errorf("run post-hooks failed: %w", err)
 		}
 	}

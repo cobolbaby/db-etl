@@ -86,47 +86,50 @@ tasks:
 
 数据库连接定义列表。
 
-每项字段如下：
-
-| 字段       | 说明                                                                                             |
-| ---------- | ------------------------------------------------------------------------------------------------ |
-| `name`     | 数据库别名，供 `sources[].conn_name` 和 `target.conn_name` 引用                                  |
-| `id`       | 数据库唯一标识（可选），供 `sources[].conn_id` 和 `target.conn_id` 引用；匹配时优先级高于 `name` |
-| `type`     | 数据库类型：`mssql`、`postgres`、`greenplum`                                                     |
-| `host`     | 主机地址                                                                                         |
-| `port`     | 端口                                                                                             |
-| `user`     | 用户名                                                                                           |
-| `password` | 密码                                                                                             |
-| `database` | 数据库名                                                                                         |
+| 字段 | 说明 |
+|------|------|
+| `name` | 数据库别名，供 `sources[].conn_name` 和 `target.conn_name` 引用 |
+| `id` | 数据库唯一标识（可选），供 `sources[].conn_id` 和 `target.conn_id` 引用；匹配时优先级高于 `name` |
+| `type` | 数据库类型：`mssql`、`postgres`、`greenplum` |
+| `host` | 主机地址 |
+| `port` | 端口 |
+| `user` | 用户名 |
+| `password` | 密码 |
+| `database` | 数据库名 |
+| `ping_timeout` | 建连探活超时（秒），默认 10 秒 |
+| `lock_timeout` | PostgreSQL/Greenplum 等锁超时（秒），通过连接串注入会话参数 |
+| `statement_timeout` | 语句执行超时（秒），0 表示不限制 |
+| `timezone` | 固定写入端 PostgreSQL 会话时区，如 `UTC`、`+08` |
 
 ### `tasks`
 
 任务定义列表。每个任务将多个 `sources` 的数据写入一个 `target`。
 
-| 字段      | 说明                                                                        |
-| --------- | --------------------------------------------------------------------------- |
-| `name`    | 任务名称，配置了 `incr_field` 时必填，写入 `manager.job_data_sync.job_name` |
-| `type`    | 任务类型，目前支持 `query`                                                  |
-| `comment` | 可选备注                                                                    |
-| `sources` | 源配置列表，见下节                                                          |
-| `target`  | 目标配置，见下节                                                            |
+| 字段 | 说明 |
+|------|------|
+| `name` | 任务名称，配置了 `incr_field` 时必填，写入 `manager.job_data_sync.job_name` |
+| `type` | 任务类型，目前支持 `query` |
+| `comment` | 可选备注 |
+| `sources` | 源配置列表，见下节 |
+| `target` | 目标配置，见下节 |
+| `hooks` | 前置/后置 SQL hook，见下节 |
 
 ## `sources` 配置
 
 每个 source 表示一个源库读取定义。
 
-| 字段              | 必填   | 说明                                                                             |
-| ----------------- | ------ | -------------------------------------------------------------------------------- |
-| `conn_id`         | 二选一 | 引用 `databases[].id`；与 `conn_name` 至少填一个，优先级高于 `conn_name`         |
-| `conn_name`       | 二选一 | 引用 `databases[].name`                                                          |
-| `sql`             | 二选一 | 自定义查询语句                                                                   |
-| `table`           | 二选一 | 直接读取的表名，格式 `schema.table`；仅 SQL Server 支持 `db.schema.table`        |
-| `where_statement` |        | 附加过滤条件；使用 `table` 时直接拼到 `WHERE`，使用 `sql` 时作为外层过滤条件追加 |
-| `fields_mapping`  |        | 字段投影/映射；仅支持简单 map，格式为 `源字段或表达式: 目标字段`                 |
-| `batch_size`      |        | 每批读取行数，默认 `10000`                                                       |
-| `incr_field`      |        | 增量抽取字段名（日期/时间类型），配合 watermark 实现断点续传                     |
-| `incr_point`      |        | 增量起点，通常由程序从 watermark 自动回填，也可手动指定初始值                    |
-| `order_by`        |        | 查询排序表达式，启用 `commit_batch_size` 时若未指定则自动补为 `<incr_field> ASC` |
+| 字段 | 必填 | 说明 |
+|------|------|------|
+| `conn_id` | 二选一 | 引用 `databases[].id`；与 `conn_name` 至少填一个，优先级高于 `conn_name` |
+| `conn_name` | 二选一 | 引用 `databases[].name` |
+| `sql` | 二选一 | 自定义查询语句 |
+| `table` | 二选一 | 直接读取的表名，格式 `schema.table`；仅 SQL Server 支持 `db.schema.table` |
+| `where_statement` | | 附加过滤条件；使用 `table` 时直接拼到 `WHERE`，使用 `sql` 时作为外层过滤条件追加 |
+| `fields_mapping` | | 字段投影/映射；仅支持简单 map，格式为 `源字段或表达式: 目标字段` |
+| `batch_size` | | 每批读取行数，默认 `10000` |
+| `incr_field` | | 增量抽取字段名（日期/时间类型），配合 watermark 实现断点续传 |
+| `incr_point` | | 增量起点，通常由程序从 watermark 自动回填，也可手动指定初始值 |
+| `order_by` | | 查询排序表达式，启用 `commit_batch_size` 时若未指定则自动补为 `<incr_field> ASC` |
 
 ### `sql` 与 `table` 规则
 
@@ -154,23 +157,56 @@ tasks:
 
 ## `target` 配置
 
-| 字段                | 必填         | 说明                                                                                                                       |
-| ------------------- | ------------ | -------------------------------------------------------------------------------------------------------------------------- |
-| `conn_id`           | 二选一       | 引用 `databases[].id`；与 `conn_name` 至少填一个，优先级高于 `conn_name`                                                   |
-| `conn_name`         | 二选一       | 引用 `databases[].name`                                                                                                    |
-| `table`             | ✅           | 目标表，建议使用 `schema.table` 格式                                                                                       |
-| `mode`              | ✅           | 写入模式，见下节                                                                                                           |
-| `pk`                | merge 时必填 | 主键列列表，多列用逗号分隔，如 `id` 或 `id,tenant_id`                                                                      |
-| `commit_batch_size` |              | 分段提交粒度（批次数），`0` 表示整个任务在单个事务中完成（默认）；设置后每 N 个 batch 提交一次事务并更新水位，适用于超大表 |
+| 字段 | 必填 | 说明 |
+|------|------|------|
+| `conn_id` | 二选一 | 引用 `databases[].id`；与 `conn_name` 至少填一个，优先级高于 `conn_name` |
+| `conn_name` | 二选一 | 引用 `databases[].name` |
+| `table` | ✅ | 目标表，建议使用 `schema.table` 格式 |
+| `mode` | ✅ | 写入模式，见下节 |
+| `pk` | merge 时必填 | 主键列列表，多列用逗号分隔，如 `id` 或 `id,tenant_id` |
+| `commit_batch_size` | | 分段提交粒度（批次数），`0` 表示整个任务在单个事务中完成（默认）；设置后每 N 个 batch 提交一次事务并更新水位，适用于超大表 |
+| `truncate_timeout` | | full 模式下 TRUNCATE 等锁超时（秒），默认 10 秒；超时后自动退避为 DELETE FROM |
 
 ### 支持的 `mode`
 
-| 值        | 说明                                                                                                                                                            |
-| --------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| 值 | 说明 |
+|------|------|
 | `initial` | 首次全量回填：直接 COPY 到目标表，不清空已有数据，仅执行追加写入；上下游会话超时默认放宽至 2 小时（约可覆盖 2 亿行以内的同步），可通过 `statement_timeout` 覆盖 |
-| `full`    | 先清空目标表，再将本次抽取结果全量覆盖写入                                                                                                                      |
-| `append`  | 与 `initial` 一样追加写入，但要求 `incr_field`，并在写入后更新水位                                                                                              |
-| `merge`   | 先写入临时表，再按 `pk` 做 DELETE + INSERT（支持增量 upsert）                                                                                                   |
+| `full` | 先清空目标表，再将本次抽取结果全量覆盖写入 |
+| `append` | 与 `initial` 一样追加写入，但要求 `incr_field`，并在写入后更新水位 |
+| `merge` | 先写入临时表，再按 `pk` 做 DELETE + INSERT（支持增量 upsert） |
+
+## `hooks` 配置
+
+任务的前置和后置 SQL hook，支持扩展不同类型的 executor。
+
+| 字段 | 说明 |
+|------|------|
+| `pre` | 前置 hook 列表，数据同步前执行 |
+| `post` | 后置 hook 列表，数据同步后执行 |
+
+每个 hook 配置：
+
+| 字段 | 必填 | 说明 |
+|------|------|------|
+| `type` | | hook 类型，默认 `sql` |
+| `spec` | ✅ | 类型特定的配置，SQL 模式包含 `conn_name` 和 `sql` |
+
+### Hook 配置示例
+
+```yaml
+hooks:
+  pre:
+    - type: sql
+      spec:
+        conn_name: "src_db"
+        sql: "EXEC sp_generate_data"
+  post:
+    - type: sql
+      spec:
+        conn_name: "target_pg"
+        sql: "ANALYZE public.target_table"
+```
 
 ## 示例
 
@@ -251,6 +287,35 @@ tasks:
       commit_batch_size: 100 # 每 100 批（约 100 万行）提交一次事务
 ```
 
+### 5. 带 Hook 的任务
+
+```yaml
+name: etl_with_hooks
+tasks:
+  - name: order_sync
+    type: query
+    sources:
+      - conn_name: source-mssql
+        table: dbo.orders
+        incr_field: updated_at
+    target:
+      conn_name: target-pg
+      table: ods.orders
+      mode: merge
+      pk: order_id
+    hooks:
+      pre:
+        - type: sql
+          spec:
+            conn_name: "target-pg"
+            sql: "DELETE FROM ods.orders WHERE updated_at < now() - interval '7 days'"
+      post:
+        - type: sql
+          spec:
+            conn_name: "target-pg"
+            sql: "ANALYZE ods.orders"
+```
+
 ## Watermark 说明
 
 当 source 配置了 `incr_field` 时，程序会读写 `manager.job_data_sync` 表来记录同步进度（水位）。
@@ -259,23 +324,23 @@ tasks:
 
 ### 水位匹配键
 
-| 场景           | 匹配字段                                                                                 |
-| -------------- | ---------------------------------------------------------------------------------------- |
+| 场景 | 匹配字段 |
+|------|------|
 | `table` source | `job_name` + `src_schema_name` + `src_table_name` + `dst_schema_name` + `dst_table_name` |
-| `sql` source   | `job_name` + `src_rawsql` + `dst_schema_name` + `dst_table_name`                         |
+| `sql` source | `job_name` + `src_rawsql` + `dst_schema_name` + `dst_table_name` |
 
 ### 字段来源
 
-| 数据库字段                           | 来源                                                                 |
-| ------------------------------------ | -------------------------------------------------------------------- |
-| `job_name`                           | `tasks[].name`                                                       |
-| `src_schema_name` / `src_table_name` | `sources[].table` 解析                                               |
-| `src_rawsql`                         | `sources[].sql` 文本                                                 |
-| `dst_schema_name` / `dst_table_name` | `target.table` 解析                                                  |
-| `incr_point`                         | 程序运行时写入，每段（或整体）提交时更新为当前批次 `MAX(incr_field)` |
-| `sync_mode`                          | `target.mode`                                                        |
-| `src_incr_field`                     | `sources[].incr_field`                                               |
-| `dst_pk`                             | `target.pk`                                                          |
+| 数据库字段 | 来源 |
+|------|------|
+| `job_name` | `tasks[].name` |
+| `src_schema_name` / `src_table_name` | `sources[].table` 解析 |
+| `src_rawsql` | `sources[].sql` 文本 |
+| `dst_schema_name` / `dst_table_name` | `target.table` 解析 |
+| `incr_point` | 程序运行时写入，每段（或整体）提交时更新为当前批次 `MAX(incr_field)` |
+| `sync_mode` | `target.mode` |
+| `src_incr_field` | `sources[].incr_field` |
+| `dst_pk` | `target.pk` |
 
 ### 水位回填逻辑（启动时）
 

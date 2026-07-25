@@ -88,7 +88,7 @@ func (e *DBExecutor) Execute(ctx context.Context, spec map[string]any) error {
 	if err != nil {
 		return fmt.Errorf("exec failed: %w", err)
 	}
-	log.Printf("[hook] completed on %s", connName)
+	log.Printf("[hook] completed on %s: %s", connName, shortenSQL(sqlStmt))
 	return nil
 }
 

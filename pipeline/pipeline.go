@@ -10,11 +10,12 @@ import (
 	"sync"
 )
 
-func RunPipeline(source *config.SourceConfig, r reader.Reader, t transform.Transformer, w writer.BatchWriter) error {
+func RunPipeline(ctx context.Context, source *config.SourceConfig, r reader.Reader, t transform.Transformer, w writer.BatchWriter) error {
 	// reader 在独立 goroutine 中异步抽取；若其出错会 cancel(ctx)，
 	// 令 writer 正在进行的事务以 context.Canceled 中止并回滚，
 	// 避免 full/copy 模式下提交被截断的部分数据。
-	ctx, cancel := context.WithCancel(context.Background())
+	// 从上游传入的 ctx 派生，使父级取消/超时能够向下传播。
+	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
 	rowChan := r.ReadBatch(ctx, cancel)

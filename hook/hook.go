@@ -19,22 +19,22 @@ type Executor interface {
 }
 
 // RunPreHooks executes all pre-hooks before data synchronization.
-func RunPreHooks(hooks []config.HookConfig, resolver config.DBResolver) error {
-	return runHooks(hooks, resolver, "pre")
+func RunPreHooks(ctx context.Context, hooks []config.HookConfig, resolver config.DBResolver) error {
+	return runHooks(ctx, hooks, resolver, "pre")
 }
 
 // RunPostHooks executes all post-hooks after data synchronization.
-func RunPostHooks(hooks []config.HookConfig, resolver config.DBResolver) error {
-	return runHooks(hooks, resolver, "post")
+func RunPostHooks(ctx context.Context, hooks []config.HookConfig, resolver config.DBResolver) error {
+	return runHooks(ctx, hooks, resolver, "post")
 }
 
-func runHooks(hooks []config.HookConfig, resolver config.DBResolver, hookType string) error {
+func runHooks(ctx context.Context, hooks []config.HookConfig, resolver config.DBResolver, hookType string) error {
 	for i, h := range hooks {
 		exec, err := newExecutor(h.Type, resolver)
 		if err != nil {
 			return fmt.Errorf("%s hook #%d: %w", hookType, i+1, err)
 		}
-		if err := exec.Execute(context.Background(), h.Spec); err != nil {
+		if err := exec.Execute(ctx, h.Spec); err != nil {
 			return fmt.Errorf("%s hook #%d: %w", hookType, i+1, err)
 		}
 	}
@@ -77,9 +77,9 @@ func (e *DBExecutor) Execute(ctx context.Context, spec map[string]any) error {
 	}
 	defer db.Close()
 
-	ctx, cancel := context.WithTimeout(ctx, time.Duration(dbCfg.PingTimeout)*time.Second)
-	defer cancel()
-	if err := db.PingContext(ctx); err != nil {
+	pingCtx, pingCancel := context.WithTimeout(ctx, time.Duration(dbCfg.PingTimeout)*time.Second)
+	defer pingCancel()
+	if err := db.PingContext(pingCtx); err != nil {
 		return fmt.Errorf("ping db failed: %w", err)
 	}
 

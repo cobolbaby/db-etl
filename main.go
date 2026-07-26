@@ -116,7 +116,7 @@ func main() {
 				if task.Name == "" {
 					task.Name = cfg.Name
 				}
-				if err := runTask(task, resolver, retryCfg); err != nil {
+				if err := runTask(context.Background(), task, resolver, retryCfg); err != nil {
 					log.Printf("task failed: %v", err)
 					if cfg.ErrorPolicy == config.ErrorPolicyAbort {
 						log.Fatal(err)
@@ -132,10 +132,10 @@ func main() {
 
 }
 
-func runTask(task config.TaskConfig, resolver config.DBResolver, retryCfg util.RetryConfig) error {
+func runTask(ctx context.Context, task config.TaskConfig, resolver config.DBResolver, retryCfg util.RetryConfig) error {
 	// 执行前置 hook
 	if task.Hooks != nil && len(task.Hooks.Pre) > 0 {
-		if err := hook.RunPreHooks(task.Hooks.Pre, resolver); err != nil {
+		if err := hook.RunPreHooks(ctx, task.Hooks.Pre, resolver); err != nil {
 			return fmt.Errorf("run pre-hooks failed: %w", err)
 		}
 	}
@@ -160,7 +160,7 @@ func runTask(task config.TaskConfig, resolver config.DBResolver, retryCfg util.R
 
 		label := fmt.Sprintf("%s (%s) → %s (%s)", srcDB.Name, src.Table, dstDB.Name, task.Target.Table)
 		err := util.Retry(label, retryCfg, func() error {
-			return runPipeline(src, srcDB, dstDB, task)
+			return runPipeline(ctx, src, srcDB, dstDB, task)
 		})
 		if err != nil {
 			log.Printf("pipeline failed %s after retries: %v", label, err)
@@ -171,7 +171,7 @@ func runTask(task config.TaskConfig, resolver config.DBResolver, retryCfg util.R
 
 	// 执行后置 hook
 	if task.Hooks != nil && len(task.Hooks.Post) > 0 {
-		if err := hook.RunPostHooks(task.Hooks.Post, resolver); err != nil {
+		if err := hook.RunPostHooks(ctx, task.Hooks.Post, resolver); err != nil {
 			return fmt.Errorf("run post-hooks failed: %w", err)
 		}
 	}
@@ -179,7 +179,7 @@ func runTask(task config.TaskConfig, resolver config.DBResolver, retryCfg util.R
 	return lastErr
 }
 
-func runPipeline(src *config.SourceConfig, srcDB config.DBConfig, dstDB config.DBConfig, task config.TaskConfig) error {
+func runPipeline(ctx context.Context, src *config.SourceConfig, srcDB config.DBConfig, dstDB config.DBConfig, task config.TaskConfig) error {
 
 	// mc := metrics.Default()
 	// pm := mc.NewPipelineMetrics(src.ConnName, task.Target.ConnName, task.Target.Table, string(task.Target.Mode))
@@ -250,7 +250,7 @@ func runPipeline(src *config.SourceConfig, srcDB config.DBConfig, dstDB config.D
 		task.Target.Table,
 	)
 
-	err = pipeline.RunPipeline(src, r, t, w)
+	err = pipeline.RunPipeline(ctx, src, r, t, w)
 	// mc.Finish(pm, err)
 
 	if err != nil {

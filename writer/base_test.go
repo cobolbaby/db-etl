@@ -13,7 +13,7 @@ type stubWriterDialect struct {
 	called string
 }
 
-func (d *stubWriterDialect) writeInitial(ctx context.Context, in <-chan transform.CSVBatch, target *config.TargetConfig) error {
+func (d *stubWriterDialect) writeInitial(ctx context.Context, in <-chan transform.CSVBatch, target *config.TargetConfig, source *config.SourceConfig, jobName string) error {
 	d.called = "initial"
 	return nil
 }

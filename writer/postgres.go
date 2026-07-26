@@ -100,15 +100,86 @@ func (d *pgWriterDialect) writeFull(ctx context.Context, in <-chan transform.CSV
 	return tx.Commit(ctx)
 }
 
-func (d *pgWriterDialect) writeInitial(ctx context.Context, in <-chan transform.CSVBatch, target *config.TargetConfig) error {
+func (d *pgWriterDialect) writeInitial(ctx context.Context, in <-chan transform.CSVBatch, target *config.TargetConfig, source *config.SourceConfig, jobName string) error {
 	firstBatch, foundRows := drainFirstBatch(in)
 
-	if !foundRows {
+	// COPY 与「任务下线」放在同一事务内提交，保证 initial（首次全量）回填成功后
+	// job_data_sync 才被置为 inuse=false，避免下次重复回填上亿行。
+	tx, err := d.conn.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx)
+
+	if foundRows {
+		if err := d.writeCopyWithFirstBatch(ctx, firstBatch, in, target.Table, tx.Conn()); err != nil {
+			return err
+		}
+	} else {
 		log.Printf("table=%s no rows to copy, skip", target.Table)
-		return nil
 	}
 
-	return d.writeCopyWithFirstBatch(ctx, firstBatch, in, target.Table, d.conn)
+	if err := d.deactivateInitialJob(ctx, tx, target, source, jobName); err != nil {
+		return err
+	}
+
+	return tx.Commit(ctx)
+}
+
+// deactivateInitialJob 在 initial 模式成功后，将 manager.job_data_sync 中对应记录置为
+// inuse=false，避免下次运行重复执行首次全量回填。
+//
+// 与 updateWatermark 一致，按 (job_name + 源标识 + 目标标识) 定位记录，无需外层透传 job_id。
+// 若没有匹配到记录（如纯 config.yaml 任务），RowsAffected 为 0，视为无操作。
+func (d *pgWriterDialect) deactivateInitialJob(ctx context.Context, tx pgx.Tx, target *config.TargetConfig, source *config.SourceConfig, jobName string) error {
+	funcName := watermarkJobName(jobName)
+	src, err := sourceIdentity(source)
+	if err != nil {
+		return err
+	}
+	dst, err := targetIdentity(target)
+	if err != nil {
+		return err
+	}
+
+	var tag pgconn.CommandTag
+	if src.RawSQL != "" {
+		tag, err = tx.Exec(
+			ctx,
+			`UPDATE manager.job_data_sync
+			    SET inuse = false,
+			        udt   = now()
+			  WHERE job_name        = $1
+			    AND src_db_name     = $2
+			    AND src_rawsql      = $3
+			    AND dst_schema_name = $4
+			    AND dst_table_name  = $5`,
+			funcName, src.Database, src.RawSQL, dst.Schema, dst.Table,
+		)
+	} else {
+		tag, err = tx.Exec(
+			ctx,
+			`UPDATE manager.job_data_sync
+			    SET inuse = false,
+			        udt   = now()
+			  WHERE job_name        = $1
+			    AND src_db_name     = $2
+			    AND src_schema_name = $3
+			    AND src_table_name  = $4
+			    AND dst_schema_name = $5
+			    AND dst_table_name  = $6`,
+			funcName, src.Database, src.Schema, src.Table, dst.Schema, dst.Table,
+		)
+	}
+	if err != nil {
+		return util.WrapPgError(err)
+	}
+	if tag.RowsAffected() == 0 {
+		log.Printf("initial task done but no matching job_data_sync row (job=%s table=%s), inuse unchanged", funcName, target.Table)
+		return nil
+	}
+	log.Printf("initial task done, set inuse=false (job=%s table=%s)", funcName, target.Table)
+	return nil
 }
 
 func (d *pgWriterDialect) writeCopyWithFirstBatch(ctx context.Context, firstBatch transform.CSVBatch, in <-chan transform.CSVBatch, table string, conn *pgx.Conn) error {
@@ -540,8 +611,6 @@ func (d *pgWriterDialect) updateWatermark(ctx context.Context, tx pgx.Tx, wm str
 		return err
 	}
 
-	now := time.Now()
-
 	var tag pgconn.CommandTag
 	var execErr error
 	if src.RawSQL != "" {
@@ -552,13 +621,13 @@ func (d *pgWriterDialect) updateWatermark(ctx context.Context, tx pgx.Tx, wm str
 			        sync_mode       = $2,
 			        src_incr_field  = $3,
 			        dst_pk          = $4,
-			        udt             = $5
-			  WHERE job_name        = $6
-			    AND src_db_name     = $7
-			    AND src_rawsql      = $8
-			    AND dst_schema_name = $9
-			    AND dst_table_name  = $10`,
-			wm, string(target.Mode), source.IncrField, target.PK, now,
+			        udt             = now()
+			  WHERE job_name        = $5
+			    AND src_db_name     = $6
+			    AND src_rawsql      = $7
+			    AND dst_schema_name = $8
+			    AND dst_table_name  = $9`,
+			wm, string(target.Mode), source.IncrField, target.PK,
 			funcName, src.Database, src.RawSQL, dst.Schema, dst.Table,
 		)
 	} else {
@@ -569,14 +638,14 @@ func (d *pgWriterDialect) updateWatermark(ctx context.Context, tx pgx.Tx, wm str
 			        sync_mode       = $2,
 			        src_incr_field  = $3,
 			        dst_pk          = $4,
-			        udt             = $5
-			  WHERE job_name        = $6
-			    AND src_db_name     = $7
-			    AND src_schema_name = $8
-			    AND src_table_name  = $9
-			    AND dst_schema_name = $10
-			    AND dst_table_name  = $11`,
-			wm, string(target.Mode), source.IncrField, target.PK, now,
+			        udt             = now()
+			  WHERE job_name        = $5
+			    AND src_db_name     = $6
+			    AND src_schema_name = $7
+			    AND src_table_name  = $8
+			    AND dst_schema_name = $9
+			    AND dst_table_name  = $10`,
+			wm, string(target.Mode), source.IncrField, target.PK,
 			funcName, src.Database, src.Schema, src.Table, dst.Schema, dst.Table,
 		)
 	}
@@ -594,9 +663,9 @@ func (d *pgWriterDialect) updateWatermark(ctx context.Context, tx pgx.Tx, wm str
 			`INSERT INTO manager.job_data_sync
 			    (job_name, src_db_name, src_rawsql, dst_schema_name, dst_table_name,
 			     incr_point, sync_mode, src_incr_field, dst_pk, cdt, udt)
-			  VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $10)`,
+			  VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, now(), now())`,
 			funcName, src.Database, src.RawSQL, dst.Schema, dst.Table,
-			wm, string(target.Mode), source.IncrField, target.PK, now,
+			wm, string(target.Mode), source.IncrField, target.PK,
 		)
 	} else {
 		_, err = tx.Exec(
@@ -604,9 +673,9 @@ func (d *pgWriterDialect) updateWatermark(ctx context.Context, tx pgx.Tx, wm str
 			`INSERT INTO manager.job_data_sync
 			    (job_name, src_db_name, src_schema_name, src_table_name, dst_schema_name, dst_table_name,
 			     incr_point, sync_mode, src_incr_field, dst_pk, cdt, udt)
-			  VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $12)`,
+			  VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, now(), now())`,
 			funcName, src.Database, src.Schema, src.Table, dst.Schema, dst.Table,
-			wm, string(target.Mode), source.IncrField, target.PK, now,
+			wm, string(target.Mode), source.IncrField, target.PK,
 		)
 	}
 	return util.WrapPgError(err)

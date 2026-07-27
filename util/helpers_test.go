@@ -13,3 +13,12 @@ func TestSanitizeStringReturnsEmptyForBlank(t *testing.T) {
 		t.Fatalf("expected empty string, got %q", got)
 	}
 }
+
+func TestSanitizeStringQuotesCarriageReturn(t *testing.T) {
+	if got := SanitizeString("abc\rdef"); got != "\"abc\rdef\"" {
+		t.Fatalf("expected carriage return to be quoted, got %q", got)
+	}
+	if got := SanitizeString("abc\r\ndef"); got != "\"abc\r\ndef\"" {
+		t.Fatalf("expected CRLF to be quoted, got %q", got)
+	}
+}

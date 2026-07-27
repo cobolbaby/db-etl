@@ -26,7 +26,8 @@ var controlChars = regexp.MustCompile(`[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]`)
 //
 // 4. CSV 字段转义：
 //   - 若含有双引号，替换为两个双引号（CSV 标准转义规则）
-//   - 若含有逗号、双引号或换行符，用双引号包裹整个字段
+//   - 若含有逗号、双引号、换行符（\n）或回车符（\r），用双引号包裹整个字段
+//     （\r 必须一并判断，否则残留的裸回车会触发 COPY 报 "unquoted carriage return found in data"）
 //   - 否则返回原文本，无需包装
 //
 // 背景：通过 util.NullSentinel（"__DB_ETL_NULL__"）区分 nil 与空字符串：
@@ -49,6 +50,11 @@ func SanitizeString(s string) string {
 		return `"` + s + `"`
 	}
 
+	// 临时调试: 定位含裸回车/换行的脏数据，排查完成后删除。
+	// if strings.ContainsAny(s, "\r\n") {
+	// 	log.Printf("[DEBUG] SanitizeString found CR/LF in value: %q", s)
+	// }
+
 	// Step 3: 清洗控制字符，避免破坏 CSV 格式
 	s = controlChars.ReplaceAllString(s, "")
 
@@ -57,7 +63,7 @@ func SanitizeString(s string) string {
 		s = strings.ReplaceAll(s, `"`, `""`)
 	}
 
-	if strings.ContainsAny(s, ",\"\n") {
+	if strings.ContainsAny(s, ",\"\n\r") {
 		return `"` + s + `"`
 	}
 

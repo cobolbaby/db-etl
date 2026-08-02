@@ -769,8 +769,10 @@ func (db *DBConfig) DSN() string {
 	switch db.Type {
 
 	case DBTypeMSSQL:
+		// tlsmin=1.0：允许与仅支持 TLS 1.0/1.1 的旧版 SQL Server 完成登录握手，
+		//   否则 Go 默认最低 TLS 1.2，会报 "tls: server selected unsupported protocol version 301"。
 		return fmt.Sprintf(
-			"server=%s;user id=%s;password=%s;port=%d;database=%s",
+			"server=%s;user id=%s;password=%s;port=%d;database=%s;tlsmin=1.0",
 			db.Host,
 			db.User,
 			db.Password,

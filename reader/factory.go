@@ -10,6 +10,7 @@ import (
 
 	_ "github.com/jackc/pgx/v5/stdlib"
 	_ "github.com/microsoft/go-mssqldb"
+	_ "github.com/sijms/go-ora/v2"
 )
 
 func NewReader(db config.DBConfig, src *config.SourceConfig) (Reader, error) {
@@ -26,6 +27,8 @@ func NewReader(db config.DBConfig, src *config.SourceConfig) (Reader, error) {
 		build = func(conn *sql.DB) Reader { return NewMSSQLReader(conn, src) }
 	case config.DBTypePG, config.DBTypeGP:
 		build = func(conn *sql.DB) Reader { return NewPGReader(conn, src) }
+	case config.DBTypeOracle:
+		build = func(conn *sql.DB) Reader { return NewOracleReader(conn, src) }
 	default:
 		// 不支持的类型属配置错误，重试无益。
 		return nil, util.NonRetryable(fmt.Errorf("unsupported source db type: %s", db.Type))

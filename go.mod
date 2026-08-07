@@ -6,6 +6,7 @@ require (
 	github.com/google/uuid v1.6.0
 	github.com/jackc/pgx/v5 v5.9.1
 	github.com/microsoft/go-mssqldb v1.9.8
+	github.com/sijms/go-ora/v2 v2.9.0
 	gopkg.in/yaml.v3 v3.0.1
 )
 

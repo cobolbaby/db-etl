@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"net/url"
 	"os"
 	"sort"
 	"strings"
@@ -78,15 +79,17 @@ const DefaultPingTimeout = 10
 type DBType string
 
 const (
-	DBTypeMSSQL DBType = "mssql"
-	DBTypePG    DBType = "postgres"
-	DBTypeGP    DBType = "greenplum"
+	DBTypeMSSQL  DBType = "mssql"
+	DBTypePG     DBType = "postgres"
+	DBTypeGP     DBType = "greenplum"
+	DBTypeOracle DBType = "oracle"
 )
 
 var supportedDBTypes = map[DBType]struct{}{
-	DBTypeMSSQL: {},
-	DBTypePG:    {},
-	DBTypeGP:    {},
+	DBTypeMSSQL:  {},
+	DBTypePG:     {},
+	DBTypeGP:     {},
+	DBTypeOracle: {},
 }
 
 // DBResolver 根据 conn_id（优先）或 name 解析数据库配置。
@@ -137,6 +140,9 @@ var dbTypeAliases = map[string]DBType{
 	"pg":         DBTypePG,
 	"greenplum":  DBTypeGP,
 	"gp":         DBTypeGP,
+	"oracle":     DBTypeOracle,
+	"oci":        DBTypeOracle,
+	"ora":        DBTypeOracle,
 }
 
 type TaskConfig struct {
@@ -809,6 +815,18 @@ func (db *DBConfig) DSN() string {
 		// libpq options 值含空格，须用单引号包裹；pgx 按 libpq 规则解析。
 		return base + fmt.Sprintf(" options='%s'", strings.Join(opts, " "))
 
+	case DBTypeOracle:
+		// go-ora 采用 URL 形式的连接串：oracle://user:password@host:port/service_name。
+		// database 字段承载 Oracle 的 service name（或 SID）。
+		// 用 net/url 构造可对用户名/口令中的特殊字符做百分号转义，避免拼串注入与解析歧义。
+		u := &url.URL{
+			Scheme: "oracle",
+			User:   url.UserPassword(db.User, db.Password),
+			Host:   fmt.Sprintf("%s:%d", db.Host, db.Port),
+			Path:   "/" + strings.TrimPrefix(db.Database, "/"),
+		}
+		return u.String()
+
 	default:
 		panic("unsupported db type: " + db.Type)
 
@@ -822,6 +840,8 @@ func (db *DBConfig) Driver() string {
 		return "sqlserver"
 	case DBTypePG, DBTypeGP:
 		return "pgx"
+	case DBTypeOracle:
+		return "oracle"
 	default:
 		panic("unsupported db type: " + db.Type)
 	}

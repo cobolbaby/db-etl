@@ -769,8 +769,12 @@ func (db *DBConfig) DSN() string {
 	switch db.Type {
 
 	case DBTypeMSSQL:
+		// encrypt=disable：客户端声明不支持加密，登录包也不走 TLS。
+		//   旧版 SQL Server 的 TLS 栈可能有问题：即使用 tlsmin=1.0 放宽版本，
+		//   握手阶段仍会被服务器直接重置（read: connection reset by peer）。
+		//   disable 彻底跳过 TLS，交由内网链路保证安全。
 		return fmt.Sprintf(
-			"server=%s;user id=%s;password=%s;port=%d;database=%s",
+			"server=%s;user id=%s;password=%s;port=%d;database=%s;encrypt=disable",
 			db.Host,
 			db.User,
 			db.Password,

@@ -174,6 +174,8 @@ func rowToTaskConfig(r JobDataSyncRow, metaDB DBConfig, resolver DBResolver) (Ta
 		Table:    r.DstSchemaName + "." + r.DstTableName,
 		Mode:     ModeType(r.SyncMode),
 		PK:       r.DstPK,
+		// TruncateTimeout 未配置时使用默认值（DB 加载路径不走 validateTarget）
+		TruncateTimeout: defaultTruncateTimeoutSec,
 	}
 
 	return TaskConfig{

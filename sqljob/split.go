@@ -2,27 +2,45 @@ package sqljob
 
 import "strings"
 
-// splitStatements 将一段 SQL 脚本切分为多条独立语句（以 `;` 为分隔符）。
+// sqlDialect 决定语句切分规则：不同数据库的字符串/标识符/语句边界语法不同。
+type sqlDialect int
+
+const (
+	// dialectPostgres 适用于 PostgreSQL / Greenplum：
+	// 以裸露的 ; 分隔语句，额外支持美元引用 $tag$ ... $tag$。
+	dialectPostgres sqlDialect = iota
+	// dialectTSQL 适用于 SQL Server：
+	// 以单独成行的 GO 分隔批次（; 不切分），额外支持 [ ] 括号标识符。
+	dialectTSQL
+)
+
+// splitStatements 将一段 SQL 脚本按方言切分为多条可独立执行的单元。
 //
-// 切分时会正确跳过下列上下文中的分号，避免误切：
+// 通用规则（所有方言）：正确跳过下列上下文中的分隔符，避免误切：
 //   - 行注释 `-- ...`
-//   - 块注释 `/* ... */`（支持 PostgreSQL 的嵌套块注释）
-//   - 单引号字符串 '...'（`”` 视为转义引号）
+//   - 块注释 `/* ... */`（支持嵌套）
+//   - 单引号字符串 '...'（`”` 视为转义）
 //   - 双引号标识符 "..."（`""` 视为转义）
-//   - 美元引用 $tag$ ... $tag$（PostgreSQL 函数体常用）
 //
-// 返回的每条语句均已去除首尾空白，且不含末尾分号；空语句（纯注释/空白）被丢弃。
-func splitStatements(script string) []string {
-	s := &splitter{runes: []rune(script)}
+// 方言差异：
+//   - Postgres/Greenplum：以裸露的 `;` 作为语句分隔；额外支持美元引用 `$tag$ ... $tag$`
+//     （函数体常用，其中的 `;` 不会被切分）。
+//   - SQL Server：以单独成行的 `GO` 作为批次分隔（`;` 不切分，因为存储过程/触发器体内
+//     的 `;` 必须随整批一起提交）；额外支持 `[ ... ]` 括号标识符（`]]` 视为转义）。
+//
+// 返回的每个单元均已去除首尾空白；空单元（纯注释/空白）被丢弃。
+func splitStatements(script string, d sqlDialect) []string {
+	s := &splitter{runes: []rune(script), dialect: d}
 	return s.run()
 }
 
-// splitter 逐字符扫描 SQL 脚本，识别注释/字符串/美元引用等上下文，
-// 只在“裸露”的分号处切分语句。
+// splitter 逐字符扫描 SQL 脚本，识别注释/字符串/标识符等上下文，
+// 只在“裸露”的语句/批次边界处切分。
 type splitter struct {
-	runes []rune
-	pos   int             // 当前扫描位置
-	buf   strings.Builder // 当前正在累积的语句
+	runes   []rune
+	dialect sqlDialect
+	pos     int             // 当前扫描位置
+	buf     strings.Builder // 当前正在累积的单元
 	// meaningful 标记 buf 是否含有实际 SQL（非注释、非空白），
 	// 用于丢弃“仅注释/空白”的片段（如文件末尾的 `-- done`）。
 	meaningful bool
@@ -37,13 +55,24 @@ func (s *splitter) run() []string {
 			s.consumeLineComment()
 		case s.hasPrefix("/*"):
 			s.consumeBlockComment()
-		case s.peek() == '\'' || s.peek() == '"':
-			s.consumeQuoted(s.peek())
-		case s.peek() == '$':
+		case s.peek() == '\'':
+			s.consumeQuoted('\'')
+		case s.peek() == '"':
+			s.consumeQuoted('"')
+
+		// —— Postgres 专属 ——
+		case s.dialect == dialectPostgres && s.peek() == '$':
 			s.consumeDollar()
-		case s.peek() == ';':
+		case s.dialect == dialectPostgres && s.peek() == ';':
 			s.flush()
 			s.pos++
+
+		// —— SQL Server 专属 ——
+		case s.dialect == dialectTSQL && s.peek() == '[':
+			s.consumeBracket()
+		case s.dialect == dialectTSQL && (s.peek() == 'G' || s.peek() == 'g') && s.atGoSeparator():
+			s.consumeGo()
+
 		default:
 			if !isSpace(s.peek()) {
 				s.meaningful = true
@@ -118,7 +147,7 @@ func (s *splitter) consumeBlockComment() {
 	}
 }
 
-// consumeQuoted 消费以 q 为界的字符串/标识符；连续两个 q（如 ” 或 ""）视为转义。
+// consumeQuoted 消费以 q 为界的字符串/标识符；连续两个 q（如 `”` 或 `""`）视为转义。
 // 单引号字符串与双引号标识符的规则一致，故共用此方法。
 func (s *splitter) consumeQuoted(q rune) {
 	s.meaningful = true
@@ -157,6 +186,87 @@ func (s *splitter) consumeDollar() {
 	}
 	s.emit(closeAt - s.pos) // tag 之间的内容
 	s.emit(tagLen)          // 结束 tag
+}
+
+// consumeBracket 消费 SQL Server 的括号标识符 `[ ... ]`；`]]` 视为转义。
+func (s *splitter) consumeBracket() {
+	s.meaningful = true
+	s.emit(1) // [
+	for s.pos < len(s.runes) {
+		if s.peek() == ']' {
+			if s.pos+1 < len(s.runes) && s.runes[s.pos+1] == ']' {
+				s.emit(2)
+				continue
+			}
+			s.emit(1)
+			return
+		}
+		s.emit(1)
+	}
+}
+
+// atGoSeparator 判断当前位置是否为一条独立成行的 GO 批次分隔符（SQL Server）。
+// GO 须独占一行（前面只有空白），其后仅允许可选的批次计数（如 `GO 5`）与空白。
+func (s *splitter) atGoSeparator() bool {
+	// 1) 必须处于行首：此前直到上一个换行符只能是空白
+	for k := s.pos - 1; k >= 0 && s.runes[k] != '\n'; k-- {
+		if !isSpace(s.runes[k]) {
+			return false
+		}
+	}
+	// 2) 匹配 GO（忽略大小写）
+	if !s.hasPrefixFold("go") {
+		return false
+	}
+	// 3) 取本行 GO 之后的剩余内容
+	lineEnd := s.pos + 2
+	for lineEnd < len(s.runes) && s.runes[lineEnd] != '\n' {
+		lineEnd++
+	}
+	rest := strings.TrimSpace(string(s.runes[s.pos+2 : lineEnd]))
+	// 4) 空行即分隔符；否则只允许批次计数（GO <int>），避免误伤 GOTO、GOODS 等标识符
+	if rest == "" {
+		return true
+	}
+	for _, r := range rest {
+		if r < '0' || r > '9' {
+			return false
+		}
+	}
+	return true
+}
+
+// consumeGo 处理 SQL Server 的 GO 批次分隔：结束当前批次并跳过整行 GO。
+func (s *splitter) consumeGo() {
+	s.flush()
+	for s.pos < len(s.runes) && s.runes[s.pos] != '\n' {
+		s.pos++
+	}
+	if s.pos < len(s.runes) { // 跳过换行符本身
+		s.pos++
+	}
+}
+
+// hasPrefixFold 与 hasPrefix 类似，但对 ASCII 字母忽略大小写；p 需为小写。
+func (s *splitter) hasPrefixFold(p string) bool {
+	pr := []rune(p)
+	if s.pos+len(pr) > len(s.runes) {
+		return false
+	}
+	for i, r := range pr {
+		if toLowerASCII(s.runes[s.pos+i]) != r {
+			return false
+		}
+	}
+	return true
+}
+
+// toLowerASCII 将 ASCII 大写字母转为小写，其余字符原样返回。
+func toLowerASCII(r rune) rune {
+	if r >= 'A' && r <= 'Z' {
+		return r + ('a' - 'A')
+	}
+	return r
 }
 
 // isSpace 判断是否为 SQL 语句间可忽略的空白字符。

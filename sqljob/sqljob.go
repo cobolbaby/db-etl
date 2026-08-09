@@ -44,7 +44,7 @@ func (u stmtUnit) label() string {
 // 重试的粒度是“单条语句”：某条语句失败仅重试该条，其前面已提交的语句不受影响；
 // 该条语句最终仍失败时整个任务失败并终止。
 func Run(ctx context.Context, dbCfg config.DBConfig, job config.SQLJobConfig, retryCfg util.RetryConfig) error {
-	units, err := collectUnits(job)
+	units, err := collectUnits(job, dialectOf(dbCfg.Type))
 	if err != nil {
 		return err
 	}
@@ -90,8 +90,16 @@ func Run(ctx context.Context, dbCfg config.DBConfig, job config.SQLJobConfig, re
 	return nil
 }
 
+// dialectOf 根据数据库类型选择语句切分方言。
+func dialectOf(t config.DBType) sqlDialect {
+	if t == config.DBTypeMSSQL {
+		return dialectTSQL
+	}
+	return dialectPostgres
+}
+
 // collectUnits 汇总所有待执行语句：先内联 blocks，后 SQL 文件；均按声明顺序切分为独立语句。
-func collectUnits(job config.SQLJobConfig) ([]stmtUnit, error) {
+func collectUnits(job config.SQLJobConfig, d sqlDialect) ([]stmtUnit, error) {
 	var units []stmtUnit
 
 	for _, b := range job.Blocks {
@@ -99,7 +107,7 @@ func collectUnits(job config.SQLJobConfig) ([]stmtUnit, error) {
 		if name == "" {
 			name = "block"
 		}
-		for i, s := range splitStatements(b.SQL) {
+		for i, s := range splitStatements(b.SQL, d) {
 			units = append(units, stmtUnit{
 				source:  name,
 				owner:   strings.TrimSpace(b.Owner),
@@ -119,7 +127,7 @@ func collectUnits(job config.SQLJobConfig) ([]stmtUnit, error) {
 		if err != nil {
 			return nil, fmt.Errorf("read file %s failed: %w", file, err)
 		}
-		for i, s := range splitStatements(string(data)) {
+		for i, s := range splitStatements(string(data), d) {
 			units = append(units, stmtUnit{source: file, index: i + 1, sql: s})
 		}
 	}

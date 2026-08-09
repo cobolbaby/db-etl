@@ -7,9 +7,10 @@ import (
 
 func TestSplitStatements(t *testing.T) {
 	cases := []struct {
-		name   string
-		script string
-		want   []string
+		name    string
+		script  string
+		dialect sqlDialect
+		want    []string
 	}{
 		{
 			name:   "simple",
@@ -79,11 +80,58 @@ SELECT f();`,
 			script: "SELECT 1; /* trailing note; still a comment */",
 			want:   []string{"SELECT 1"},
 		},
+
+		// —— SQL Server (T-SQL) ——
+		{
+			name:    "tsql go separates batches",
+			script:  "SELECT 1\nGO\nSELECT 2\nGO",
+			dialect: dialectTSQL,
+			want:    []string{"SELECT 1", "SELECT 2"},
+		},
+		{
+			name:    "tsql semicolons stay within a batch",
+			script:  "INSERT INTO t VALUES (1);\nINSERT INTO t VALUES (2);\nGO",
+			dialect: dialectTSQL,
+			want:    []string{"INSERT INTO t VALUES (1);\nINSERT INTO t VALUES (2);"},
+		},
+		{
+			name:    "tsql procedure body kept whole",
+			script:  "CREATE PROCEDURE p AS\nBEGIN\n  SELECT 1;\n  SELECT 2;\nEND\nGO\nEXEC p\nGO",
+			dialect: dialectTSQL,
+			want: []string{
+				"CREATE PROCEDURE p AS\nBEGIN\n  SELECT 1;\n  SELECT 2;\nEND",
+				"EXEC p",
+			},
+		},
+		{
+			name:    "tsql go is case-insensitive with count",
+			script:  "SELECT 1\ngo 2\nSELECT 2",
+			dialect: dialectTSQL,
+			want:    []string{"SELECT 1", "SELECT 2"},
+		},
+		{
+			name:    "tsql goto is not a separator",
+			script:  "SELECT 1\nGOTO done\nSELECT 2",
+			dialect: dialectTSQL,
+			want:    []string{"SELECT 1\nGOTO done\nSELECT 2"},
+		},
+		{
+			name:    "tsql semicolon inside bracket identifier",
+			script:  "SELECT [a;b] FROM t\nGO",
+			dialect: dialectTSQL,
+			want:    []string{"SELECT [a;b] FROM t"},
+		},
+		{
+			name:    "tsql no go yields single batch",
+			script:  "SELECT 1; SELECT 2;",
+			dialect: dialectTSQL,
+			want:    []string{"SELECT 1; SELECT 2;"},
+		},
 	}
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			got := splitStatements(tc.script)
+			got := splitStatements(tc.script, tc.dialect)
 			if !reflect.DeepEqual(got, tc.want) {
 				t.Fatalf("splitStatements() =\n%#v\nwant\n%#v", got, tc.want)
 			}

@@ -59,7 +59,7 @@ databases:
 
 tasks:
   - name: sample_metric_sync
-    type: query
+    type: etl
     sources:
       - conn_name: source-mssql
         batch_size: 10000
@@ -108,11 +108,43 @@ tasks:
 | 字段 | 说明 |
 |------|------|
 | `name` | 任务名称，配置了 `incr_field` 时必填，写入 `manager.job_data_sync.job_name` |
-| `type` | 任务类型，目前支持 `query` |
+| `type` | 任务类型：`etl` 数据同步（默认）、`sqljob` 脚本任务 |
 | `comment` | 可选备注 |
-| `sources` | 源配置列表，见下节 |
-| `target` | 目标配置，见下节 |
-| `hooks` | 前置/后置 SQL hook，见下节 |
+| `sources` | 源配置列表，见下节（仅 `etl` 类型） |
+| `target` | 目标配置，见下节（仅 `etl` 类型） |
+| `hooks` | 前置/后置 SQL hook，见下节（仅 `etl` 类型） |
+| `sqljob` | 脚本任务配置，见下节（仅 `sqljob` 类型） |
+
+### `sqljob` 任务（替代 `psql -f`）
+
+用于运维脚本场景：在指定连接上按顺序执行 SQL，多条语句串行执行、**每条独立事务**
+（等价 `psql` 的 autocommit）。切分语句时会正确跳过注释、字符串以及 PostgreSQL
+的美元引用（`$$ ... $$`）。**重试粒度为“单条语句”**：某条失败仅重试该条，前面已提交的
+语句不受影响；该条最终仍失败则任务终止。
+
+语句来源两种，可混用：
+
+- `blocks`：内联在 YAML 中的可管理执行单元，可标注 `name` / `owner` / `comment`，便于后期维护；
+- `files`：外部 SQL 文件；省略且未配置 `blocks` 时，默认执行运行目录下所有 `*.sql`（按文件名升序）。
+
+```yaml
+tasks:
+  - type: sqljob
+    sqljob:
+      conn_name: mypg          # 引用 databases[]，也可用 conn_id
+      blocks:                   # 内联可管理块（推荐）
+        - name: rebuild_udf
+          owner: lisi           # 负责人
+          comment: 重建打分 UDF  # 备注
+          sql: |
+            CREATE OR REPLACE FUNCTION dw.func_score(x int)
+            RETURNS int AS $$ BEGIN RETURN x * 2; END; $$ LANGUAGE plpgsql;
+      files:                    # 或沿用既有 SQL 文件（改动最小）
+        - data_etl_udf.sql
+```
+
+运行：`./db-etl -config config-sqljob.yaml`。账密可继续用 `${VAR}` 从环境变量注入。
+
 
 ## `sources` 配置
 
@@ -215,7 +247,7 @@ hooks:
 ```yaml
 name: etl_copy_demo
 tasks:
-  - type: query
+  - type: etl
     sources:
       - conn_name: source-mssql
         batch_size: 10000
@@ -231,7 +263,7 @@ tasks:
 ```yaml
 name: etl_table_copy
 tasks:
-  - type: query
+  - type: etl
     sources:
       - conn_name: source-mssql
         batch_size: 10000
@@ -253,7 +285,7 @@ tasks:
 name: etl_incremental
 tasks:
   - name: order_sync
-    type: query
+    type: etl
     sources:
       - conn_name: source-mssql
         batch_size: 10000
@@ -272,7 +304,7 @@ tasks:
 name: etl_large_table
 tasks:
   - name: big_table_sync
-    type: query
+    type: etl
     sources:
       - conn_name: source-mssql
         batch_size: 10000
@@ -293,7 +325,7 @@ tasks:
 name: etl_with_hooks
 tasks:
   - name: order_sync
-    type: query
+    type: etl
     sources:
       - conn_name: source-mssql
         table: dbo.orders

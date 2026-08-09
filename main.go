@@ -13,6 +13,7 @@ import (
 	"db-etl/hook"
 	"db-etl/pipeline"
 	"db-etl/reader"
+	"db-etl/sqljob"
 	"db-etl/transform"
 	"db-etl/util"
 	"db-etl/writer"
@@ -132,7 +133,18 @@ func main() {
 
 }
 
+// runTask 按任务类型分派：sqljob 走脚本执行，其余走 ETL 数据同步。
 func runTask(ctx context.Context, task config.TaskConfig, resolver config.DBResolver, retryCfg util.RetryConfig) error {
+	switch task.Type {
+	case config.TaskTypeSqlJob:
+		return runSQLJob(ctx, task, resolver, retryCfg)
+	default:
+		return runEtlTask(ctx, task, resolver, retryCfg)
+	}
+}
+
+// runEtlTask 执行数据同步任务：前置 hook → 各 source 抽取写入 target → 后置 hook。
+func runEtlTask(ctx context.Context, task config.TaskConfig, resolver config.DBResolver, retryCfg util.RetryConfig) error {
 	// 执行前置 hook
 	if task.Hooks != nil && len(task.Hooks.Pre) > 0 {
 		if err := hook.RunPreHooks(ctx, task.Hooks.Pre, resolver); err != nil {
@@ -177,6 +189,22 @@ func runTask(ctx context.Context, task config.TaskConfig, resolver config.DBReso
 	}
 
 	return lastErr
+}
+
+// runSQLJob 执行脚本任务：解析连接后，在其上串行执行 SQL 文件（每条语句独立事务）。
+func runSQLJob(ctx context.Context, task config.TaskConfig, resolver config.DBResolver, retryCfg util.RetryConfig) error {
+	job := task.SQLJob
+	if job == nil {
+		return fmt.Errorf("sqljob config is nil for task %q", task.Name)
+	}
+
+	dbCfg, ok := resolver.Resolve(job.ConnID, job.ConnName)
+	if !ok {
+		return fmt.Errorf("sqljob db not found (conn_id=%q conn_name=%q)", job.ConnID, job.ConnName)
+	}
+
+	// 重试在 sqljob 内部按“单条语句”粒度进行，这里不再包裹整体重试。
+	return sqljob.Run(ctx, dbCfg, *job, retryCfg)
 }
 
 func runPipeline(ctx context.Context, src *config.SourceConfig, srcDB config.DBConfig, dstDB config.DBConfig, task config.TaskConfig) error {

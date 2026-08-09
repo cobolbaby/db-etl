@@ -145,6 +145,37 @@ type TaskConfig struct {
 	Sources []*SourceConfig `yaml:"sources"`
 	Target  *TargetConfig   `yaml:"target"`
 	Hooks   *Hooks          `yaml:"hooks"`
+	// SQLJob 仅在 type=sqljob 时生效：在指定连接上串行执行 SQL 脚本文件。
+	SQLJob *SQLJobConfig `yaml:"sqljob"`
+}
+
+// SQLJobConfig 定义脚本任务（type=sqljob）：用于替代 `psql -f xxx.sql` 这类运维脚本。
+// 连接账密来自 databases 配置。语句来源有两种（可混用）：
+//   - blocks：内联在 YAML 中的可管理执行单元，可标注负责人/备注，便于后期维护；
+//   - files：外部 SQL 文件；为空且未配置 blocks 时自动取运行目录下的 *.sql。
+//
+// 所有来源都会被切分为独立语句，按顺序串行执行、每条独立提交（等价 psql 的 autocommit）。
+type SQLJobConfig struct {
+	// ConnID / ConnName 指定脚本执行所在的数据库连接（引用 databases[]）。
+	ConnID   string `yaml:"conn_id"`
+	ConnName string `yaml:"conn_name"`
+	// Blocks 内联 SQL 执行单元，带责任人/备注元信息，优先于 files 执行。
+	Blocks []SQLBlock `yaml:"blocks"`
+	// Files 要执行的 SQL 文件列表，相对运行目录或绝对路径。
+	// 为空且未配置 blocks 时，自动加载运行目录下的所有 *.sql（按文件名升序）。
+	Files []string `yaml:"files"`
+}
+
+// SQLBlock 定义一个可管理的 SQL 执行单元，附带责任人/备注等元信息，便于后期维护与定位。
+type SQLBlock struct {
+	// Name block 名称/标识，写入日志便于定位。
+	Name string `yaml:"name"`
+	// Owner 负责人。
+	Owner string `yaml:"owner"`
+	// Comment 备注说明。
+	Comment string `yaml:"comment"`
+	// SQL 要执行的 SQL，可含多条语句（按 ; 切分后逐条执行）。
+	SQL string `yaml:"sql"`
 }
 
 // Hooks 定义任务的前置和后置 SQL hook。
@@ -171,9 +202,29 @@ const (
 type TaskType string
 
 const (
-	TaskTypeEtl  TaskType = "query"
-	TaskTypeExec TaskType = "exec"
+	// TaskTypeEtl 数据同步任务：从 source 抽取，按 target.mode 写入 target。
+	TaskTypeEtl TaskType = "etl"
+	// TaskTypeSqlJob 脚本任务：在指定连接上串行执行 SQL 文件中的多条语句，每条独立事务。
+	TaskTypeSqlJob TaskType = "sqljob"
 )
+
+// taskTypeAliases 归一化任务类型写法。
+var taskTypeAliases = map[string]TaskType{
+	"":       TaskTypeEtl, // 未指定时默认按数据同步任务处理
+	"etl":    TaskTypeEtl,
+	"sync":   TaskTypeEtl,
+	"sqljob": TaskTypeSqlJob,
+	"script": TaskTypeSqlJob,
+}
+
+// normalizeTaskType 将任务类型归一化为标准值，无法识别时原样返回。
+func normalizeTaskType(t TaskType) TaskType {
+	key := strings.ToLower(strings.TrimSpace(string(t)))
+	if canonical, ok := taskTypeAliases[key]; ok {
+		return canonical
+	}
+	return TaskType(key)
+}
 
 type SourceConfig struct {
 	ConnID         string        `yaml:"conn_id"`   // 优先按 conn_id 匹配数据源，为空时回退到 conn_name
@@ -583,8 +634,9 @@ func (c *Config) validateTasks(resolver DBResolver) error {
 		return fmt.Errorf("tasks cannot be empty (set 'meta_db' to load tasks from database)")
 	}
 
-	for _, t := range c.Tasks {
-		if err := validateTask(t, resolver); err != nil {
+	for i := range c.Tasks {
+		c.Tasks[i].Type = normalizeTaskType(c.Tasks[i].Type)
+		if err := validateTask(c.Tasks[i], resolver); err != nil {
 			return err
 		}
 	}
@@ -593,6 +645,36 @@ func (c *Config) validateTasks(resolver DBResolver) error {
 }
 
 func validateTask(task TaskConfig, resolver DBResolver) error {
+	switch task.Type {
+	case TaskTypeSqlJob:
+		return validateSQLJob(task.SQLJob, resolver)
+	case TaskTypeEtl:
+		return validateEtlTask(task, resolver)
+	default:
+		return fmt.Errorf("unsupported task type: %q", task.Type)
+	}
+}
+
+// validateSQLJob 校验脚本任务：需要指定连接；语句来源允许全部为空（运行时回退到运行目录下的 *.sql）。
+func validateSQLJob(job *SQLJobConfig, resolver DBResolver) error {
+	if job == nil {
+		return fmt.Errorf("sqljob must be specified for type=sqljob")
+	}
+	if job.ConnID == "" && job.ConnName == "" {
+		return fmt.Errorf("sqljob conn_id or conn_name is required")
+	}
+	if _, ok := resolver.Resolve(job.ConnID, job.ConnName); !ok {
+		return fmt.Errorf("sqljob db not found (conn_id=%q conn_name=%q)", job.ConnID, job.ConnName)
+	}
+	for i, b := range job.Blocks {
+		if strings.TrimSpace(b.SQL) == "" {
+			return fmt.Errorf("sqljob blocks[%d] (name=%q): sql is empty", i, b.Name)
+		}
+	}
+	return nil
+}
+
+func validateEtlTask(task TaskConfig, resolver DBResolver) error {
 	if task.Target == nil {
 		return fmt.Errorf("target must be specified")
 	}

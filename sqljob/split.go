@@ -13,147 +13,150 @@ import "strings"
 //
 // 返回的每条语句均已去除首尾空白，且不含末尾分号；空语句（纯注释/空白）被丢弃。
 func splitStatements(script string) []string {
-	var (
-		statements []string
-		buf        strings.Builder
-		runes      = []rune(script)
-		n          = len(runes)
-		// meaningful 标记当前缓冲区是否含有实际 SQL（非注释、非空白），
-		// 用于丢弃“仅注释/空白”的片段（如文件末尾的 `-- done`），避免把它们当语句执行。
-		meaningful bool
-	)
+	s := &splitter{runes: []rune(script)}
+	return s.run()
+}
 
-	flush := func() {
-		if meaningful {
-			if stmt := strings.TrimSpace(buf.String()); stmt != "" {
-				statements = append(statements, stmt)
-			}
-		}
-		buf.Reset()
-		meaningful = false
-	}
+// splitter 逐字符扫描 SQL 脚本，识别注释/字符串/美元引用等上下文，
+// 只在“裸露”的分号处切分语句。
+type splitter struct {
+	runes []rune
+	pos   int             // 当前扫描位置
+	buf   strings.Builder // 当前正在累积的语句
+	// meaningful 标记 buf 是否含有实际 SQL（非注释、非空白），
+	// 用于丢弃“仅注释/空白”的片段（如文件末尾的 `-- done`）。
+	meaningful bool
+	out        []string
+}
 
-	for i := 0; i < n; {
-		c := runes[i]
-
+// run 驱动扫描主循环：每一步识别当前上下文并交给对应的 consume 方法处理。
+func (s *splitter) run() []string {
+	for s.pos < len(s.runes) {
 		switch {
-		// 行注释：-- 到行尾
-		case c == '-' && i+1 < n && runes[i+1] == '-':
-			for i < n && runes[i] != '\n' {
-				buf.WriteRune(runes[i])
-				i++
-			}
-
-		// 块注释：/* ... */，支持嵌套
-		case c == '/' && i+1 < n && runes[i+1] == '*':
-			depth := 1
-			buf.WriteRune(runes[i])
-			buf.WriteRune(runes[i+1])
-			i += 2
-			for i < n && depth > 0 {
-				if runes[i] == '/' && i+1 < n && runes[i+1] == '*' {
-					depth++
-					buf.WriteRune(runes[i])
-					buf.WriteRune(runes[i+1])
-					i += 2
-				} else if runes[i] == '*' && i+1 < n && runes[i+1] == '/' {
-					depth--
-					buf.WriteRune(runes[i])
-					buf.WriteRune(runes[i+1])
-					i += 2
-				} else {
-					buf.WriteRune(runes[i])
-					i++
-				}
-			}
-
-		// 单引号字符串
-		case c == '\'':
-			meaningful = true
-			buf.WriteRune(c)
-			i++
-			for i < n {
-				if runes[i] == '\'' {
-					// '' 转义
-					if i+1 < n && runes[i+1] == '\'' {
-						buf.WriteRune(runes[i])
-						buf.WriteRune(runes[i+1])
-						i += 2
-						continue
-					}
-					buf.WriteRune(runes[i])
-					i++
-					break
-				}
-				buf.WriteRune(runes[i])
-				i++
-			}
-
-		// 双引号标识符
-		case c == '"':
-			meaningful = true
-			buf.WriteRune(c)
-			i++
-			for i < n {
-				if runes[i] == '"' {
-					if i+1 < n && runes[i+1] == '"' {
-						buf.WriteRune(runes[i])
-						buf.WriteRune(runes[i+1])
-						i += 2
-						continue
-					}
-					buf.WriteRune(runes[i])
-					i++
-					break
-				}
-				buf.WriteRune(runes[i])
-				i++
-			}
-
-		// 美元引用 $tag$ ... $tag$
-		case c == '$':
-			meaningful = true
-			if tag, ok := dollarTag(runes, i); ok {
-				// 写入起始 tag
-				buf.WriteString(tag)
-				i += len([]rune(tag))
-				// 查找匹配的结束 tag
-				closeAt := indexOfTag(runes, i, tag)
-				if closeAt < 0 {
-					// 未闭合：把剩余内容全部当作字符串写入
-					for i < n {
-						buf.WriteRune(runes[i])
-						i++
-					}
-				} else {
-					for i < closeAt {
-						buf.WriteRune(runes[i])
-						i++
-					}
-					buf.WriteString(tag)
-					i += len([]rune(tag))
-				}
-			} else {
-				buf.WriteRune(c)
-				i++
-			}
-
-		// 语句分隔符
-		case c == ';':
-			flush()
-			i++
-
+		case s.hasPrefix("--"):
+			s.consumeLineComment()
+		case s.hasPrefix("/*"):
+			s.consumeBlockComment()
+		case s.peek() == '\'' || s.peek() == '"':
+			s.consumeQuoted(s.peek())
+		case s.peek() == '$':
+			s.consumeDollar()
+		case s.peek() == ';':
+			s.flush()
+			s.pos++
 		default:
-			if !isSpace(c) {
-				meaningful = true
+			if !isSpace(s.peek()) {
+				s.meaningful = true
 			}
-			buf.WriteRune(c)
-			i++
+			s.emit(1)
 		}
 	}
+	s.flush()
+	return s.out
+}
 
-	flush()
-	return statements
+// peek 返回当前位置的字符（调用方需自行保证未越界）。
+func (s *splitter) peek() rune { return s.runes[s.pos] }
+
+// hasPrefix 判断当前位置是否以 p 开头。
+func (s *splitter) hasPrefix(p string) bool {
+	pr := []rune(p)
+	if s.pos+len(pr) > len(s.runes) {
+		return false
+	}
+	for i, r := range pr {
+		if s.runes[s.pos+i] != r {
+			return false
+		}
+	}
+	return true
+}
+
+// emit 将接下来的 n 个字符写入当前语句并前进相应位置。
+func (s *splitter) emit(n int) {
+	for k := 0; k < n && s.pos < len(s.runes); k++ {
+		s.buf.WriteRune(s.runes[s.pos])
+		s.pos++
+	}
+}
+
+// flush 结束当前语句：去除首尾空白后，若含实际内容则收集，并重置状态。
+func (s *splitter) flush() {
+	if s.meaningful {
+		if stmt := strings.TrimSpace(s.buf.String()); stmt != "" {
+			s.out = append(s.out, stmt)
+		}
+	}
+	s.buf.Reset()
+	s.meaningful = false
+}
+
+// consumeLineComment 消费 `-- ...` 直到行尾（换行符留给主循环处理）。
+func (s *splitter) consumeLineComment() {
+	for s.pos < len(s.runes) && s.peek() != '\n' {
+		s.emit(1)
+	}
+}
+
+// consumeBlockComment 消费 `/* ... */`，支持 PostgreSQL 的嵌套块注释。
+func (s *splitter) consumeBlockComment() {
+	depth := 0
+	for s.pos < len(s.runes) {
+		switch {
+		case s.hasPrefix("/*"):
+			depth++
+			s.emit(2)
+		case s.hasPrefix("*/"):
+			depth--
+			s.emit(2)
+			if depth == 0 {
+				return
+			}
+		default:
+			s.emit(1)
+		}
+	}
+}
+
+// consumeQuoted 消费以 q 为界的字符串/标识符；连续两个 q（如 ” 或 ""）视为转义。
+// 单引号字符串与双引号标识符的规则一致，故共用此方法。
+func (s *splitter) consumeQuoted(q rune) {
+	s.meaningful = true
+	s.emit(1) // 起始引号
+	for s.pos < len(s.runes) {
+		if s.peek() == q {
+			// 连续两个引号是转义，否则即为结束引号
+			if s.pos+1 < len(s.runes) && s.runes[s.pos+1] == q {
+				s.emit(2)
+				continue
+			}
+			s.emit(1)
+			return
+		}
+		s.emit(1)
+	}
+}
+
+// consumeDollar 处理美元引用 $tag$ ... $tag$；
+// 若当前 `$` 不是合法起始 tag（如参数占位符 $1），则按普通字符处理。
+func (s *splitter) consumeDollar() {
+	s.meaningful = true
+	tag, ok := dollarTag(s.runes, s.pos)
+	if !ok {
+		s.emit(1)
+		return
+	}
+	tagLen := len([]rune(tag))
+	s.emit(tagLen) // 起始 tag
+
+	closeAt := indexOfTag(s.runes, s.pos, tag)
+	if closeAt < 0 {
+		// 未闭合：把剩余内容全部并入当前语句
+		s.emit(len(s.runes) - s.pos)
+		return
+	}
+	s.emit(closeAt - s.pos) // tag 之间的内容
+	s.emit(tagLen)          // 结束 tag
 }
 
 // isSpace 判断是否为 SQL 语句间可忽略的空白字符。

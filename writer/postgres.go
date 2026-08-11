@@ -474,7 +474,8 @@ func (d *pgWriterDialect) writeIncrChunked(ctx context.Context, in <-chan transf
 			source.IncrPoint = committedWM
 		}
 		// 模拟异常，测试 retry 机制
-		return fmt.Errorf("simulated error for retry mechanism")
+		// return fmt.Errorf("simulated error for retry mechanism")
+		return nil
 	}
 
 	for batch := range in {

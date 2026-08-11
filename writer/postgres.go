@@ -442,6 +442,7 @@ func (d *pgWriterDialect) writeIncrChunked(ctx context.Context, in <-chan transf
 		totalInserted += inserted
 
 		watermark := ""
+		committedWM := ""
 		if source != nil && source.IncrField != "" {
 			maxWM, err := d.computeWatermark(ctx, currentTx, currentStaging, source)
 			if err != nil {
@@ -452,6 +453,7 @@ func (d *pgWriterDialect) writeIncrChunked(ctx context.Context, in <-chan transf
 				_ = currentTx.Rollback(ctx)
 				return err
 			}
+			committedWM = maxWM
 			watermark = " watermark=" + maxWM
 		}
 
@@ -460,7 +462,19 @@ func (d *pgWriterDialect) writeIncrChunked(ctx context.Context, in <-chan transf
 		} else {
 			log.Printf("table=%s chunk#%d: appended=%d%s", target.Table, chunkIdx, inserted, watermark)
 		}
-		return currentTx.Commit(ctx)
+
+		if err := currentTx.Commit(ctx); err != nil {
+			return err
+		}
+
+		// fix: 本块提交成功后，把内存中的水位推进到本块的最大值。
+		// 若后续块失败并触发外层 util.Retry 重跑整条 pipeline，runPipeline 会复用这个已推进的 IncrPoint，
+		// Reader 从已提交的断点续传，而不是从任务起始水位重新抽取，从而避免已成功的分片被重复导入。
+		if committedWM != "" {
+			source.IncrPoint = committedWM
+		}
+		// 模拟异常，测试 retry 机制
+		return fmt.Errorf("simulated error for retry mechanism")
 	}
 
 	for batch := range in {

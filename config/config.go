@@ -151,6 +151,26 @@ type TaskConfig struct {
 	Sources []*SourceConfig `yaml:"sources"`
 	Target  *TargetConfig   `yaml:"target"`
 	Hooks   *Hooks          `yaml:"hooks"`
+	// Transform 定义抽取后的数据转换链（在类型序列化之后、写入之前执行）。
+	// 数据默认逐列透传（Default）；列表中的每个步骤按顺序在其后叠加应用。
+	Transform []*TransformConfig `yaml:"transform"`
+}
+
+// TransformConfig 描述 transform 链中的单个转换步骤。每个步骤只应配置一种转换类型。
+type TransformConfig struct {
+	// Unpivot 配置列转行（宽表转长表）。
+	Unpivot *UnpivotConfig `yaml:"unpivot"`
+}
+
+// Validate 校验单个转换步骤的配置。
+func (t *TransformConfig) Validate() error {
+	if t == nil {
+		return fmt.Errorf("transform step must not be empty")
+	}
+	if t.Unpivot == nil {
+		return fmt.Errorf("transform step must specify a transform type (e.g. unpivot)")
+	}
+	return t.Unpivot.Validate()
 }
 
 // Hooks 定义任务的前置和后置 SQL hook。
@@ -197,6 +217,57 @@ type SourceConfig struct {
 	OrderBy        string        `yaml:"order_by"`   // OrderBy 指定查询排序字段。当 target.commit_batch_size > 0 时必须有序，框架会自动设为 src_incr_field，也可手动指定其他表达式（如 "id ASC"）。
 	// Transforms 定义字段级后处理转换规则（在类型序列化之后执行）。
 	// Transforms []FieldTransformDef `yaml:"transforms"`
+}
+
+// UnpivotConfig 配置列转行（unpivot）：把宽表中的一组列展开成两列多行。
+// 配置后，源端仍抽取宽表（读取量小），在转换阶段将指定的多列展开为两列
+// （key + value）的多行，避免在源端 SQL 中重复标识列导致源库→ETL 网络传输量成倍放大。
+// 例如 Day1..Day31 展开为 (day, value)，其余列作为标识列在每行重复保留。
+type UnpivotConfig struct {
+	// KeyField 输出中承载“列标签”的目标列名（如 "day"）。
+	KeyField string `yaml:"key_field"`
+	// ValueField 输出中承载“列值”的目标列名（如 "value"）。
+	ValueField string `yaml:"value_field"`
+	// Columns 是「宽表源列名 -> 写入 KeyField 的标签」映射。
+	// 例如 {Day1: "1", Day2: "2", ...}。未出现在此映射中的列作为标识列保留。
+	Columns map[string]string `yaml:"columns"`
+	// DropNull 为 true 时，源列值为 NULL 的展开行会被跳过（不写入目标）。
+	DropNull bool `yaml:"drop_null"`
+}
+
+// Validate 校验 unpivot 配置的完整性与字段名合法性。
+func (u *UnpivotConfig) Validate() error {
+	if u == nil {
+		return nil
+	}
+	key := strings.TrimSpace(u.KeyField)
+	value := strings.TrimSpace(u.ValueField)
+	if key == "" || value == "" {
+		return fmt.Errorf("unpivot key_field and value_field are required")
+	}
+	for _, field := range []string{key, value} {
+		if !isAllowedFieldName(field) {
+			return fmt.Errorf("unpivot field %q contains invalid characters; only letters, digits, and underscore are allowed", field)
+		}
+		if isReservedKeyword(field) {
+			return fmt.Errorf("unpivot field %q is a reserved keyword", field)
+		}
+	}
+	if key == value {
+		return fmt.Errorf("unpivot key_field and value_field must differ")
+	}
+	if len(u.Columns) == 0 {
+		return fmt.Errorf("unpivot columns must not be empty")
+	}
+	for source, label := range u.Columns {
+		if strings.TrimSpace(source) == "" {
+			return fmt.Errorf("unpivot columns contains an empty source column name")
+		}
+		if strings.TrimSpace(label) == "" {
+			return fmt.Errorf("unpivot label for source column %q is empty", source)
+		}
+	}
+	return nil
 }
 
 // FieldTransformDef defines a single field transformation rule in config.
@@ -608,6 +679,12 @@ func validateTask(task TaskConfig, resolver DBResolver) error {
 
 	if err := validateHooks(task.Hooks, resolver); err != nil {
 		return err
+	}
+
+	for i, tf := range task.Transform {
+		if err := tf.Validate(); err != nil {
+			return fmt.Errorf("transform[%d]: %w", i, err)
+		}
 	}
 
 	for _, source := range task.Sources {

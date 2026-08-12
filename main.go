@@ -233,9 +233,7 @@ func runPipeline(ctx context.Context, src *config.SourceConfig, srcDB config.DBC
 	if err != nil {
 		return fmt.Errorf("get column handlers: %w", err)
 	}
-	t := &transform.DefaultTransformer{
-		Handlers: handlers,
-	}
+	t := transform.NewTransformer(task.Transform, handlers)
 
 	// -----------------------------
 	// Pipeline

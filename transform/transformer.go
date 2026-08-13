@@ -12,18 +12,35 @@ type CSVBatch struct {
 	Rows    [][]string
 }
 
+// Transformer 是转换链的统一入口：把 reader 抽取的 RowBatch 转换为字符串 CSVBatch。
+// DefaultTransformer 完成基础的类型序列化；ChainTransformer 在其基础上按顺序叠加
+// 额外的转换步骤（如列转行）。二者都遵循该接口，pipeline 只需调用一次 Transform。
 type Transformer interface {
-	// RowBatch -> CSVBatch
 	Transform(batch reader.RowBatch) CSVBatch
 }
 
-// CSVTransformer 是链式转换步骤：在已序列化的 CSVBatch 上做进一步重塑（CSVBatch -> CSVBatch）。
-// 基座 DefaultTransformer 完成 RowBatch -> CSVBatch 的类型序列化后，
-// 额外配置的转换步骤按顺序在其结果上叠加应用。
+// CSVTransformer 是链上的转换步骤：在已序列化的 CSVBatch 上做进一步重塑（CSVBatch -> CSVBatch）。
+// 因输入输出同构而可按顺序自由串接，叠加在 DefaultTransformer 的序列化结果之后。
 type CSVTransformer interface {
-	TransformCSV(batch CSVBatch) CSVBatch
+	Transform(batch CSVBatch) CSVBatch
 }
 
+// ChainTransformer 以 DefaultTransformer 为基座，按顺序叠加若干 CSVTransformer 步骤。
+// 无额外步骤时行为等价于 DefaultTransformer（仅做序列化透传）。
+type ChainTransformer struct {
+	Base  *DefaultTransformer
+	Steps []CSVTransformer
+}
+
+func (t *ChainTransformer) Transform(batch reader.RowBatch) CSVBatch {
+	out := t.Base.Transform(batch)
+	for _, step := range t.Steps {
+		out = step.Transform(out)
+	}
+	return out
+}
+
+// DefaultTransformer 是所有任务共用的基座：把 RowBatch 按列类型逐列序列化为字符串 CSVBatch。
 type DefaultTransformer struct {
 	Handlers []reader.ColHandler
 }
@@ -38,20 +55,6 @@ func (t *DefaultTransformer) Transform(batch reader.RowBatch) CSVBatch {
 		res[i] = rec
 	}
 	return CSVBatch{Columns: batch.Columns, Rows: res}
-}
-
-// ChainTransformer 以 DefaultTransformer 为基座，按顺序叠加若干 CSVTransformer 步骤。
-type ChainTransformer struct {
-	Base  Transformer
-	Steps []CSVTransformer
-}
-
-func (t *ChainTransformer) Transform(batch reader.RowBatch) CSVBatch {
-	out := t.Base.Transform(batch)
-	for _, step := range t.Steps {
-		out = step.TransformCSV(out)
-	}
-	return out
 }
 
 // UnpivotTransformer 将宽表列转行：把 Columns 中列出的源列展开成两列（Key/Value）的多行，
@@ -71,7 +74,7 @@ type UnpivotTransformer struct {
 	warnOnce sync.Once
 }
 
-func (t *UnpivotTransformer) TransformCSV(batch CSVBatch) CSVBatch {
+func (t *UnpivotTransformer) Transform(batch CSVBatch) CSVBatch {
 	// 按当前批次的列结构解析标识列与待展开列。列结构在整个任务中稳定，
 	// 每批重算成本极低（O(列数)），且避免在并发 worker 间共享可变状态。
 	type pivotCol struct {

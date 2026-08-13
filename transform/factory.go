@@ -6,8 +6,7 @@ import (
 )
 
 // NewTransformer 根据 task 的 transform 链构造 Transformer。
-// 数据默认逐列透传（DefaultTransformer 作为基座完成类型序列化）；
-// transform 列表中的每个步骤按顺序在其结果上叠加应用。
+// 以 DefaultTransformer 为基座完成类型序列化；transform 列表中的每个步骤按顺序在其后叠加。
 // 列表为空时直接返回基座，避免链式包装的额外开销。
 func NewTransformer(cfgs []*config.TransformConfig, handlers []reader.ColHandler) Transformer {
 	base := &DefaultTransformer{Handlers: handlers}

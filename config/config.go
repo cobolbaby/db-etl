@@ -154,6 +154,26 @@ type TaskConfig struct {
 	// Transform 定义抽取后的数据转换链（在类型序列化之后、写入之前执行）。
 	// 数据默认逐列透传（Default）；列表中的每个步骤按顺序在其后叠加应用。
 	Transform []*TransformConfig `yaml:"transform"`
+	// SQLJob 仅在 Type 为 sqljob 时使用，描述一批需要在目标库串行执行的运维 SQL。
+	// 用于替代 `psql -f xxx.sql` 这类脚本任务，不涉及数据抽取/写入 pipeline。
+	SQLJob *SQLJobConfig `yaml:"sqljob"`
+}
+
+// SQLJobConfig 描述 sqljob 任务：在单个连接上串行执行一批 SQL 执行单元。
+// 每个执行单元（block 或 file）各自独立提交，重试粒度为单个执行单元。
+type SQLJobConfig struct {
+	ConnID   string     `yaml:"conn_id"`   // 优先按 conn_id 匹配数据源，为空时回退到 conn_name
+	ConnName string     `yaml:"conn_name"` // 引用 databases[].name
+	Blocks   []SQLBlock `yaml:"blocks"`    // 内联执行单元，可标注负责人/备注
+	Files    []string   `yaml:"files"`     // 外部 SQL 文件；与 blocks 均省略时默认执行运行目录下所有 *.sql
+}
+
+// SQLBlock 是一个内联的 SQL 执行单元。整个 SQL 作为一个执行单元一次性提交。
+type SQLBlock struct {
+	Name    string `yaml:"name"`    // 执行单元名称，便于日志与维护
+	Owner   string `yaml:"owner"`   // 负责人，仅作标注
+	Comment string `yaml:"comment"` // 备注，仅作标注
+	SQL     string `yaml:"sql"`     // 待执行的 SQL 文本
 }
 
 // TransformConfig 描述 transform 链中的单个转换步骤。每个步骤只应配置一种转换类型。
@@ -197,7 +217,8 @@ const (
 type TaskType string
 
 const (
-	TaskTypeEtl TaskType = "query"
+	TaskTypeEtl    TaskType = "query"
+	TaskTypeSQLJob TaskType = "sqljob"
 )
 
 type SourceConfig struct {
@@ -659,8 +680,12 @@ func (c *Config) validateTasks(resolver DBResolver) error {
 		return fmt.Errorf("tasks cannot be empty (set 'meta_db' to load tasks from database)")
 	}
 
-	for _, t := range c.Tasks {
-		if err := validateTask(t, resolver); err != nil {
+	for i := range c.Tasks {
+		// 未显式指定 type 时默认为 query（ETL 数据同步），保持向后兼容。
+		if c.Tasks[i].Type == "" {
+			c.Tasks[i].Type = TaskTypeEtl
+		}
+		if err := validateTask(c.Tasks[i], resolver); err != nil {
 			return err
 		}
 	}
@@ -669,6 +694,17 @@ func (c *Config) validateTasks(resolver DBResolver) error {
 }
 
 func validateTask(task TaskConfig, resolver DBResolver) error {
+	switch task.Type {
+	case TaskTypeSQLJob:
+		return validateSQLJob(task.SQLJob, resolver)
+	case TaskTypeEtl:
+		return validateEtlTask(task, resolver)
+	default:
+		return fmt.Errorf("unsupported task type: %q", task.Type)
+	}
+}
+
+func validateEtlTask(task TaskConfig, resolver DBResolver) error {
 	if task.Target == nil {
 		return fmt.Errorf("target must be specified")
 	}
@@ -692,6 +728,31 @@ func validateTask(task TaskConfig, resolver DBResolver) error {
 		}
 	}
 
+	return nil
+}
+
+// validateSQLJob 校验 sqljob 任务配置：连接可解析、内联 block 的 SQL 非空。
+// files 的存在性不在此校验（可能是运行目录下的相对路径），交由执行阶段处理。
+func validateSQLJob(cfg *SQLJobConfig, resolver DBResolver) error {
+	if cfg == nil {
+		return fmt.Errorf("sqljob config is required for task type %q", TaskTypeSQLJob)
+	}
+	if strings.TrimSpace(cfg.ConnID) == "" && strings.TrimSpace(cfg.ConnName) == "" {
+		return fmt.Errorf("sqljob conn_id or conn_name is required")
+	}
+	if _, ok := resolver.Resolve(cfg.ConnID, cfg.ConnName); !ok {
+		return fmt.Errorf("sqljob db not found (conn_id=%q conn_name=%q)", cfg.ConnID, cfg.ConnName)
+	}
+	for i, b := range cfg.Blocks {
+		if strings.TrimSpace(b.SQL) == "" {
+			return fmt.Errorf("sqljob blocks[%d] sql is empty", i)
+		}
+	}
+	for i, f := range cfg.Files {
+		if strings.TrimSpace(f) == "" {
+			return fmt.Errorf("sqljob files[%d] is empty", i)
+		}
+	}
 	return nil
 }
 

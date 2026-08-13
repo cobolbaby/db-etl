@@ -13,6 +13,7 @@ import (
 	"db-etl/hook"
 	"db-etl/pipeline"
 	"db-etl/reader"
+	"db-etl/sqljob"
 	"db-etl/transform"
 	"db-etl/util"
 	"db-etl/writer"
@@ -133,6 +134,11 @@ func main() {
 }
 
 func runTask(ctx context.Context, task config.TaskConfig, resolver config.DBResolver, retryCfg util.RetryConfig) error {
+	// sqljob 任务不走数据同步 pipeline，直接在目标连接上串行执行 SQL。
+	if task.Type == config.TaskTypeSQLJob {
+		return sqljob.Run(ctx, task, resolver, retryCfg)
+	}
+
 	// 执行前置 hook
 	if task.Hooks != nil && len(task.Hooks.Pre) > 0 {
 		if err := hook.RunPreHooks(ctx, task.Hooks.Pre, resolver); err != nil {

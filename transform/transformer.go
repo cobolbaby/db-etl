@@ -13,8 +13,8 @@ type CSVBatch struct {
 }
 
 // Transformer 是转换链的统一入口：把 reader 抽取的 RowBatch 转换为字符串 CSVBatch。
-// DefaultTransformer 完成基础的类型序列化；ChainTransformer 在其基础上按顺序叠加
-// 额外的转换步骤（如列转行）。二者都遵循该接口，pipeline 只需调用一次 Transform。
+// 有两个实现：DefaultTransformer 只做基础的类型序列化；ChainTransformer 在序列化
+// 结果之上再按顺序叠加额外的转换步骤（如列转行）。pipeline 对每个批次只调用一次 Transform。
 type Transformer interface {
 	Transform(batch reader.RowBatch) CSVBatch
 }
@@ -57,9 +57,10 @@ func (t *DefaultTransformer) Transform(batch reader.RowBatch) CSVBatch {
 	return CSVBatch{Columns: batch.Columns, Rows: res}
 }
 
-// UnpivotTransformer 将宽表列转行：把 Columns 中列出的源列展开成两列（Key/Value）的多行，
-// 其余列作为标识列在每个展开行中重复保留。它作用于已序列化的 CSVBatch，
-// 源端只需抽取宽表（读取量小），避免在源端 SQL 中重复标识列导致源库→ETL 网络传输量成倍放大。
+// UnpivotTransformer 将宽表列转行：把 Columns 中列出的源列展开成 KeyField/ValueField 两列的多行，
+// 其余列作为标识列在每个展开行中重复保留。它作用于已序列化的 CSVBatch。
+// 把 unpivot 放在转换阶段（而非源端 SQL）可让源端只抽宽表，避免标识列在源库→ETL 链路上
+// 随展开行数成倍重复传输。
 type UnpivotTransformer struct {
 	// KeyField 输出中承载“列标签”的列名。
 	KeyField string
@@ -75,8 +76,9 @@ type UnpivotTransformer struct {
 }
 
 func (t *UnpivotTransformer) Transform(batch CSVBatch) CSVBatch {
-	// 按当前批次的列结构解析标识列与待展开列。列结构在整个任务中稳定，
-	// 每批重算成本极低（O(列数)），且避免在并发 worker 间共享可变状态。
+	// 每批根据当前列名重新解析标识列与待展开列：转换器实例在多个 worker 间共享，
+	// 将解析结果保留为局部变量（而非缓存到字段）可避免共享可变状态、天然并发安全；
+	// 解析成本为 O(列数)，相对每批的行处理可忽略。
 	type pivotCol struct {
 		idx   int
 		label string

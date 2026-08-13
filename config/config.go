@@ -19,7 +19,7 @@ type Config struct {
 	Name        string       `yaml:"name"`
 	Comment     string       `yaml:"comment"`
 	// MetaDB 指定存放 manager.job_data_sync 配置表的数据库别名（引用 databases[].name）。
-	// 当通过 -job 参数从数据库加载任务列表时必填。
+	// 配置该项（非空）后，任务列表改为从数据库按 job_name=name 加载，而非使用 config 中的 tasks。
 	MetaDB string `yaml:"meta_db"`
 	// Retry 配置任务失败时的重试策略。
 	Retry *RetryPolicy `yaml:"retry"`
@@ -43,7 +43,7 @@ type DBConfig struct {
 	// 匹配数据源时 ID 优先级高于 Name；Name 可为空。
 	ID       string `yaml:"id"`
 	Name     string `yaml:"name"`
-	Type     DBType `yaml:"type"` // mssql / pg
+	Type     DBType `yaml:"type"` // mssql / postgres / greenplum / oracle
 	Host     string `yaml:"host"`
 	Port     int    `yaml:"port"`
 	User     string `yaml:"user"`
@@ -197,8 +197,7 @@ const (
 type TaskType string
 
 const (
-	TaskTypeEtl  TaskType = "query"
-	TaskTypeExec TaskType = "exec"
+	TaskTypeEtl TaskType = "query"
 )
 
 type SourceConfig struct {

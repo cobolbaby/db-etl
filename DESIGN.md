@@ -111,7 +111,7 @@ COMMIT
 | 技巧                                   | 原理                                                                                                                                                       |
 | -------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | TRUNCATE + COPY 同事务                 | 原子性保证：失败自动回滚，不会出现"清空了但没写入"的中间态                                                                                                 |
-| Lock Timeout 退避                      | `SET LOCAL lock_timeout = '30s'`；TRUNCATE 需要 ACCESS EXCLUSIVE 锁，若被阻塞则超时后退化为 `DELETE FROM`（仅需 ROW EXCLUSIVE 锁），避免长时间阻塞其他会话 |
+| Lock Timeout 退避                      | `SET LOCAL lock_timeout = '10s'`（默认，可由 `truncate_timeout` 覆盖）；TRUNCATE 需要 ACCESS EXCLUSIVE 锁，若被阻塞则超时后退化为 `DELETE FROM`（仅需 ROW EXCLUSIVE 锁），避免长时间阻塞其他会话 |
 | 延迟启动 `drainFirstBatch()`           | 先从 channel 取第一个非空 batch，若 Reader 无数据直接跳过，不执行无意义的 TRUNCATE                                                                         |
 | `CREATE TEMP TABLE ... ON COMMIT DROP` | Full 模式不需要 staging 表，但 Merge/Append 需要——临时表随事务结束自动清理                                                                                 |
 
@@ -137,7 +137,7 @@ COMMIT
 | Staging 中转                 | 先 COPY 到 temp table 再 `INSERT INTO ... SELECT`，比逐行 INSERT 快 1~2 个数量级         |
 | Watermark 原子更新           | 水位更新与数据写入在同一事务，保证一致性——不会出现"数据写了但水位没更新"导致重复同步     |
 | 分段提交 `commit_batch_size` | 超大表场景，每 N 个 batch 提交一次事务并推进水位；中断后从上次水位续传，避免从头同步     |
-| Watermark Fallback 链        | ① 查 `job_data_sync_v2.incr_point` → ② 查目标表 `MAX(incr_field)` → ③ 按字段名推断默认值 |
+| Watermark Fallback 链        | ① 查 `job_data_sync.incr_point` → ② 查目标表 `MAX(incr_field)` → ③ 按字段名推断默认值 |
 
 ---
 
@@ -219,16 +219,29 @@ buildReadQuery()             → 追加增量条件 + ORDER BY
 
 ## 5. Transform 层设计
 
-当前为**无状态的列级序列化**：
+Transform 层由**基座序列化**与**可选的转换步骤链**组成：
 
 ```go
+// 链入口：RowBatch -> CSVBatch
 type Transformer interface {
-    Transform(batch RowBatch) CSVBatch
+    Transform(batch reader.RowBatch) CSVBatch
+}
+
+// 链上的重塑步骤：CSVBatch -> CSVBatch（输入输出同构，可自由串接）
+type CSVTransformer interface {
+    Transform(batch CSVBatch) CSVBatch
 }
 ```
 
-- Pipeline 内使用 `min(NumCPU, 2)` 个 worker 并发执行 Transform，输出到 `csvChan`（缓冲 4）。
-- 设计为接口，未来可扩展为支持字段计算、脱敏、过滤等用户自定义逻辑。
+- **DefaultTransformer**：所有任务共用的基座，按列类型将 `any` 逐列序列化为字符串 `CSVBatch`。
+- **ChainTransformer**：以 `DefaultTransformer` 为基座，在序列化结果之上按顺序叠加若干 `CSVTransformer` 步骤；无步骤时等价于纯序列化透传。
+- **UnpivotTransformer**：已实现的转换步骤，做**列转行（宽表转长表）**——把配置的一组源列展开成 `key_field`/`value_field` 两列的多行，其余列作为标识列在每行重复保留（配置见 README 的 `transform.unpivot`）。
+
+**并发与扩展：**
+
+- Pipeline 内使用 `min(NumCPU, 2)` 个 worker 并发执行 `Transform`，输出到 `csvChan`（缓冲 4）。
+- 转换器实例在多个 worker 间共享，因此步骤内部按当前批列名重新解析布局、只用局部变量，天然并发安全。
+- 新增转换类型只需实现 `CSVTransformer` 并接入转换链，无需改动基座与 pipeline。
 
 ---
 
@@ -242,7 +255,7 @@ type Transformer interface {
 
 ```
 getWatermark()
-  → 查 job_data_sync_v2.incr_point
+  → 查 job_data_sync.incr_point
   → 若空：SELECT MAX(incr_field) FROM target_table
   → 若仍空：defaultIncrPoint(field_name)
        含 time/date/cdt/udt → "1970-01-01 00:00:00.000"

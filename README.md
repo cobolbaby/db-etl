@@ -26,7 +26,7 @@ CREATE TABLE IF NOT EXISTS manager.job_data_sync
     cdt timestamp without time zone,
     udt timestamp without time zone,
     created_by character varying(50) COLLATE pg_catalog."default",
-    modified_by character varying(50) COLLATE pg_catalog."default"
+    modified_by character varying(50) COLLATE pg_catalog."default",
     remark text COLLATE pg_catalog."default",
     inuse boolean,
     src_conn_name character varying(50) COLLATE pg_catalog."default",
@@ -45,8 +45,8 @@ TABLESPACE pg_default;
 
 ```yaml
 name: my_etl_job # 全局任务名，必填
-comment: 可选备注
-error_policy: abort # abort（默认）或 continue
+comment: 可选备注 # 仅注释用途，程序不使用
+error_policy: continue # continue（默认）或 abort
 
 databases:
   - name: source-mssql
@@ -77,8 +77,9 @@ tasks:
 ### 顶层字段
 
 - `name`：全局任务名，必填。写入 watermark 表时作为 `job_name` 的默认值（可被 `tasks[].name` 覆盖）。
-- `comment`：可选备注。
-- `error_policy`：任务失败策略，`abort`（默认，遇错立即退出）或 `continue`（跳过失败任务继续执行）。
+- `comment`：可选备注，仅作为配置注释，程序不读取也不会影响行为。
+- `error_policy`：任务失败策略，`continue`（默认，跳过失败任务继续执行）或 `abort`（遇错立即退出）。
+- `meta_db`：可选。指定存放 `manager.job_data_sync` 配置表的数据库别名（引用 `databases[].name`）。配置后任务列表改为从该库按 `job_name = name` 加载，忽略 `tasks`。
 - `databases`：数据库连接定义列表。
 - `tasks`：任务定义列表。
 
@@ -109,9 +110,9 @@ tasks:
 | --------- | --------------------------------------------------------------------------- |
 | `name`    | 任务名称，配置了 `incr_field` 时必填，写入 `manager.job_data_sync.job_name` |
 | `type`    | 任务类型，目前支持 `query`                                                  |
-| `comment` | 可选备注                                                                    |
 | `sources` | 源配置列表，见下节                                                          |
 | `target`  | 目标配置，见下节                                                            |
+| `transform` | 可选。转换步骤列表（在类型序列化之后、写入之前按顺序执行），见下节        |
 | `hooks`   | 前置/后置 SQL hook，见下节                                                  |
 
 ## `sources` 配置
@@ -154,6 +155,43 @@ tasks:
 
 - `tasks[].name` 必须配置。
 - 启用 `commit_batch_size` 时，查询必须有序（框架自动补 `ORDER BY incr_field ASC`，或手动指定 `order_by`）。
+
+## `transform` 配置
+
+`transform` 是任务级的**转换步骤列表**，在列类型序列化之后、写入目标之前按顺序执行。未配置时为纯序列化透传。目前支持的步骤类型为 `unpivot`（列转行）。
+
+```yaml
+tasks:
+  - name: daily_output
+    sources:
+      - conn_name: src_db
+        table: dbo.output_by_day
+    transform:
+      - unpivot:
+          key_field: day       # 承载“列标签”的目标列名
+          value_field: qty     # 承载“列值”的目标列名
+          drop_null: true      # 源列值为 NULL 的展开行跳过
+          columns:             # 宽表源列名 -> 写入 key_field 的标签
+            Day1: "1"
+            Day2: "2"
+            Day3: "3"
+    target:
+      conn_name: dst_db
+      table: public.output_long
+```
+
+### `unpivot`（列转行 / 宽表转长表）
+
+把宽表中一组列展开成 `key_field` / `value_field` 两列的多行：`columns` 中的每一个源列产生一行，其余未列举的列作为标识列在每行重复保留。适用于 Day1..Day31 这类周期性宽表：源端仍按宽表抽取（网络传输量小），在转换阶段才展开为长表。
+
+| 字段          | 必填 | 说明                                                                          |
+| ------------- | ---- | ----------------------------------------------------------------------------- |
+| `key_field`   | 是   | 输出中承载“列标签”的目标列名（如 `day`）；不能与 `value_field` 相同            |
+| `value_field` | 是   | 输出中承载“列值”的目标列名（如 `qty`）                                        |
+| `columns`     | 是   | 「宽表源列名 -> 写入 `key_field` 的标签」映射；未出现在此映射中的列作为标识列保留 |
+| `drop_null`   |      | 为 `true` 时，源列值为 NULL 的展开行会被跳过（默认 `false`）                    |
+
+> `key_field` / `value_field` 只允许字母、数字、下划线，且不能为保留关键字。
 
 ## `target` 配置
 
@@ -351,12 +389,21 @@ tasks:
 ## 运行
 
 ```bash
-# 单次执行（默认）
+# 使用默认的 config.yaml
 go run . -config config.yaml
 
-# 后台服务模式（每 5 分钟执行一次）
-go run . -config config.yaml -mode server -interval 5m
+# 打印版本信息
+go run . -version
 ```
+
+可用参数：
+
+| 参数       | 说明                              |
+| ---------- | --------------------------------- |
+| `-config`  | 配置文件路径，默认 `config.yaml` |
+| `-version` | 打印版本信息后退出              |
+
+> 程序为单次执行（跑完所有任务即退出）；定时调度请交由外部（如 cron）驱动。
 
 或构建后执行：
 

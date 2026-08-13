@@ -22,7 +22,7 @@ func RunPipeline(ctx context.Context, source *config.SourceConfig, r reader.Read
 	csvChan := make(chan transform.CSVBatch, 4)
 
 	var wg sync.WaitGroup
-	workers := min(runtime.NumCPU(), 2) // 4 is an empirical value, can be tuned
+	workers := min(runtime.NumCPU(), 2) // 2 is an empirical value, can be tuned
 	for i := 0; i < workers; i++ {
 		wg.Add(1)
 		go func() {

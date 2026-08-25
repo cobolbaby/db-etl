@@ -15,6 +15,7 @@ import (
 type Config struct {
 	ErrorPolicy string       `yaml:"error_policy"`
 	Databases   []DBConfig   `yaml:"databases"`
+	S3          []S3Config   `yaml:"s3"`
 	Tasks       []TaskConfig `yaml:"tasks"`
 	Name        string       `yaml:"name"`
 	Comment     string       `yaml:"comment"`
@@ -117,6 +118,7 @@ func NewDBResolver(dbs []DBConfig) DBResolver {
 }
 
 // Resolve 优先按 connID 匹配，其次按 connName 匹配；都命中不了时返回 false。
+// 返回值副本而非指针，调用方的修改不会篡改 resolver 内部持有的共享配置。
 func (r DBResolver) Resolve(connID, connName string) (DBConfig, bool) {
 	if id := strings.TrimSpace(connID); id != "" {
 		if db, ok := r.byID[id]; ok {
@@ -137,12 +139,69 @@ var dbTypeAliases = map[string]DBType{
 	"sqlserver":  DBTypeMSSQL,
 	"postgres":   DBTypePG,
 	"postgresql": DBTypePG,
-	"pg":         DBTypePG,
 	"greenplum":  DBTypeGP,
-	"gp":         DBTypeGP,
 	"oracle":     DBTypeOracle,
-	"oci":        DBTypeOracle,
-	"ora":        DBTypeOracle,
+}
+
+// S3Format 标识落地文件格式。目前仅支持 parquet。
+type S3Format string
+
+const (
+	S3FormatParquet S3Format = "parquet"
+)
+
+// S3Config 描述一个 S3 / S3 兼容对象存储落地端（含 MinIO）。
+// target 通过 s3 字段引用 s3[].name，与 conn_id/conn_name 互斥。
+// AccessKey / SecretKey 支持 ${ENV} 引用，由 ResolveSecrets 解析。
+type S3Config struct {
+	Name      string   `yaml:"name"`
+	Format    S3Format `yaml:"format"`     // 目前仅 parquet，空值按 parquet 处理
+	Endpoint  string   `yaml:"endpoint"`   // S3 端点，如 s3.<region>.amazonaws.com 或 minio.internal:9000
+	Region    string   `yaml:"region"`     // 区域，S3 兼容存储可留空
+	Bucket    string   `yaml:"bucket"`     // 目标 bucket（必填）
+	Prefix    string   `yaml:"prefix"`     // 对象 key 前缀，可为空
+	AccessKey string   `yaml:"access_key"` // 访问密钥（支持 ${ENV}）
+	SecretKey string   `yaml:"secret_key"` // 私有密钥（支持 ${ENV}）
+	UseSSL    bool     `yaml:"use_ssl"`    // 是否走 https
+}
+
+// Validate 校验 s3 存储配置的完整性。
+func (s S3Config) Validate() error {
+	if strings.TrimSpace(s.Name) == "" {
+		return fmt.Errorf("s3 storage name is required")
+	}
+	if s.Format != "" && s.Format != S3FormatParquet {
+		return fmt.Errorf("unsupported s3 format %q for storage %q", s.Format, s.Name)
+	}
+	if strings.TrimSpace(s.Endpoint) == "" {
+		return fmt.Errorf("s3 storage %q: endpoint is required", s.Name)
+	}
+	if strings.TrimSpace(s.Bucket) == "" {
+		return fmt.Errorf("s3 storage %q: bucket is required", s.Name)
+	}
+	return nil
+}
+
+// S3Resolver 按 name 解析 S3Config。
+type S3Resolver struct {
+	byName map[string]S3Config
+}
+
+// NewS3Resolver 基于 s3 列表构建解析器。
+func NewS3Resolver(list []S3Config) S3Resolver {
+	r := S3Resolver{byName: make(map[string]S3Config, len(list))}
+	for _, s := range list {
+		if name := strings.TrimSpace(s.Name); name != "" {
+			r.byName[name] = s
+		}
+	}
+	return r
+}
+
+// Resolve 按 name 匹配 s3 存储，命中不了时返回 false。
+func (r S3Resolver) Resolve(name string) (S3Config, bool) {
+	s, ok := r.byName[strings.TrimSpace(name)]
+	return s, ok
 }
 
 type TaskConfig struct {
@@ -151,8 +210,8 @@ type TaskConfig struct {
 	Sources []*SourceConfig `yaml:"sources"`
 	Target  *TargetConfig   `yaml:"target"`
 	Hooks   *Hooks          `yaml:"hooks"`
-	// Transform 定义抽取后的数据转换链（在类型序列化之后、写入之前执行）。
-	// 数据默认逐列透传（Default）；列表中的每个步骤按顺序在其后叠加应用。
+	// Transform 定义抽取后的数据转换链（在 reader 之后、writer 之前执行）。
+	// 数据默认逐列透传；列表中的每个步骤按顺序在其后叠加应用。
 	Transform []*TransformConfig `yaml:"transform"`
 }
 
@@ -509,6 +568,7 @@ func (s *SourceConfig) normalize() {
 type TargetConfig struct {
 	ConnID    string   `yaml:"conn_id"`   // 优先按 conn_id 匹配数据源，为空时回退到 conn_name
 	ConnName  string   `yaml:"conn_name"` // 引用 databases[].name
+	S3        string   `yaml:"s3"`        // 引用 s3[].name，与 conn_id/conn_name 互斥
 	Table     string   `yaml:"table"`
 	Mode      ModeType `yaml:"mode"`
 	IncrField string
@@ -599,7 +659,12 @@ func (c *Config) Validate() error {
 		return err
 	}
 
-	if err := c.validateTasks(resolver); err != nil {
+	s3Resolver, err := c.validateS3()
+	if err != nil {
+		return err
+	}
+
+	if err := c.validateTasks(resolver, s3Resolver); err != nil {
 		return err
 	}
 
@@ -654,14 +719,35 @@ func (c *Config) validateDatabases() (DBResolver, error) {
 	return NewDBResolver(c.Databases), nil
 }
 
-func (c *Config) validateTasks(resolver DBResolver) error {
+// validateS3 校验 s3 段并构建 S3Resolver。
+func (c *Config) validateS3() (S3Resolver, error) {
+	seen := make(map[string]struct{}, len(c.S3))
+	for i := range c.S3 {
+		s := &c.S3[i]
+		name := strings.TrimSpace(s.Name)
+		// Format 默认 parquet。
+		if s.Format == "" {
+			s.Format = S3FormatParquet
+		}
+		if err := s.Validate(); err != nil {
+			return S3Resolver{}, err
+		}
+		if _, dup := seen[name]; dup {
+			return S3Resolver{}, fmt.Errorf("duplicate s3 storage name %q", name)
+		}
+		seen[name] = struct{}{}
+	}
+	return NewS3Resolver(c.S3), nil
+}
+
+func (c *Config) validateTasks(resolver DBResolver, s3Resolver S3Resolver) error {
 
 	if len(c.Tasks) == 0 && c.MetaDB == "" {
 		return fmt.Errorf("tasks cannot be empty (set 'meta_db' to load tasks from database)")
 	}
 
 	for _, t := range c.Tasks {
-		if err := validateTask(t, resolver); err != nil {
+		if err := validateTask(t, resolver, s3Resolver); err != nil {
 			return err
 		}
 	}
@@ -669,11 +755,11 @@ func (c *Config) validateTasks(resolver DBResolver) error {
 	return nil
 }
 
-func validateTask(task TaskConfig, resolver DBResolver) error {
+func validateTask(task TaskConfig, resolver DBResolver, s3Resolver S3Resolver) error {
 	if task.Target == nil {
 		return fmt.Errorf("target must be specified")
 	}
-	if err := validateTarget(task.Target, resolver); err != nil {
+	if err := validateTarget(task.Target, resolver, s3Resolver); err != nil {
 		return err
 	}
 
@@ -742,12 +828,14 @@ func validateHooks(hooks *Hooks, resolver DBResolver) error {
 	return nil
 }
 
-func validateTarget(target *TargetConfig, resolver DBResolver) error {
-	if target.ConnID == "" && target.ConnName == "" {
-		return fmt.Errorf("target conn_id or conn_name is required")
+func validateTarget(target *TargetConfig, resolver DBResolver, s3Resolver S3Resolver) error {
+	hasDB := strings.TrimSpace(target.ConnID) != "" || strings.TrimSpace(target.ConnName) != ""
+	hasS3 := strings.TrimSpace(target.S3) != ""
+	if hasDB && hasS3 {
+		return fmt.Errorf("target cannot set both s3 and conn_id/conn_name")
 	}
-	if _, ok := resolver.Resolve(target.ConnID, target.ConnName); !ok {
-		return fmt.Errorf("target db not found (conn_id=%q conn_name=%q)", target.ConnID, target.ConnName)
+	if !hasDB && !hasS3 {
+		return fmt.Errorf("target conn_id/conn_name or s3 is required")
 	}
 	if strings.TrimSpace(target.Table) == "" {
 		return fmt.Errorf("target table is required")
@@ -755,10 +843,23 @@ func validateTarget(target *TargetConfig, resolver DBResolver) error {
 	if _, ok := supportedTargetModes[target.Mode]; !ok {
 		return fmt.Errorf("unsupported target mode: %s", target.Mode)
 	}
-	// merge 模式依赖主键做 DELETE + INSERT，pk 为空属于结构性配置错误，
-	// 必须在加载阶段就 fail-fast，避免跑到 writer 才报错并被无谓重试。
+	// merge 模式依赖主键做 DELETE + INSERT（DB）或供下游去重（对象存储），
+	// pk 为空属结构性配置错误，必须在加载阶段就 fail-fast。
 	if target.Mode == ModeTypeMerge && strings.TrimSpace(target.PK) == "" {
 		return fmt.Errorf("pk is required for merge mode (target table %q)", target.Table)
+	}
+
+	// s3 目标（对象存储）：类型相关校验已在 validateS3 完成，这里只校验引用可解析。
+	if hasS3 {
+		if _, ok := s3Resolver.Resolve(target.S3); !ok {
+			return fmt.Errorf("target s3 %q not found", target.S3)
+		}
+		return nil
+	}
+
+	// DB 目标。
+	if _, ok := resolver.Resolve(target.ConnID, target.ConnName); !ok {
+		return fmt.Errorf("target db not found (conn_id=%q conn_name=%q)", target.ConnID, target.ConnName)
 	}
 	// TruncateTimeout 未配置时使用默认值
 	if target.TruncateTimeout == 0 {
@@ -766,6 +867,7 @@ func validateTarget(target *TargetConfig, resolver DBResolver) error {
 	}
 	return nil
 }
+
 
 func validateSource(source *SourceConfig, target *TargetConfig, resolver DBResolver) error {
 	if source == nil {
@@ -801,6 +903,12 @@ func validateSource(source *SourceConfig, target *TargetConfig, resolver DBResol
 
 	if source.BatchSize <= 0 {
 		source.BatchSize = 10000
+	}
+
+	// 增量模式（append/merge）以 incr_field 为水位字段界定抽取区间，缺失则无从判断增量起点，
+	// 会退化为每次全量重抽；属结构性配置错误，在加载阶段 fail-fast。
+	if target != nil && (target.Mode == ModeTypeAppend || target.Mode == ModeTypeMerge) && strings.TrimSpace(source.IncrField) == "" {
+		return fmt.Errorf("incr_field is required for %s mode", target.Mode)
 	}
 
 	if target.CommitBatchSize > 0 {

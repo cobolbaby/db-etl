@@ -19,7 +19,7 @@ func RunPipeline(ctx context.Context, source *config.SourceConfig, r reader.Read
 	defer cancel()
 
 	rowChan := r.ReadBatch(ctx, cancel)
-	csvChan := make(chan transform.CSVBatch, 4)
+	batchChan := make(chan transform.Batch, 4)
 
 	var wg sync.WaitGroup
 	workers := min(runtime.NumCPU(), 2) // 4 is an empirical value, can be tuned
@@ -29,7 +29,7 @@ func RunPipeline(ctx context.Context, source *config.SourceConfig, r reader.Read
 			defer wg.Done()
 			for batch := range rowChan {
 				select {
-				case csvChan <- t.Transform(batch):
+				case batchChan <- t.Transform(batch):
 				case <-ctx.Done():
 					return
 				}
@@ -39,10 +39,10 @@ func RunPipeline(ctx context.Context, source *config.SourceConfig, r reader.Read
 
 	go func() {
 		wg.Wait()
-		close(csvChan)
+		close(batchChan)
 	}()
 
-	werr := w.WriteBatch(ctx, source, csvChan)
+	werr := w.WriteBatch(ctx, source, batchChan)
 
 	// reader 错误优先：它是根因，且会通过 cancel 触发 writer 的 context.Canceled。
 	if rerr := r.Err(); rerr != nil {

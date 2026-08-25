@@ -74,33 +74,42 @@ func TestFieldsMappingRejectsNonObjectJSON(t *testing.T) {
 }
 
 func TestFieldsMappingValidateReturnsWarnings(t *testing.T) {
-	mapping := FieldsMapping{Items: map[string]string{
-		"plain_field":   "target_field",
-		"source.field":  "target_field_two",
-		"now()":         "cdt",
-		"Another-Field": "target_name_three",
-	}}
-
-	var logged strings.Builder
-	originalWriter := log.Writer()
-	log.SetOutput(&logged)
-	defer log.SetOutput(originalWriter)
-
-	if err := mapping.Validate(); err != nil {
-		t.Fatalf("Validate returned error: %v", err)
+	// 告警只针对「会被 reader 当作限定名/表达式而不加引号」的源字段。
+	// 含空格、连字符等字符的列名仍会被 isColumnIdentifier 识别为纯列名并加引号，
+	// 属于可正常工作的场景，不应打扰用户。
+	cases := []struct {
+		source   string
+		wantWarn bool
+		reason   string
+	}{
+		{source: "plain_field", wantWarn: false, reason: "纯标识符"},
+		{source: "now()", wantWarn: false, reason: "函数调用，圆括号已表明是表达式"},
+		{source: "price - cost", wantWarn: false, reason: "算术表达式"},
+		{source: "Another-Field", wantWarn: false, reason: "连字符与减号无法区分，reader 会加引号，故不告警"},
+		{source: "source.field", wantWarn: true, reason: "点号会被当作限定名，不会加引号"},
+		{source: "order#id", wantWarn: true, reason: "特殊字符既非表达式也非合法标识符"},
 	}
-	joined := logged.String()
 
-	if strings.Contains(joined, `source field "now()"`) {
-		t.Fatalf("expression source should not warn, got %q", joined)
-	}
-	for _, want := range []string{
-		`source field "source.field" contains special characters`,
-		`source field "Another-Field" contains special characters`,
-	} {
-		if !strings.Contains(joined, want) {
-			t.Fatalf("warnings %q does not contain %q", joined, want)
-		}
+	for _, tc := range cases {
+		t.Run(tc.source, func(t *testing.T) {
+			mapping := FieldsMapping{Items: map[string]string{tc.source: "target_field"}}
+
+			var logged strings.Builder
+			originalWriter := log.Writer()
+			log.SetOutput(&logged)
+			defer log.SetOutput(originalWriter)
+
+			if err := mapping.Validate(); err != nil {
+				t.Fatalf("Validate returned error: %v", err)
+			}
+
+			warned := strings.Contains(logged.String(),
+				`source field "`+tc.source+`" contains special characters`)
+			if warned != tc.wantWarn {
+				t.Fatalf("source %q (%s): warned=%v, want %v; log=%q",
+					tc.source, tc.reason, warned, tc.wantWarn, logged.String())
+			}
+		})
 	}
 }
 

@@ -4,10 +4,8 @@ import (
 	"database/sql"
 	"db-etl/config"
 	"db-etl/util"
-	"encoding/hex"
 	"fmt"
 	"strings"
-	"time"
 
 	"github.com/google/uuid"
 )
@@ -66,46 +64,47 @@ func (mssqlDialect) wrapError(err error) error {
 	return util.WrapMSSQLError(err)
 }
 
-func (mssqlDialect) getColumnHandler(dbType string) ColHandler {
+// columnKind 将 SQL Server 的类型名映射到归一化语义类别。
+func (mssqlDialect) columnKind(dbType string) ColumnKind {
 	switch strings.ToUpper(dbType) {
-	case "UNIQUEIDENTIFIER":
-		return func(v any) string {
-			switch t := v.(type) {
-			case []byte:
-				s, _ := MSSQLUUIDToString(t)
-				return s
-			case string:
-				return strings.ToUpper(t)
-			default:
-				return defaultColumnHandler(v)
-			}
-		}
-	case "DATETIME", "DATETIME2", "DATE", "TIME":
-		return func(v any) string {
-			if v == nil {
-				return util.NullSentinel
-			}
-			if t, ok := v.(time.Time); ok {
-				return t.Format("2006-01-02 15:04:05.999999999")
-			}
-			return defaultColumnHandler(v)
-		}
-	case "IMAGE", "VARBINARY", "BINARY":
-		// PostgreSQL bytea 在 COPY CSV 中使用 \x 十六进制格式
-		return func(v any) string {
-			if v == nil {
-				return util.NullSentinel
-			}
-			if b, ok := v.([]byte); ok {
-				if len(b) == 0 {
-					return `\x`
-				}
-				return `\x` + hex.EncodeToString(b)
-			}
-			return defaultColumnHandler(v)
-		}
+	case "BIT":
+		return KindBool
+	case "TINYINT", "SMALLINT", "INT", "BIGINT":
+		return KindInt
+	case "REAL", "FLOAT":
+		return KindFloat
+	case "DATETIME", "DATETIME2", "SMALLDATETIME", "DATE", "TIME", "DATETIMEOFFSET":
+		return KindTime
+	case "BINARY", "VARBINARY", "IMAGE", "TIMESTAMP", "ROWVERSION":
+		// 注意：SQL Server 的 TIMESTAMP 是行版本戳（8 字节二进制），与时间无关。
+		return KindBytes
 	default:
-		return defaultColumnHandler
+		// DECIMAL/NUMERIC/MONEY 按字符串透传以免精度损失；
+		// UNIQUEIDENTIFIER 经 valueNormalizer 归一为 UUID 文本；其余文本类同理。
+		return KindString
+	}
+}
+
+// valueNormalizer 修正 uniqueidentifier 的字节序。
+// go-mssqldb 以 SQL Server 的混合字节序返回该类型的 16 字节值，
+// 需按 RFC 4122 重排后才是通用的 UUID 文本。
+func (mssqlDialect) valueNormalizer(dbType string) ValueNormalizer {
+	if strings.ToUpper(dbType) != "UNIQUEIDENTIFIER" {
+		return nil
+	}
+	return func(v any) any {
+		switch t := v.(type) {
+		case []byte:
+			s, err := MSSQLUUIDToString(t)
+			if err != nil {
+				return v
+			}
+			return s
+		case string:
+			return strings.ToUpper(t)
+		default:
+			return v
+		}
 	}
 }
 

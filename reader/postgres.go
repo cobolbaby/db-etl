@@ -6,7 +6,6 @@ import (
 	"db-etl/util"
 	"fmt"
 	"strings"
-	"time"
 )
 
 type PGReader struct {
@@ -50,43 +49,35 @@ func (pgDialect) wrapError(err error) error {
 	return util.WrapPgError(err)
 }
 
-func (pgDialect) getColumnHandler(dbType string) ColHandler {
+// columnKind 将 PostgreSQL / Greenplum 的类型名映射到归一化语义类别。
+func (pgDialect) columnKind(dbType string) ColumnKind {
 	upper := strings.ToUpper(dbType)
 
-	// PostgreSQL 数组类型在 pgx 中统一以 "_" 前缀命名（_int4、_text、_timestamp、_numeric ...），
-	// 因此 DatabaseTypeName 对数组列会返回形如 "_INT4"、"_TEXT" 的名称。
-	// 显式识别数组并交给专用 handler，避免依赖 default 分支的隐式行为，
-	// 也为将来定制数组序列化（例如转 JSON）预留唯一入口。
+	// PostgreSQL 数组类型在 pgx 中统一以 "_" 前缀命名（_int4、_text、_timestamp、_numeric ...）。
+	// pgx stdlib 以文本字面量（如 {1,2,3}）返回数组，正是 COPY 能识别的数组输入语法，
+	// 故按字符串原样透传；前提是目标列为相同元素类型的数组。
 	if strings.HasPrefix(upper, "_") {
-		return pgArrayColumnHandler
+		return KindString
 	}
 
 	switch upper {
-
-	case "TIMESTAMP", "TIMESTAMPTZ", "DATETIME", "DATE", "TIME", "TIMETZ":
-		return func(v any) string {
-			if v == nil {
-				return util.NullSentinel
-			}
-			if t, ok := v.(time.Time); ok {
-				return t.Format("2006-01-02 15:04:05.000000")
-			}
-			return defaultColumnHandler(v)
-		}
+	case "BOOL":
+		return KindBool
+	case "INT2", "INT4", "INT8", "SMALLINT", "INTEGER", "BIGINT",
+		"SERIAL", "BIGSERIAL", "SMALLSERIAL":
+		return KindInt
+	case "FLOAT4", "FLOAT8", "REAL", "DOUBLE PRECISION":
+		return KindFloat
+	case "TIMESTAMP", "TIMESTAMPTZ", "DATE", "TIME", "TIMETZ":
+		return KindTime
+	case "BYTEA":
+		return KindBytes
 	default:
-		return defaultColumnHandler
+		// NUMERIC/DECIMAL/MONEY 由 pgx 以文本返回，按字符串透传以免精度损失；
+		// VARCHAR/TEXT/UUID/JSON/JSONB 等文本类同理。
+		return KindString
 	}
 }
 
-// pgArrayColumnHandler 显式处理 PostgreSQL 数组列。
-//
-// pgx stdlib 驱动以文本格式返回数组字面量（如 {1,2,3}、{"a,b",c}、{}），
-// 这正是 PostgreSQL COPY 能识别的数组输入语法，因此原样透传即可保证往返闭合：
-//   - nil（SQL NULL） → NullSentinel，COPY 识别为真正的 NULL
-//   - 字面量字符串     → SanitizeString 做 CSV 转义（含逗号的 {1,2,3} 会被引号包裹）
-//
-// 前提：目标列须为相同元素类型的数组类型；否则字面量会作为普通文本入库。
-// 若日后需要改变数组的落地形态（例如转成 jsonb 的 [1,2,3]），在此函数内改写即可。
-func pgArrayColumnHandler(v any) string {
-	return defaultColumnHandler(v)
-}
+// valueNormalizer PostgreSQL 驱动返回的值已符合各 ColumnKind 的约定，无需修正。
+func (pgDialect) valueNormalizer(string) ValueNormalizer { return nil }

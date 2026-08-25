@@ -4,10 +4,8 @@ import (
 	"database/sql"
 	"db-etl/config"
 	"db-etl/util"
-	"encoding/hex"
 	"fmt"
 	"strings"
-	"time"
 )
 
 type OracleReader struct {
@@ -56,43 +54,26 @@ func (oracleDialect) wrapError(err error) error {
 	return util.WrapOracleError(err)
 }
 
-func (oracleDialect) getColumnHandler(dbType string) ColHandler {
+// columnKind 将 Oracle 的类型名映射到归一化语义类别。
+func (oracleDialect) columnKind(dbType string) ColumnKind {
 	upper := strings.ToUpper(dbType)
 
 	// 二进制类型（RAW / LongRaw / BLOB）：go-ora 以 []byte 返回，
 	// 默认 LOB 内联模式下 BLOB 列的类型名会呈现为 LONGRAW。
-	// 统一转成 PostgreSQL bytea 在 COPY CSV 中识别的 \x 十六进制格式。
 	if strings.Contains(upper, "RAW") || strings.Contains(upper, "BLOB") {
-		return func(v any) string {
-			if v == nil {
-				return util.NullSentinel
-			}
-			if b, ok := v.([]byte); ok {
-				if len(b) == 0 {
-					return `\x`
-				}
-				return `\x` + hex.EncodeToString(b)
-			}
-			return defaultColumnHandler(v)
-		}
+		return KindBytes
 	}
 
-	// 日期/时间类型：go-ora 以 time.Time 返回。
-	// DATE、TIMESTAMP、TIMESTAMP WITH [LOCAL] TIME ZONE 等在类型名中均含 DATE/TIMESTAMP/TIMETZ。
-	// 保留至纳秒的小数秒精度（尾随零自动去除），覆盖 Oracle TIMESTAMP(9)。
+	// DATE、TIMESTAMP、TIMESTAMP WITH [LOCAL] TIME ZONE 等在类型名中均含 DATE/TIMESTAMP/TIMETZ，
+	// go-ora 一律以 time.Time 返回。
 	if upper == "DATE" || strings.Contains(upper, "TIMESTAMP") || strings.Contains(upper, "TIMETZ") {
-		return func(v any) string {
-			if v == nil {
-				return util.NullSentinel
-			}
-			if t, ok := v.(time.Time); ok {
-				return t.Format("2006-01-02 15:04:05.999999999")
-			}
-			return defaultColumnHandler(v)
-		}
+		return KindTime
 	}
 
-	// NUMBER 由 go-ora 以字符串返回（完整精度，无 float64 精度损失）；
-	// VARCHAR2/CHAR/NCHAR/CLOB/LONG 等亦为字符串，统一交由默认处理器。
-	return defaultColumnHandler
+	// NUMBER 由 go-ora 以字符串返回（完整精度，无 float64 精度损失），按字符串透传；
+	// VARCHAR2/CHAR/NCHAR/CLOB/LONG 等文本类同理。
+	return KindString
 }
+
+// valueNormalizer Oracle 驱动返回的值已符合各 ColumnKind 的约定，无需修正。
+func (oracleDialect) valueNormalizer(string) ValueNormalizer { return nil }

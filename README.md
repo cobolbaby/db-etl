@@ -26,7 +26,7 @@ CREATE TABLE IF NOT EXISTS manager.job_data_sync
     cdt timestamp without time zone,
     udt timestamp without time zone,
     created_by character varying(50) COLLATE pg_catalog."default",
-    modified_by character varying(50) COLLATE pg_catalog."default"
+    modified_by character varying(50) COLLATE pg_catalog."default",
     remark text COLLATE pg_catalog."default",
     inuse boolean,
     src_conn_name character varying(50) COLLATE pg_catalog."default",
@@ -80,7 +80,21 @@ tasks:
 - `comment`：可选备注。
 - `error_policy`：任务失败策略，`abort`（默认，遇错立即退出）或 `continue`（跳过失败任务继续执行）。
 - `databases`：数据库连接定义列表。
+- `s3`：对象存储落地端定义列表，供 `target.s3` 引用。
+- `meta_db`：存放 `manager.job_data_sync` 的数据库别名（引用 `databases[].name`）。配置后任务列表改从该表按 `name` 加载，而非使用 `tasks`；未配置时不回写水位。
+- `retry`：失败重试策略（按 source 粒度），见下。
 - `tasks`：任务定义列表。
+
+### `retry`
+
+```yaml
+retry:
+  max_attempts: 3 # 总尝试次数（含首次），默认 3
+  delay_seconds: 5 # 初始退避延迟（秒），默认 5
+  max_delay_seconds: 60 # 退避延迟上限（秒），默认 60
+```
+
+数据错误、约束冲突、SQL 语法错误等不可重试类型会直接失败，不消耗重试次数。
 
 ### `databases`
 
@@ -101,18 +115,52 @@ tasks:
 | `statement_timeout` | 语句执行超时（秒），0 表示不限制                                                                 |
 | `timezone`          | 固定写入端 PostgreSQL 会话时区，如 `UTC`、`+08`                                                  |
 
+### `s3`
+
+对象存储（S3 / MinIO 等 S3 兼容服务）落地端定义列表。
+
+```yaml
+s3:
+  - name: lake
+    format: parquet # 目前仅支持 parquet，留空同义
+    endpoint: minio.internal:9000
+    bucket: ods
+    prefix: db-etl/ # 可选，对象 key 前缀
+    access_key: ${S3_ACCESS_KEY}
+    secret_key: ${S3_SECRET_KEY}
+    use_ssl: false
+```
+
+| 字段         | 必填 | 说明                                                             |
+| ------------ | ---- | ---------------------------------------------------------------- |
+| `name`       | ✅   | 存储别名，供 `target.s3` 引用                                    |
+| `format`     |      | 落地格式，目前仅 `parquet`（空值按 `parquet` 处理）              |
+| `endpoint`   | ✅   | S3 端点，如 `s3.<region>.amazonaws.com` 或 `minio.internal:9000` |
+| `region`     |      | 区域，S3 兼容存储可留空                                          |
+| `bucket`     | ✅   | 目标 bucket                                                      |
+| `prefix`     |      | 对象 key 前缀                                                    |
+| `access_key` |      | 访问密钥，支持 `${ENV}` 引用                                     |
+| `secret_key` |      | 私有密钥，支持 `${ENV}` 引用                                     |
+| `use_ssl`    |      | 是否走 https，默认 `false`                                       |
+
+对象 key 由 `target.table` 推导，且是确定性的（不含时间戳），便于中断重跑时覆盖同名对象：
+
+- 非增量模式：`<prefix>/<table>.parquet`
+- 增量模式：`<prefix>/<table>_<incr_point>.parquet`
+
+其中 `<table>` / `<incr_point>` 会做安全化处理：仅保留字母、数字、`_`、`-`，其余字符（`.`、`/`、空格、`:` 等）替换为 `_`。例如 `ods.orders` → `ods_orders.parquet`。
+
 ### `tasks`
 
 任务定义列表。每个任务将多个 `sources` 的数据写入一个 `target`。
 
 | 字段      | 说明                                                                        |
-| --------- | --------------------------------------------------------------------------- |
+| --------- | --------------------------------------------------------------------------- | --- | ----------- | ---------------------------------------- | --- | ------- | -------------------------- |
 | `name`    | 任务名称，配置了 `incr_field` 时必填，写入 `manager.job_data_sync.job_name` |
 | `type`    | 任务类型，目前支持 `query`                                                  |
 | `comment` | 可选备注                                                                    |
 | `sources` | 源配置列表，见下节                                                          |
-| `target`  | 目标配置，见下节                                                            |
-| `hooks`   | 前置/后置 SQL hook，见下节                                                  |
+| `target`  | 目标配置，见下节                                                            |     | `transform` | 转换链，在写入前对数据做结构重塑，见下节 |     | `hooks` | 前置/后置 SQL hook，见下节 |
 
 ## `sources` 配置
 
@@ -155,13 +203,53 @@ tasks:
 - `tasks[].name` 必须配置。
 - 启用 `commit_batch_size` 时，查询必须有序（框架自动补 `ORDER BY incr_field ASC`，或手动指定 `order_by`）。
 
+## `transform` 配置
+
+`transform` 是 `tasks[]` 下的转换步骤列表，在 reader 之后、writer 之前按顺序执行。每个步骤只能指定一种转换类型，目前支持 `unpivot`。
+
+### `unpivot`（列转行）
+
+把宽表中的一组列展开成 `key + value` 两列多行，其余列作为标识列逐行重复保留。
+展开在 ETL 侧完成，源端仍按宽表抽取，避免在源端 SQL 里用 `UNION ALL` 重复标识列导致传输量成倍放大。
+
+```yaml
+tasks:
+  - name: monthly_plan_sync
+    sources:
+      - conn_name: source-mssql
+        table: dbo.monthly_plan
+    transform:
+      - unpivot:
+          key_field: day # 承载「列标签」的目标列名
+          value_field: qty # 承载「列值」的目标列名
+          drop_null: true # 源列值为 NULL 时跳过该行，默认 false
+          columns: # 源列名 -> 写入 key_field 的标签
+            Day1: "1"
+            Day2: "2"
+            Day3: "3"
+    target:
+      conn_name: target-pg
+      table: ods.monthly_plan_long
+      mode: full
+```
+
+| 字段          | 必填 | 说明                                                             |
+| ------------- | ---- | ---------------------------------------------------------------- |
+| `key_field`   | ✅   | 输出中承载列标签的目标列名，仅允许字母/数字/下划线，不得为保留字 |
+| `value_field` | ✅   | 输出中承载列值的目标列名，同上，且不能与 `key_field` 相同        |
+| `columns`     | ✅   | 「宽表源列名 -> 标签」映射；未出现在映射中的列作为标识列保留     |
+| `drop_null`   |      | 为 `true` 时跳过源列值为 NULL 的展开行                           |
+
+> `value_field` 汇聚的是多个异构源列的取值，因此统一以文本输出（时间采用 `2006-01-02 15:04:05.999999999` 格式）。源列为 NULL 时仍保持 NULL。
+
 ## `target` 配置
 
 | 字段                | 必填         | 说明                                                                                                                       |
 | ------------------- | ------------ | -------------------------------------------------------------------------------------------------------------------------- |
-| `conn_id`           | 二选一       | 引用 `databases[].id`；与 `conn_name` 至少填一个，优先级高于 `conn_name`                                                   |
-| `conn_name`         | 二选一       | 引用 `databases[].name`                                                                                                    |
-| `table`             | ✅           | 目标表，建议使用 `schema.table` 格式                                                                                       |
+| `conn_id`           | 三选一       | 引用 `databases[].id`；与 `conn_name` 至少填一个，优先级高于 `conn_name`                                                   |
+| `conn_name`         | 三选一       | 引用 `databases[].name`                                                                                                    |
+| `s3`                | 三选一       | 引用 `s3[].name`，写入对象存储（parquet）；与 `conn_id` / `conn_name` 互斥                                                 |
+| `table`             | ✅           | 目标表，建议使用 `schema.table` 格式；写 S3 时用于推导对象 key                                                             |
 | `mode`              | ✅           | 写入模式，见下节                                                                                                           |
 | `pk`                | merge 时必填 | 主键列列表，多列用逗号分隔，如 `id` 或 `id,tenant_id`                                                                      |
 | `commit_batch_size` |              | 分段提交粒度（批次数），`0` 表示整个任务在单个事务中完成（默认）；设置后每 N 个 batch 提交一次事务并更新水位，适用于超大表 |
@@ -175,6 +263,10 @@ tasks:
 | `full`    | 先清空目标表，再将本次抽取结果全量覆盖写入                                                                                                                      |
 | `append`  | 与 `initial` 一样追加写入，但要求 `incr_field`，并在写入后更新水位                                                                                              |
 | `merge`   | 先写入临时表，再按 `pk` 做 DELETE + INSERT（支持增量 upsert）                                                                                                   |
+
+> 目标为 `s3` 时，`initial` / `full` 写入单个覆盖式对象，`append` / `merge` 按本次起点水位写入独立对象。
+> 对象存储无法按 pk 原地删除/更新，故 `merge` 行为与 `append` 一致，**去重需由下游查询处理**；
+> 幂等性由确定性对象 key 覆盖保证。
 
 ## `hooks` 配置
 
@@ -316,6 +408,30 @@ tasks:
             sql: "ANALYZE ods.orders"
 ```
 
+### 6. Table → S3 Parquet
+
+```yaml
+s3:
+  - name: lake
+    endpoint: minio.internal:9000
+    bucket: ods
+    prefix: db-etl/
+    access_key: ${S3_ACCESS_KEY}
+    secret_key: ${S3_SECRET_KEY}
+
+tasks:
+  - name: orders_to_lake
+    type: query
+    sources:
+      - conn_name: "source-mssql"
+        table: "dbo.orders"
+        batch_size: 20000
+    target:
+      s3: "lake" # 引用 s3[].name，与 conn_name 互斥
+      table: "ods.orders" # 用于推导对象 key：db-etl/ods_orders.parquet
+      mode: full
+```
+
 ## Watermark 说明
 
 当 source 配置了 `incr_field` 时，程序会读写 `manager.job_data_sync` 表来记录同步进度（水位）。
@@ -348,14 +464,16 @@ tasks:
 2. 若无记录或为空 → 查目标表 `MAX(incr_field)`
 3. 若目标表也无数据 → 根据字段名推断兜底值（时间类字段返回 `1970-01-01 00:00:00.000`，其他返回 `1`）
 
+> 水位写回采用「UPDATE 未命中则 INSERT」，不依赖 `ON CONFLICT`（兼容 Greenplum，也不把水位库锁在 PostgreSQL 上）。
+> 对应地，`job_data_sync` 上没有唯一约束，**同一任务不得并发执行**，否则可能产生重复水位行。
+
 ## 运行
 
 ```bash
-# 单次执行（默认）
 go run . -config config.yaml
 
-# 后台服务模式（每 5 分钟执行一次）
-go run . -config config.yaml -mode server -interval 5m
+# 查看版本信息
+go run . -version
 ```
 
 或构建后执行：
@@ -364,3 +482,5 @@ go run . -config config.yaml -mode server -interval 5m
 make build
 ./bin/db-etl-linux-amd64 -config config.yaml
 ```
+
+程序为**单次执行**，跑完所有 task 即退出；周期调度请交给 cron / 定时任务平台。

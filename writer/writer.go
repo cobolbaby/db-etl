@@ -9,7 +9,7 @@ import (
 
 type BatchWriter interface {
 	// 从 channel 写入目标数据库。ctx 被取消时（如 reader 出错）应中止写入并回滚。
-	WriteBatch(ctx context.Context, source *config.SourceConfig, in <-chan transform.CSVBatch) error
+	WriteBatch(ctx context.Context, source *config.SourceConfig, in <-chan transform.Batch) error
 }
 
 type WatermarkStore interface {

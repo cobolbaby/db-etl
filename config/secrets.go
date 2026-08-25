@@ -38,6 +38,21 @@ func ResolveSecrets(cfg *Config) error {
 		}
 		cfg.Databases[i].Host = resolved
 	}
+
+	// 解析对象存储凭证（access_key / secret_key 支持 ${ENV}）。
+	for i := range cfg.S3 {
+		resolved, err := resolveValue(cfg.S3[i].AccessKey)
+		if err != nil {
+			return fmt.Errorf("s3 storage %q access_key: %w", cfg.S3[i].Name, err)
+		}
+		cfg.S3[i].AccessKey = resolved
+
+		resolved, err = resolveValue(cfg.S3[i].SecretKey)
+		if err != nil {
+			return fmt.Errorf("s3 storage %q secret_key: %w", cfg.S3[i].Name, err)
+		}
+		cfg.S3[i].SecretKey = resolved
+	}
 	return nil
 }
 

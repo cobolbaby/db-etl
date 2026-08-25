@@ -2,9 +2,9 @@ package reader
 
 import (
 	"db-etl/config"
-	"db-etl/util"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestBuildWhereClauseIgnoresPlaceholderWhenEmptyResult(t *testing.T) {
@@ -61,7 +61,7 @@ func TestResolveProjectionQuotesSpacedAndUnicodeColumns(t *testing.T) {
 	for _, want := range []string{
 		"[Analysis Result Judge] AS [analysis_result_judge]", // 含空格的列名须加方括号
 		"[Cost Saving] AS [cost_saving]",
-		"[故障DC/LC] AS [dclc]", // 含中文与斜杠的列名须加方括号
+		"[故障DC/LC] AS [dclc]",  // 含中文与斜杠的列名须加方括号
 		"GETDATE() AS [cdt]",   // 表达式保持原样
 		"dbo.sourceId AS [ID]", // 限定名保持原样
 	} {
@@ -88,7 +88,7 @@ func TestResolveProjectionDoesNotDoubleQuoteAlreadyQuoted(t *testing.T) {
 
 	for _, want := range []string{
 		"[Price(USD)] AS [priceusd]", // 保持单层方括号，不得变成 [[Price(USD)]]
-		`"OrderID" AS [order_id]`,     // 已用双引号引用，原样保留
+		`"OrderID" AS [order_id]`,    // 已用双引号引用，原样保留
 	} {
 		if !strings.Contains(projection, want) {
 			t.Fatalf("projection %q does not contain %q", projection, want)
@@ -98,8 +98,6 @@ func TestResolveProjectionDoesNotDoubleQuoteAlreadyQuoted(t *testing.T) {
 		t.Fatalf("projection %q double-quoted an already-quoted identifier", projection)
 	}
 }
-
-
 
 func TestResolveProjectionForPostgres(t *testing.T) {
 	source := &config.SourceConfig{
@@ -127,29 +125,52 @@ func TestResolveProjectionForPostgres(t *testing.T) {
 	}
 }
 
-func TestDefaultColumnHandlerDistinguishesNilAndEmptyString(t *testing.T) {
-	if got := defaultColumnHandler(nil); got != util.NullSentinel {
-		t.Fatalf("expected nil to map to null sentinel %q, got %q", util.NullSentinel, got)
+func TestFormatTextRendersByKind(t *testing.T) {
+	if got := FormatText(KindString, nil); got != "" {
+		t.Fatalf("expected nil to render as empty string, got %q", got)
 	}
 
-	if got := defaultColumnHandler(""); got != "" {
-		t.Fatalf("expected empty string to remain empty, got %q", got)
+	if got := FormatText(KindString, []byte("abc")); got != "abc" {
+		t.Fatalf("expected text bytes to render as string, got %q", got)
+	}
+
+	if got := FormatText(KindBytes, []byte{0xDE, 0xAD}); got != "dead" {
+		t.Fatalf("expected binary bytes to render as hex, got %q", got)
+	}
+
+	ts := time.Date(2024, 3, 1, 9, 8, 7, 0, time.UTC)
+	if got := FormatText(KindTime, ts); got != "2024-03-01 09:08:07" {
+		t.Fatalf("expected trailing zeros to be trimmed, got %q", got)
 	}
 }
 
-func TestPGDialectResolvesArrayColumnHandler(t *testing.T) {
-	// pgx 对数组列的 DatabaseTypeName 返回 "_" 前缀名称，须走显式的数组 handler。
+func TestPGDialectResolvesArrayColumnKind(t *testing.T) {
+	// pgx 对数组列的 DatabaseTypeName 返回 "_" 前缀名称，
+	// 其文本字面量已是 COPY 可识别的输入语法，故按字符串透传。
 	for _, dbType := range []string{"_INT4", "_text", "_Timestamp", "_numeric"} {
-		handler := pgDialect{}.getColumnHandler(dbType)
-
-		if got := handler(nil); got != util.NullSentinel {
-			t.Fatalf("type %q: expected nil -> null sentinel %q, got %q", dbType, util.NullSentinel, got)
-		}
-
-		// 含逗号的数组字面量必须被 CSV 引号包裹，避免破坏 COPY 的列分隔。
-		if got := handler("{1,2,3}"); got != `"{1,2,3}"` {
-			t.Fatalf("type %q: expected quoted array literal, got %q", dbType, got)
+		if got := (pgDialect{}).columnKind(dbType); got != KindString {
+			t.Fatalf("type %q: expected KindString, got %v", dbType, got)
 		}
 	}
 }
 
+func TestMSSQLDialectNormalizesUniqueidentifierOnly(t *testing.T) {
+	if got := (mssqlDialect{}).valueNormalizer("VARCHAR"); got != nil {
+		t.Fatal("expected no normalizer for varchar")
+	}
+
+	normalize := (mssqlDialect{}).valueNormalizer("uniqueidentifier")
+	if normalize == nil {
+		t.Fatal("expected a normalizer for uniqueidentifier")
+	}
+
+	// SQL Server 以混合字节序存储前三组，需重排后才是通用 UUID 文本。
+	raw := []byte{0x78, 0x56, 0x34, 0x12, 0xBC, 0x9A, 0xF0, 0xDE, 1, 2, 3, 4, 5, 6, 7, 8}
+	got, ok := normalize(raw).(string)
+	if !ok {
+		t.Fatalf("expected normalized value to be a string, got %T", normalize(raw))
+	}
+	if want := "12345678-9ABC-DEF0-0102-030405060708"; got != want {
+		t.Fatalf("expected %q, got %q", want, got)
+	}
+}

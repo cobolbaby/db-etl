@@ -8,12 +8,14 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
-	"time"
 )
 
 type readerDialect interface {
 	buildBaseQuery(source *config.SourceConfig, projection string, whereClause string) (string, error)
-	getColumnHandler(dbType string) ColHandler
+	// columnKind 将本方言的类型名映射到归一化的 ColumnKind。
+	columnKind(dbType string) ColumnKind
+	// valueNormalizer 返回该类型所需的值修正函数；无需修正时返回 nil。
+	valueNormalizer(dbType string) ValueNormalizer
 	quoteIdentifier(identifier string) string
 	// wrapError 按方言对底层驱动错误做归一化，将无法通过重试解决的错误
 	//（语法错误、无效列名、约束冲突等）标记为 NonRetryable。
@@ -38,17 +40,24 @@ func (r *BaseReader) Close() error {
 	return nil
 }
 
-func (r *BaseReader) GetColumnHandlers() ([]ColHandler, error) {
+// GetColumnMeta 返回每列的列名、源库类型名与归一化语义类别，顺序与查询列一致。
+// 三者同源于一次列类型探测（WHERE 1=0），合并为单次调用可避免重复往返源库。
+func (r *BaseReader) GetColumnMeta() ([]ColumnMeta, error) {
 	colTypes, err := r.getColumnTypes()
 	if err != nil {
 		return nil, err
 	}
 
-	handlers := make([]ColHandler, len(colTypes))
+	meta := make([]ColumnMeta, len(colTypes))
 	for i, ct := range colTypes {
-		handlers[i] = r.dialect.getColumnHandler(ct.DatabaseTypeName())
+		typeName := ct.DatabaseTypeName()
+		meta[i] = ColumnMeta{
+			Name:     ct.Name(),
+			TypeName: typeName,
+			Kind:     r.dialect.columnKind(typeName),
+		}
 	}
-	return handlers, nil
+	return meta, nil
 }
 
 func (r *BaseReader) getColumnTypes() ([]*sql.ColumnType, error) {
@@ -96,23 +105,42 @@ func (r *BaseReader) ReadBatch(ctx context.Context, cancel context.CancelFunc) <
 
 		batchSize := r.Source.BatchSize
 
-		cols, err := rows.Columns()
+		colTypes, err := rows.ColumnTypes()
 		if err != nil {
 			fail(r.dialect.wrapError(fmt.Errorf("get columns: %w，sql: %s", err, query)))
 			return
 		}
 
+		// 驱动层的值表示差异在此归一，使下游只需面对 ColumnKind 约定的 Go 类型。
+		// 绝大多数列无需修正（normalizer 为 nil），故先探测是否有任何一列需要，
+		// 避免为空操作在每行上多走一遍循环。
+		normalizers := make([]ValueNormalizer, len(colTypes))
+		needNormalize := false
+		for i, ct := range colTypes {
+			if n := r.dialect.valueNormalizer(ct.DatabaseTypeName()); n != nil {
+				normalizers[i] = n
+				needNormalize = true
+			}
+		}
+
 		for {
 			batch := make([][]any, 0, batchSize)
 			for len(batch) < batchSize && rows.Next() {
-				values := make([]any, len(cols))
-				valuePtrs := make([]any, len(cols))
+				values := make([]any, len(colTypes))
+				valuePtrs := make([]any, len(colTypes))
 				for i := range values {
 					valuePtrs[i] = &values[i]
 				}
 				if err := rows.Scan(valuePtrs...); err != nil {
 					fail(r.dialect.wrapError(fmt.Errorf("scan row: %w，sql: %s", err, query)))
 					return
+				}
+				if needNormalize {
+					for i, n := range normalizers {
+						if n != nil && values[i] != nil {
+							values[i] = n(values[i])
+						}
+					}
 				}
 				batch = append(batch, values)
 			}
@@ -128,7 +156,7 @@ func (r *BaseReader) ReadBatch(ctx context.Context, cancel context.CancelFunc) <
 
 			// 监听 ctx：若下游（writer/transform）已失败并 cancel，及时退出避免 goroutine 泄漏。
 			select {
-			case out <- RowBatch{Columns: cols, Rows: batch}:
+			case out <- RowBatch{Rows: batch}:
 			case <-ctx.Done():
 				return
 			}
@@ -288,38 +316,4 @@ func isColumnIdentifier(value string) bool {
 func isAlreadyQuotedIdentifier(value string) bool {
 	return (strings.HasPrefix(value, `"`) && strings.HasSuffix(value, `"`)) ||
 		(strings.HasPrefix(value, "[") && strings.HasSuffix(value, "]"))
-}
-
-// defaultColumnHandler 是列值的通用转换器，负责将数据库查询结果转换为 CSV 格式的字符串。
-//
-// 核心设计：区分 nil（SQL NULL）与空字符串""
-//   - nil 值 → 返回 util.NullSentinel（"__DB_ETL_NULL__"）
-//     在 PostgreSQL COPY 中，此哨兵会被配置的 NULL '__DB_ETL_NULL__' 识别为真正的 SQL NULL
-//   - 非 nil 值 → 通过 SanitizeString 进行 CSV 安全转义
-//     空字符串会被 SanitizeString 返回为 ""（不是 NULL），保持在 COPY 中作为空字符串入库
-//
-// 这样做的原因：
-// 之前的实现把 nil 都转为 ""（空字符串），导致 PostgreSQL 无法区分：
-//
-//	SELECT NULL → "" → COPY 中被当作普通空字符串，对 NOT NULL 约束无益
-//
-// 现在通过哨兵值中间层，确保：
-//
-//	SELECT NULL → NullSentinel → COPY 中被识别为 NULL，正确触发 NOT NULL 约束检查
-//	SELECT '' → "" → COPY 中保持为空字符串，不触发 NOT NULL 约束
-func defaultColumnHandler(v any) string {
-	if v == nil {
-		return util.NullSentinel
-	}
-
-	switch t := v.(type) {
-	case []byte:
-		return util.SanitizeString(string(t))
-	case string:
-		return util.SanitizeString(t)
-	case time.Time:
-		return t.Format("2006-01-02 15:04:05.000000")
-	default:
-		return util.SanitizeString(fmt.Sprintf("%v", t))
-	}
 }

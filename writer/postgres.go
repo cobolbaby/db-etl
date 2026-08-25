@@ -44,17 +44,17 @@ func (d *pgWriterDialect) close(ctx context.Context) error {
 }
 
 // drainFirstBatch 从 channel 中取出第一个非空 batch，用于获取列信息并启动后续写入。
-func drainFirstBatch(in <-chan transform.CSVBatch) (transform.CSVBatch, bool) {
+func drainFirstBatch(in <-chan transform.Batch) (transform.Batch, bool) {
 	for batch := range in {
 		if len(batch.Rows) == 0 {
 			continue
 		}
 		return batch, true
 	}
-	return transform.CSVBatch{}, false
+	return transform.Batch{}, false
 }
 
-func (d *pgWriterDialect) writeFull(ctx context.Context, in <-chan transform.CSVBatch, target *config.TargetConfig) error {
+func (d *pgWriterDialect) writeFull(ctx context.Context, in <-chan transform.Batch, target *config.TargetConfig) error {
 
 	firstBatch, foundRows := drainFirstBatch(in)
 
@@ -100,7 +100,7 @@ func (d *pgWriterDialect) writeFull(ctx context.Context, in <-chan transform.CSV
 	return tx.Commit(ctx)
 }
 
-func (d *pgWriterDialect) writeInitial(ctx context.Context, in <-chan transform.CSVBatch, target *config.TargetConfig, source *config.SourceConfig, jobName string) error {
+func (d *pgWriterDialect) writeInitial(ctx context.Context, in <-chan transform.Batch, target *config.TargetConfig, source *config.SourceConfig, jobName string) error {
 	firstBatch, foundRows := drainFirstBatch(in)
 
 	// COPY 与「任务下线」放在同一事务内提交，保证 initial（首次全量）回填成功后
@@ -132,49 +132,12 @@ func (d *pgWriterDialect) writeInitial(ctx context.Context, in <-chan transform.
 // 与 updateWatermark 一致，按 (job_name + 源标识 + 目标标识) 定位记录，无需外层透传 job_id。
 // 若没有匹配到记录（如纯 config.yaml 任务），RowsAffected 为 0，视为无操作。
 func (d *pgWriterDialect) deactivateInitialJob(ctx context.Context, tx pgx.Tx, target *config.TargetConfig, source *config.SourceConfig, jobName string) error {
+	affected, err := execDeactivateInitialJob(ctx, tx, target, source, jobName)
+	if err != nil {
+		return err
+	}
 	funcName := watermarkJobName(jobName)
-	src, err := sourceIdentity(source)
-	if err != nil {
-		return err
-	}
-	dst, err := targetIdentity(target)
-	if err != nil {
-		return err
-	}
-
-	var tag pgconn.CommandTag
-	if src.RawSQL != "" {
-		tag, err = tx.Exec(
-			ctx,
-			`UPDATE manager.job_data_sync
-			    SET inuse = false,
-			        udt   = now()
-			  WHERE job_name        = $1
-			    AND src_db_name     = $2
-			    AND src_rawsql      = $3
-			    AND dst_schema_name = $4
-			    AND dst_table_name  = $5`,
-			funcName, src.Database, src.RawSQL, dst.Schema, dst.Table,
-		)
-	} else {
-		tag, err = tx.Exec(
-			ctx,
-			`UPDATE manager.job_data_sync
-			    SET inuse = false,
-			        udt   = now()
-			  WHERE job_name        = $1
-			    AND src_db_name     = $2
-			    AND src_schema_name = $3
-			    AND src_table_name  = $4
-			    AND dst_schema_name = $5
-			    AND dst_table_name  = $6`,
-			funcName, src.Database, src.Schema, src.Table, dst.Schema, dst.Table,
-		)
-	}
-	if err != nil {
-		return util.WrapPgError(err)
-	}
-	if tag.RowsAffected() == 0 {
+	if affected == 0 {
 		log.Printf("initial task done but no matching job_data_sync row (job=%s table=%s), inuse unchanged", funcName, target.Table)
 		return nil
 	}
@@ -182,8 +145,8 @@ func (d *pgWriterDialect) deactivateInitialJob(ctx context.Context, tx pgx.Tx, t
 	return nil
 }
 
-func (d *pgWriterDialect) writeCopyWithFirstBatch(ctx context.Context, firstBatch transform.CSVBatch, in <-chan transform.CSVBatch, table string, conn *pgx.Conn) error {
-	return d.writeCopyStream(ctx, table, firstBatch.Columns, conn, func(write func(transform.CSVBatch) error) error {
+func (d *pgWriterDialect) writeCopyWithFirstBatch(ctx context.Context, firstBatch transform.Batch, in <-chan transform.Batch, table string, conn *pgx.Conn) error {
+	return d.writeCopyStream(ctx, table, firstBatch.ColumnNames(), conn, func(write func(transform.Batch) error) error {
 		if err := write(firstBatch); err != nil {
 			return err
 		}
@@ -204,7 +167,7 @@ func (d *pgWriterDialect) writeCopyStream(
 	table string,
 	columns []string,
 	conn *pgx.Conn,
-	iterFn func(write func(transform.CSVBatch) error) error,
+	iterFn func(write func(transform.Batch) error) error,
 ) error {
 	pr, pw := io.Pipe()
 
@@ -236,17 +199,19 @@ func (d *pgWriterDialect) writeCopyStream(
 		buf.Reset()
 		return nil
 	}
-	writeBatch := func(batch transform.CSVBatch) error {
+	// CSV 文本编码在此处（而非 reader/transform）完成：它是 COPY 的输入格式要求，
+	// 与目标绑定；parquet 目标则直接消费原始值，无需经过字符串中转。
+	writeBatch := func(batch transform.Batch) error {
 		if len(batch.Rows) == 0 {
 			return nil
 		}
 
 		for _, row := range batch.Rows {
-			for i, col := range row {
+			for i, v := range row {
 				if i > 0 {
 					buf.WriteByte(',')
 				}
-				buf.WriteString(col) // 简化版 CSV
+				buf.WriteString(encodeCopyValue(batch.Columns[i].Kind, v))
 			}
 			buf.WriteByte('\n')
 			if buf.Len() > 3*1024*1024 {
@@ -283,25 +248,24 @@ func (d *pgWriterDialect) writeCopyStream(
 	return nil
 }
 
-// 使用保留占位符区分 NULL 与空字符串：
-// nil -> util.NullSentinel（被 COPY 识别为 NULL），空字符串仍为 ""。
+// buildCopySQL 以 nullSentinel 作为 NULL 标记，令 COPY 能区分 NULL 与空字符串。
 func buildCopySQL(table string, columns []string) string {
 	base := "COPY " + table
 	if len(columns) > 0 {
 		base += "(" + strings.Join(columns, ", ") + ")"
 	}
 
-	return base + " FROM STDIN WITH (FORMAT CSV, DELIMITER ',', QUOTE '\"', ESCAPE '\"', NULL '" + util.NullSentinel + "')"
+	return base + " FROM STDIN WITH (FORMAT CSV, DELIMITER ',', QUOTE '\"', ESCAPE '\"', NULL '" + nullSentinel + "')"
 }
 
-func (d *pgWriterDialect) writeAppend(ctx context.Context, in <-chan transform.CSVBatch, target *config.TargetConfig, source *config.SourceConfig, jobName string) error {
+func (d *pgWriterDialect) writeAppend(ctx context.Context, in <-chan transform.Batch, target *config.TargetConfig, source *config.SourceConfig, jobName string) error {
 	if target.CommitBatchSize > 0 {
 		return d.writeIncrChunked(ctx, in, target, source, jobName, false)
 	}
 	return d.writeIncrOnce(ctx, in, target, source, jobName, false)
 }
 
-func (d *pgWriterDialect) writeMerge(ctx context.Context, in <-chan transform.CSVBatch, target *config.TargetConfig, source *config.SourceConfig, jobName string) error {
+func (d *pgWriterDialect) writeMerge(ctx context.Context, in <-chan transform.Batch, target *config.TargetConfig, source *config.SourceConfig, jobName string) error {
 	if target.CommitBatchSize > 0 {
 		return d.writeIncrChunked(ctx, in, target, source, jobName, true)
 	}
@@ -310,7 +274,7 @@ func (d *pgWriterDialect) writeMerge(ctx context.Context, in <-chan transform.CS
 
 // writeIncrOnce 在单个事务中完成增量写入（append / merge 共用）。
 // needDelete=true 时先按 PK 从目标表删除重复行（merge 语义），false 时仅追加（append 语义）。
-func (d *pgWriterDialect) writeIncrOnce(ctx context.Context, in <-chan transform.CSVBatch, target *config.TargetConfig, source *config.SourceConfig, jobName string, needDelete bool) error {
+func (d *pgWriterDialect) writeIncrOnce(ctx context.Context, in <-chan transform.Batch, target *config.TargetConfig, source *config.SourceConfig, jobName string, needDelete bool) error {
 	firstBatch, foundRows := drainFirstBatch(in)
 
 	if !foundRows {
@@ -373,7 +337,7 @@ func (d *pgWriterDialect) writeIncrOnce(ctx context.Context, in <-chan transform
 // writeIncrChunked 将增量写入拆成若干块，每 CommitBatchSize 个 batch 提交一次事务并更新水位。
 // needDelete=true 时每块先 DELETE 再 INSERT（merge），false 时仅 INSERT（append）。
 // 适用于超大表：中断后重启可从上次已提交的水位断点继续，而不必从头同步。
-func (d *pgWriterDialect) writeIncrChunked(ctx context.Context, in <-chan transform.CSVBatch, target *config.TargetConfig, source *config.SourceConfig, jobName string, needDelete bool) error {
+func (d *pgWriterDialect) writeIncrChunked(ctx context.Context, in <-chan transform.Batch, target *config.TargetConfig, source *config.SourceConfig, jobName string, needDelete bool) error {
 	var totalDeleted, totalInserted int64
 	chunkIdx := 0
 
@@ -381,7 +345,7 @@ func (d *pgWriterDialect) writeIncrChunked(ctx context.Context, in <-chan transf
 	var (
 		currentTx      pgx.Tx
 		currentStaging string
-		feedCh         chan transform.CSVBatch
+		feedCh         chan transform.Batch
 		copyDone       chan error
 		batchCount     int
 	)
@@ -399,10 +363,10 @@ func (d *pgWriterDialect) writeIncrChunked(ctx context.Context, in <-chan transf
 		}
 		currentTx = tx
 		currentStaging = staging
-		feedCh = make(chan transform.CSVBatch, 1)
+		feedCh = make(chan transform.Batch, 1)
 		copyDone = make(chan error, 1)
 		go func(txConn *pgx.Conn) {
-			copyDone <- d.writeCopyStream(ctx, staging, columns, txConn, func(write func(transform.CSVBatch) error) error {
+			copyDone <- d.writeCopyStream(ctx, staging, columns, txConn, func(write func(transform.Batch) error) error {
 				for b := range feedCh {
 					if err := write(b); err != nil {
 						return err
@@ -483,7 +447,7 @@ func (d *pgWriterDialect) writeIncrChunked(ctx context.Context, in <-chan transf
 			continue
 		}
 		if batchCount == 0 {
-			if err := startChunk(batch.Columns); err != nil {
+			if err := startChunk(batch.ColumnNames()); err != nil {
 				return err
 			}
 		}
@@ -616,129 +580,14 @@ func (d *pgWriterDialect) computeWatermark(ctx context.Context, tx pgx.Tx, stagi
 }
 
 func (d *pgWriterDialect) updateWatermark(ctx context.Context, tx pgx.Tx, wm string, target *config.TargetConfig, source *config.SourceConfig, jobName string) error {
-	funcName := watermarkJobName(jobName)
-	src, err := sourceIdentity(source)
-	if err != nil {
-		return err
-	}
-	dst, err := targetIdentity(target)
-	if err != nil {
-		return err
-	}
-
-	var tag pgconn.CommandTag
-	var execErr error
-	if src.RawSQL != "" {
-		tag, execErr = tx.Exec(
-			ctx,
-			`UPDATE manager.job_data_sync
-			    SET incr_point      = $1,
-			        sync_mode       = $2,
-			        src_incr_field  = $3,
-			        dst_pk          = $4,
-			        udt             = now()
-			  WHERE job_name        = $5
-			    AND src_db_name     = $6
-			    AND src_rawsql      = $7
-			    AND dst_schema_name = $8
-			    AND dst_table_name  = $9`,
-			wm, string(target.Mode), source.IncrField, target.PK,
-			funcName, src.Database, src.RawSQL, dst.Schema, dst.Table,
-		)
-	} else {
-		tag, execErr = tx.Exec(
-			ctx,
-			`UPDATE manager.job_data_sync
-			    SET incr_point      = $1,
-			        sync_mode       = $2,
-			        src_incr_field  = $3,
-			        dst_pk          = $4,
-			        udt             = now()
-			  WHERE job_name        = $5
-			    AND src_db_name     = $6
-			    AND src_schema_name = $7
-			    AND src_table_name  = $8
-			    AND dst_schema_name = $9
-			    AND dst_table_name  = $10`,
-			wm, string(target.Mode), source.IncrField, target.PK,
-			funcName, src.Database, src.Schema, src.Table, dst.Schema, dst.Table,
-		)
-	}
-	if execErr != nil {
-		return util.WrapPgError(execErr)
-	}
-
-	if tag.RowsAffected() > 0 {
-		return nil
-	}
-
-	if src.RawSQL != "" {
-		_, err = tx.Exec(
-			ctx,
-			`INSERT INTO manager.job_data_sync
-			    (job_name, src_db_name, src_rawsql, dst_schema_name, dst_table_name,
-			     incr_point, sync_mode, src_incr_field, dst_pk, cdt, udt)
-			  VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, now(), now())`,
-			funcName, src.Database, src.RawSQL, dst.Schema, dst.Table,
-			wm, string(target.Mode), source.IncrField, target.PK,
-		)
-	} else {
-		_, err = tx.Exec(
-			ctx,
-			`INSERT INTO manager.job_data_sync
-			    (job_name, src_db_name, src_schema_name, src_table_name, dst_schema_name, dst_table_name,
-			     incr_point, sync_mode, src_incr_field, dst_pk, cdt, udt)
-			  VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, now(), now())`,
-			funcName, src.Database, src.Schema, src.Table, dst.Schema, dst.Table,
-			wm, string(target.Mode), source.IncrField, target.PK,
-		)
-	}
-	return util.WrapPgError(err)
+	// 与暂存表写入在同一事务内提交，保证「数据落地」与「水位推进」原子一致。
+	return upsertWatermark(ctx, tx, wm, target, source, jobName)
 }
 
 func (d *pgWriterDialect) getWatermark(target *config.TargetConfig, source *config.SourceConfig, jobName string) (string, error) {
-	funcName := watermarkJobName(jobName)
-	src, err := sourceIdentity(source)
-	if err != nil {
-		return "", err
-	}
-	dst, err := targetIdentity(target)
-	if err != nil {
-		return "", err
-	}
-
 	ctx := context.Background()
-	var wm string
-	if src.RawSQL != "" {
-		err = d.conn.QueryRow(
-			ctx,
-			`SELECT COALESCE(incr_point, '')
-			   FROM manager.job_data_sync
-			  WHERE job_name = $1
-			    AND src_db_name = $2
-			    AND src_rawsql = $3
-			    AND dst_schema_name = $4
-			    AND dst_table_name = $5
-			  LIMIT 1`,
-			funcName, src.Database, src.RawSQL, dst.Schema, dst.Table,
-		).Scan(&wm)
-	} else {
-		err = d.conn.QueryRow(
-			ctx,
-			`SELECT COALESCE(incr_point, '')
-			   FROM manager.job_data_sync
-			  WHERE job_name = $1
-			    AND src_db_name = $2
-			    AND src_schema_name = $3
-			    AND src_table_name = $4
-			    AND dst_schema_name = $5
-			    AND dst_table_name = $6
-			  LIMIT 1`,
-			funcName, src.Database, src.Schema, src.Table, dst.Schema, dst.Table,
-		).Scan(&wm)
-	}
-
-	if err != nil && err != pgx.ErrNoRows {
+	wm, err := readWatermarkPoint(ctx, d.conn, target, source, jobName)
+	if err != nil {
 		return "", err
 	}
 

@@ -9,10 +9,10 @@ import (
 )
 
 type writerDialect interface {
-	writeInitial(ctx context.Context, in <-chan transform.CSVBatch, target *config.TargetConfig, source *config.SourceConfig, jobName string) error
-	writeFull(ctx context.Context, in <-chan transform.CSVBatch, target *config.TargetConfig) error
-	writeAppend(ctx context.Context, in <-chan transform.CSVBatch, target *config.TargetConfig, source *config.SourceConfig, jobName string) error
-	writeMerge(ctx context.Context, in <-chan transform.CSVBatch, target *config.TargetConfig, source *config.SourceConfig, jobName string) error
+	writeInitial(ctx context.Context, in <-chan transform.Batch, target *config.TargetConfig, source *config.SourceConfig, jobName string) error
+	writeFull(ctx context.Context, in <-chan transform.Batch, target *config.TargetConfig) error
+	writeAppend(ctx context.Context, in <-chan transform.Batch, target *config.TargetConfig, source *config.SourceConfig, jobName string) error
+	writeMerge(ctx context.Context, in <-chan transform.Batch, target *config.TargetConfig, source *config.SourceConfig, jobName string) error
 	getWatermark(target *config.TargetConfig, source *config.SourceConfig, jobName string) (string, error)
 	// close 释放底层连接。
 	close(ctx context.Context) error
@@ -24,7 +24,7 @@ type BaseWriter struct {
 	dialect writerDialect
 }
 
-func (w *BaseWriter) WriteBatch(ctx context.Context, source *config.SourceConfig, in <-chan transform.CSVBatch) error {
+func (w *BaseWriter) WriteBatch(ctx context.Context, source *config.SourceConfig, in <-chan transform.Batch) error {
 	if w.Target == nil {
 		return fmt.Errorf("target config is required")
 	}

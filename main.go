@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log"
 	"runtime"
+	"strings"
 	"sync"
 	"time"
 
@@ -46,7 +47,10 @@ func main() {
 	// 1. 构建 DB Resolver（conn_id 优先，name 回退）
 	// --------------------------------
 
-	resolver := config.NewDBResolver(cfg.Databases)
+	dbResolver := config.NewDBResolver(cfg.Databases)
+
+	// 构建 S3 Resolver（对象存储目标按 name 引用）
+	s3Resolver := config.NewS3Resolver(cfg.S3)
 
 	// --------------------------------
 	// 2. 确定 Task 列表
@@ -54,14 +58,19 @@ func main() {
 
 	tasks := cfg.Tasks
 
+	// managerDB 指向存放 manager.job_data_sync 的 PostgreSQL（meta_db）；
+	// 未配置 meta_db 时保持零值，下游据此跳过水位回写。
+	var managerDB config.DBConfig
+
 	if cfg.MetaDB != "" {
 		// 从数据库加载任务列表，job_name 取自 config.yaml 的 name 字段
-		metaDB, ok := resolver.Resolve(cfg.MetaDB, cfg.MetaDB)
+		var ok bool
+		managerDB, ok = dbResolver.Resolve(cfg.MetaDB, cfg.MetaDB)
 		if !ok {
 			log.Fatalf("meta_db %q not found in databases config", cfg.MetaDB)
 		}
 
-		dbTasks, err := config.LoadTasksFromDB(context.Background(), metaDB, cfg.Name, resolver)
+		dbTasks, err := config.LoadTasksFromDB(context.Background(), managerDB, cfg.Name, dbResolver)
 		if err != nil {
 			log.Fatalf("load tasks from db failed: %v", err)
 		}
@@ -105,6 +114,13 @@ func main() {
 	}
 
 	workers := min(runtime.NumCPU(), 4) // 4 is an empirical value, can be tuned
+	e := &etl{
+		dbResolver: dbResolver,
+		s3Resolver: s3Resolver,
+		managerDB:  managerDB,
+		retryCfg:   retryCfg,
+		jobName:    cfg.Name,
+	}
 	var wg sync.WaitGroup
 	for i := 0; i < workers; i++ {
 		wg.Add(1)
@@ -112,11 +128,7 @@ func main() {
 			defer wg.Done()
 			for task := range taskCh {
 				// log.Printf("[Worker %d] start task", workerID)
-				// 如果 TaskConfig 里没有 Name，就用 Config 的 Name 作为默认值
-				if task.Name == "" {
-					task.Name = cfg.Name
-				}
-				if err := runTask(context.Background(), task, resolver, retryCfg); err != nil {
+				if err := e.runTask(context.Background(), task); err != nil {
 					log.Printf("task failed: %v", err)
 					if cfg.ErrorPolicy == config.ErrorPolicyAbort {
 						log.Fatal(err)
@@ -132,10 +144,24 @@ func main() {
 
 }
 
-func runTask(ctx context.Context, task config.TaskConfig, resolver config.DBResolver, retryCfg util.RetryConfig) error {
+// etl 聚合各 task/pipeline 共享的依赖，避免在 runTask/runPipeline 间层层透传。
+type etl struct {
+	// jobName 为 job 级默认任务名（config.yaml 的 name），task 未指定 name 时取此值。
+	jobName    string
+	dbResolver config.DBResolver
+	s3Resolver config.S3Resolver
+	managerDB  config.DBConfig
+	retryCfg   util.RetryConfig
+}
+
+func (e *etl) runTask(ctx context.Context, task config.TaskConfig) error {
+	if task.Name == "" {
+		task.Name = e.jobName
+	}
+
 	// 执行前置 hook
 	if task.Hooks != nil && len(task.Hooks.Pre) > 0 {
-		if err := hook.RunPreHooks(ctx, task.Hooks.Pre, resolver); err != nil {
+		if err := hook.RunPreHooks(ctx, task.Hooks.Pre, e.dbResolver); err != nil {
 			return fmt.Errorf("run pre-hooks failed: %w", err)
 		}
 	}
@@ -144,7 +170,7 @@ func runTask(ctx context.Context, task config.TaskConfig, resolver config.DBReso
 	var lastErr error
 	for _, src := range task.Sources {
 
-		srcDB, ok := resolver.Resolve(src.ConnID, src.ConnName)
+		srcDB, ok := e.dbResolver.Resolve(src.ConnID, src.ConnName)
 		if !ok {
 			return fmt.Errorf("source db not found (conn_id=%q conn_name=%q)", src.ConnID, src.ConnName)
 		}
@@ -153,14 +179,10 @@ func runTask(ctx context.Context, task config.TaskConfig, resolver config.DBReso
 			return err
 		}
 
-		dstDB, ok := resolver.Resolve(task.Target.ConnID, task.Target.ConnName)
-		if !ok {
-			return fmt.Errorf("target db not found (conn_id=%q conn_name=%q)", task.Target.ConnID, task.Target.ConnName)
-		}
-
-		label := fmt.Sprintf("%s (%s) → %s (%s)", srcDB.Name, src.Table, dstDB.Name, task.Target.Table)
-		err := util.Retry(label, retryCfg, func() error {
-			return runPipeline(ctx, src, srcDB, dstDB, task)
+		dstName := e.targetName(task.Target)
+		label := fmt.Sprintf("%s (%s) → %s (%s)", srcDB.Name, src.Table, dstName, task.Target.Table)
+		err := util.Retry(label, e.retryCfg, func() error {
+			return e.runPipeline(ctx, src, srcDB, task)
 		})
 		if err != nil {
 			log.Printf("pipeline failed %s after retries: %v", label, err)
@@ -171,7 +193,7 @@ func runTask(ctx context.Context, task config.TaskConfig, resolver config.DBReso
 
 	// 执行后置 hook
 	if task.Hooks != nil && len(task.Hooks.Post) > 0 {
-		if err := hook.RunPostHooks(ctx, task.Hooks.Post, resolver); err != nil {
+		if err := hook.RunPostHooks(ctx, task.Hooks.Post, e.dbResolver); err != nil {
 			return fmt.Errorf("run post-hooks failed: %w", err)
 		}
 	}
@@ -179,16 +201,18 @@ func runTask(ctx context.Context, task config.TaskConfig, resolver config.DBReso
 	return lastErr
 }
 
-func runPipeline(ctx context.Context, src *config.SourceConfig, srcDB config.DBConfig, dstDB config.DBConfig, task config.TaskConfig) error {
+func (e *etl) runPipeline(ctx context.Context, src *config.SourceConfig, srcDB config.DBConfig, task config.TaskConfig) error {
 
 	// mc := metrics.Default()
 	// pm := mc.NewPipelineMetrics(src.ConnName, task.Target.ConnName, task.Target.Table, string(task.Target.Mode))
+
+	dstName := e.targetName(task.Target)
 
 	// -----------------------------
 	// Writer
 	// -----------------------------
 
-	w, err := writer.NewWriter(dstDB, task.Target, task.Name)
+	w, err := writer.NewWriter(task.Target, e.dbResolver, e.s3Resolver, e.managerDB, task.Name)
 	if err != nil {
 		return fmt.Errorf("create writer: %w", err)
 	}
@@ -229,11 +253,11 @@ func runPipeline(ctx context.Context, src *config.SourceConfig, srcDB config.DBC
 	// Transformer
 	// -----------------------------
 
-	handlers, err := r.GetColumnHandlers()
+	columns, err := r.GetColumnMeta()
 	if err != nil {
-		return fmt.Errorf("get column handlers: %w", err)
+		return fmt.Errorf("get column meta: %w", err)
 	}
-	t := transform.NewTransformer(task.Transform, handlers)
+	t := transform.NewTransformer(task.Transform, columns)
 
 	// -----------------------------
 	// Pipeline
@@ -244,7 +268,7 @@ func runPipeline(ctx context.Context, src *config.SourceConfig, srcDB config.DBC
 		"pipeline start %s (%s) -> %s (%s)",
 		srcDB.Name,
 		src.Table,
-		dstDB.Name,
+		dstName,
 		task.Target.Table,
 	)
 
@@ -256,7 +280,7 @@ func runPipeline(ctx context.Context, src *config.SourceConfig, srcDB config.DBC
 			"pipeline failed %s (%s) -> %s (%s) cost=%s: %w",
 			srcDB.Name,
 			src.Table,
-			dstDB.Name,
+			dstName,
 			task.Target.Table,
 			time.Since(startedAt).Round(time.Millisecond),
 			err,
@@ -268,9 +292,23 @@ func runPipeline(ctx context.Context, src *config.SourceConfig, srcDB config.DBC
 		"pipeline finished %s (%s) -> %s (%s) cost=%s",
 		srcDB.Name,
 		src.Table,
-		dstDB.Name,
+		dstName,
 		task.Target.Table,
 		time.Since(startedAt).Round(time.Millisecond),
 	)
 	return nil
+}
+
+// targetName 返回目标端用于日志的名称：对象存储目标取 s3 名，数据库目标取库名。
+func (e *etl) targetName(target *config.TargetConfig) string {
+	if strings.TrimSpace(target.S3) != "" {
+		return target.S3
+	}
+	if db, ok := e.dbResolver.Resolve(target.ConnID, target.ConnName); ok {
+		return db.Name
+	}
+	if target.ConnName != "" {
+		return target.ConnName
+	}
+	return target.ConnID
 }

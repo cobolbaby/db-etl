@@ -12,9 +12,9 @@ import (
 
 // NewWriter 根据 target 构建 Writer：优先按 target.S3 分发到对象存储（parquet），
 // 否则按 target 引用的数据库类型分发到对应数据库写入器。
-// managerDB 指向存放 manager.job_data_sync 的 PostgreSQL（meta_db），仅对象存储目标使用，
+// metaDB 指向存放 manager.job_data_sync 的 PostgreSQL（meta_db），仅对象存储目标使用，
 // 未配置 meta_db 时传零值。
-func NewWriter(target *config.TargetConfig, dbResolver config.DBResolver, s3Resolver config.S3Resolver, managerDB config.DBConfig, jobName string) (Writer, error) {
+func NewWriter(target *config.TargetConfig, dbResolver config.DBResolver, s3Resolver config.S3Resolver, metaDB config.DBConfig, jobName string) (Writer, error) {
 	if target == nil {
 		return nil, util.NonRetryable(fmt.Errorf("target config is required"))
 	}
@@ -25,7 +25,7 @@ func NewWriter(target *config.TargetConfig, dbResolver config.DBResolver, s3Reso
 		if !ok {
 			return nil, util.NonRetryable(fmt.Errorf("target s3 %q not found", target.S3))
 		}
-		return NewParquetWriter(s3, managerDB, target, jobName)
+		return NewParquetWriter(s3, metaDB, target, jobName)
 	}
 
 	// 数据库目标：Resolve 返回共享 datasource 配置的值副本，下方改写只作用于本副本。
@@ -47,6 +47,10 @@ func NewWriter(target *config.TargetConfig, dbResolver config.DBResolver, s3Reso
 		if err != nil {
 			return nil, fmt.Errorf("PG connect failed: %w", err)
 		}
+		// 此处刻意不传 metaDB：PG/GP 目标的水位由 upsertWatermark 写在目标库自己的事务里，
+		// 与数据落地同进同退（见 watermark.go 中 pgxExecutor 的说明）；
+		// 换成独立的 metaDB 连接会破坏这个原子性，代价是 manager.job_data_sync 必须与目标库同实例。
+		// 对象存储无事务可挂靠，才需要单独的 metaDB 连接（见 NewParquetWriter）。
 		return NewPGWriter(pgConn, target, jobName), nil
 	default:
 		// 不支持的类型属配置错误，重试无益。

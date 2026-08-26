@@ -58,19 +58,19 @@ func main() {
 
 	tasks := cfg.Tasks
 
-	// managerDB 指向存放 manager.job_data_sync 的 PostgreSQL（meta_db）；
+	// metaDB 指向存放 manager.job_data_sync 的 PostgreSQL（meta_db）；
 	// 未配置 meta_db 时保持零值，下游据此跳过水位回写。
-	var managerDB config.DBConfig
+	var metaDB config.DBConfig
 
 	if cfg.MetaDB != "" {
 		// 从数据库加载任务列表，job_name 取自 config.yaml 的 name 字段
 		var ok bool
-		managerDB, ok = dbResolver.Resolve(cfg.MetaDB, cfg.MetaDB)
+		metaDB, ok = dbResolver.Resolve(cfg.MetaDB, cfg.MetaDB)
 		if !ok {
 			log.Fatalf("meta_db %q not found in databases config", cfg.MetaDB)
 		}
 
-		dbTasks, err := config.LoadTasksFromDB(context.Background(), managerDB, cfg.Name, dbResolver)
+		dbTasks, err := config.LoadTasksFromDB(context.Background(), metaDB, cfg.Name, dbResolver)
 		if err != nil {
 			log.Fatalf("load tasks from db failed: %v", err)
 		}
@@ -115,7 +115,7 @@ func main() {
 	e := &etl{
 		dbResolver: dbResolver,
 		s3Resolver: s3Resolver,
-		managerDB:  managerDB,
+		metaDB:     metaDB,
 		retryCfg:   retryCfg,
 		jobName:    cfg.Name,
 	}
@@ -148,7 +148,7 @@ type etl struct {
 	jobName    string
 	dbResolver config.DBResolver
 	s3Resolver config.S3Resolver
-	managerDB  config.DBConfig
+	metaDB     config.DBConfig
 	retryCfg   util.RetryConfig
 }
 
@@ -206,7 +206,7 @@ func (e *etl) runPipeline(ctx context.Context, src *config.SourceConfig, srcDB c
 	// Writer
 	// -----------------------------
 
-	w, err := writer.NewWriter(task.Target, e.dbResolver, e.s3Resolver, e.managerDB, task.Name)
+	w, err := writer.NewWriter(task.Target, e.dbResolver, e.s3Resolver, e.metaDB, task.Name)
 	if err != nil {
 		return fmt.Errorf("create writer: %w", err)
 	}

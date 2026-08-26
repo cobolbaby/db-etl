@@ -25,16 +25,18 @@ const parquetFlushRows = 1024
 //   - full/initial：覆盖写单个 <table>.parquet 对象（每次全量刷新）。
 //   - append/merge：每次增量写一个以起点水位命名的对象，并把水位写回 manager.job_data_sync。
 //
-// managerConn 指向存放 manager.job_data_sync 的 PostgreSQL；为 nil 时跳过水位写回/读取
+// metaConn 指向存放 manager.job_data_sync 的 PostgreSQL；为 nil 时跳过水位写回/读取
 // （退化为无状态增量，起点由 defaultIncrPoint 兜底）。
+// 与 PG writer 不同：对象存储上传没有事务可挂靠，水位只能走这条独立连接写，
+// 因此存在「上传成功但水位写失败」的窗口。
 type parquetWriterDialect struct {
-	store       *s3Store
-	managerConn *pgx.Conn
+	store    *s3Store
+	metaConn *pgx.Conn
 }
 
 // NewParquetWriter 构建写 parquet 到对象存储的 Writer。
-// s3 提供对象存储连接信息；managerDB 提供水位写回连接，为零值（未配置 meta_db）时不建连接。
-func NewParquetWriter(s3 config.S3Config, managerDB config.DBConfig, target *config.TargetConfig, jobName string) (Writer, error) {
+// s3 提供对象存储连接信息；metaDB 提供水位写回连接，为零值（未配置 meta_db）时不建连接。
+func NewParquetWriter(s3 config.S3Config, metaDB config.DBConfig, target *config.TargetConfig, jobName string) (Writer, error) {
 	if target == nil {
 		return nil, util.NonRetryable(fmt.Errorf("target config is required for parquet writer"))
 	}
@@ -46,30 +48,30 @@ func NewParquetWriter(s3 config.S3Config, managerDB config.DBConfig, target *con
 
 	// Database 是每个 datasource 的必填项（见 config.validateDatabases），
 	// 为空即表示未配置 meta_db，此时不建连接、跳过水位读写。
-	var managerConn *pgx.Conn
-	if managerDB.Database != "" {
-		conn, err := pgx.Connect(context.Background(), managerDB.DSN())
+	var metaConn *pgx.Conn
+	if metaDB.Database != "" {
+		conn, err := pgx.Connect(context.Background(), metaDB.DSN())
 		if err != nil {
-			return nil, fmt.Errorf("manager DB connect failed: %w", err)
+			return nil, fmt.Errorf("meta DB connect failed: %w", err)
 		}
-		managerConn = conn
+		metaConn = conn
 	}
 
 	base := &BaseWriter{
 		Target:  target,
 		JobName: jobName,
 	}
-	base.dialect = &parquetWriterDialect{store: store, managerConn: managerConn}
+	base.dialect = &parquetWriterDialect{store: store, metaConn: metaConn}
 
 	return base, nil
 }
 
 // close 关闭 manager 连接（若有）。
 func (d *parquetWriterDialect) close(ctx context.Context) error {
-	if d.managerConn == nil {
+	if d.metaConn == nil {
 		return nil
 	}
-	return d.managerConn.Close(ctx)
+	return d.metaConn.Close(ctx)
 }
 
 func (d *parquetWriterDialect) writeInitial(ctx context.Context, in <-chan transform.Batch, target *config.TargetConfig, source *config.SourceConfig, jobName string) error {
@@ -77,8 +79,8 @@ func (d *parquetWriterDialect) writeInitial(ctx context.Context, in <-chan trans
 	if _, err := d.writeObject(ctx, in, defaultObjectKey(target), source); err != nil {
 		return err
 	}
-	if d.managerConn != nil {
-		if _, err := execDeactivateInitialJob(ctx, d.managerConn, target, source, jobName); err != nil {
+	if d.metaConn != nil {
+		if _, err := execDeactivateInitialJob(ctx, d.metaConn, target, source, jobName); err != nil {
 			return err
 		}
 		log.Printf("initial parquet task done, set inuse=false (table=%s)", target.Table)
@@ -112,10 +114,10 @@ func (d *parquetWriterDialect) writeIncremental(ctx context.Context, in <-chan t
 	}
 
 	// 无数据或未追踪到水位则不推进（保持既有 incr_point 不变）。
-	if wm == "" || d.managerConn == nil || source == nil {
+	if wm == "" || d.metaConn == nil || source == nil {
 		return nil
 	}
-	return upsertWatermark(ctx, d.managerConn, wm, target, source, jobName)
+	return upsertWatermark(ctx, d.metaConn, wm, target, source, jobName)
 }
 
 // parquetEncoder 持有单个对象的编码状态：列映射、类型、增量水位追踪与行缓冲，
@@ -294,8 +296,8 @@ func (d *parquetWriterDialect) getWatermark(target *config.TargetConfig, source 
 		return "", nil
 	}
 
-	if d.managerConn != nil {
-		wm, err := readWatermarkPoint(context.Background(), d.managerConn, target, source, jobName)
+	if d.metaConn != nil {
+		wm, err := readWatermarkPoint(context.Background(), d.metaConn, target, source, jobName)
 		if err != nil {
 			return "", err
 		}

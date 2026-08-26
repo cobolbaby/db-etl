@@ -150,6 +150,11 @@ func rowToTaskConfig(r JobDataSyncRow, metaDB DBConfig, resolver DBResolver) (Ta
 		src.FieldsMapping = parsedMapping
 	}
 
+	srcDB, srcDBFound := resolver.Resolve(r.SrcConnID, "")
+	if srcDBFound {
+		src.DBType = srcDB.Type
+	}
+
 	switch {
 	case strings.TrimSpace(r.SrcRawSQL) != "":
 		src.SQL = r.SrcRawSQL
@@ -159,11 +164,14 @@ func rowToTaskConfig(r JobDataSyncRow, metaDB DBConfig, resolver DBResolver) (Ta
 			return TaskConfig{}, fmt.Errorf("src_schema_name / src_table_name is empty and no sql provided")
 		}
 		srcDBName := strings.TrimSpace(r.SrcDBName)
-		srcDB, ok := resolver.Resolve(r.SrcConnID, "")
-		if srcDBName != "" && ok && srcDB.Type == DBTypeMSSQL {
+		if srcDBName != "" && srcDBFound && srcDB.Type == DBTypeMSSQL {
 			src.Table = srcDBName + "." + r.SrcSchemaName + "." + r.SrcTableName
 		} else {
 			src.Table = r.SrcSchemaName + "." + r.SrcTableName
+		}
+		// DB 加载路径不走 validateSource，表名形态在此就地校验，避免留到运行期才失败。
+		if err := ValidateSourceTableName(src.Table, src.DBType); err != nil {
+			return TaskConfig{}, err
 		}
 	}
 

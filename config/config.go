@@ -274,8 +274,6 @@ type SourceConfig struct {
 	IncrField      string        `yaml:"incr_field"` // 用于增量抽取，指定一个日期/时间字段，配合 Watermark 实现增量抽取
 	IncrPoint      string        `yaml:"incr_point"` // 增量抽取的起点
 	OrderBy        string        `yaml:"order_by"`   // OrderBy 指定查询排序字段。当 target.commit_batch_size > 0 时必须有序，框架会自动设为 src_incr_field，也可手动指定其他表达式（如 "id ASC"）。
-	// Transforms 定义字段级后处理转换规则（在类型序列化之后执行）。
-	// Transforms []FieldTransformDef `yaml:"transforms"`
 }
 
 // UnpivotConfig 配置列转行（unpivot）：把宽表中的一组列展开成两列多行。
@@ -328,14 +326,6 @@ func (u *UnpivotConfig) Validate() error {
 	}
 	return nil
 }
-
-// FieldTransformDef defines a single field transformation rule in config.
-// type FieldTransformDef struct {
-// 	Column    string `yaml:"column"`
-// 	Transform string `yaml:"transform"` // trim, upper, lower, replace, default, prefix, suffix
-// 	Arg1      string `yaml:"arg1"`
-// 	Arg2      string `yaml:"arg2"`
-// }
 
 func normalizeFieldsMappingItems(items map[string]string) map[string]string {
 	if len(items) == 0 {
@@ -905,10 +895,17 @@ func validateSource(source *SourceConfig, target *TargetConfig, resolver DBResol
 		source.BatchSize = 10000
 	}
 
-	// 增量模式（append/merge）以 incr_field 为水位字段界定抽取区间，缺失则无从判断增量起点，
-	// 会退化为每次全量重抽；属结构性配置错误，在加载阶段 fail-fast。
-	if target != nil && (target.Mode == ModeTypeAppend || target.Mode == ModeTypeMerge) && strings.TrimSpace(source.IncrField) == "" {
+	// append 只追加不去重，没有 incr_field 就无从界定增量区间，重跑必然产生重复行，故必填。
+	if target.Mode == ModeTypeAppend && strings.TrimSpace(source.IncrField) == "" {
 		return fmt.Errorf("incr_field is required for %s mode", target.Mode)
+	}
+
+	// merge 写 DB 时按 pk 做 DELETE + INSERT，重复抽取同一区间是幂等的，
+	// 允许不配 incr_field（由 SQL 自身圈定滚动窗口，如 date >= now() - interval '3 days'）。
+	// 但 merge 写对象存储时，增量对象的 key 由起点水位命名（见 incrementalObjectKey），
+	// 缺少 incr_field 会让每次增量都覆盖同一个对象，故此场景仍必填。
+	if target.Mode == ModeTypeMerge && strings.TrimSpace(target.S3) != "" && strings.TrimSpace(source.IncrField) == "" {
+		return fmt.Errorf("incr_field is required for %s mode when target is s3", target.Mode)
 	}
 
 	if target.CommitBatchSize > 0 {

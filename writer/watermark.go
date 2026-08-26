@@ -4,10 +4,96 @@ import (
 	"context"
 	"db-etl/config"
 	"db-etl/util"
+	"fmt"
+	"strings"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 )
+
+func watermarkJobName(jobName string) string {
+	return strings.TrimSpace(jobName)
+}
+
+// tableRef 是 watermark 里「表标识」的统一表示：
+// 目标端只用到 Schema/Table（Database 恒为空，由 targetIdentity 强制），
+// 源端则可能带上库名（MSSQL 的 db.schema.table）。
+type tableRef struct {
+	Database string
+	Schema   string
+	Table    string
+}
+
+// wmSource 在表标识之上多一个 RawSQL 分支：
+// 源可以是一张表，也可以是一段自定义 SQL，两者互斥。
+type wmSource struct {
+	tableRef
+	RawSQL string
+}
+
+func sourceIdentity(source *config.SourceConfig) (wmSource, error) {
+	if source == nil {
+		return wmSource{}, fmt.Errorf("source config is required for watermark")
+	}
+
+	if table := strings.TrimSpace(source.Table); table != "" {
+		parts, err := splitTableRef(table)
+		if err != nil {
+			return wmSource{}, err
+		}
+		// 三段式表名仅 MSSQL 合法，已在加载阶段由 config.ValidateSourceTableName 保证；
+		// 此处只做归属推导：以表名内的库名为准，否则回退到数据源连接的库名，
+		// 确保 watermark 的 src_db_name 始终反映真实的源库。
+		if parts.Database == "" {
+			parts.Database = strings.TrimSpace(source.Database)
+		}
+		return wmSource{tableRef: parts}, nil
+	}
+
+	if sql := strings.TrimSpace(source.SQL); sql != "" {
+		return wmSource{
+			tableRef: tableRef{Database: strings.TrimSpace(source.Database)},
+			RawSQL:   sql,
+		}, nil
+	}
+
+	return wmSource{}, fmt.Errorf("source identity is required for watermark")
+}
+
+func targetIdentity(target *config.TargetConfig) (tableRef, error) {
+	if target == nil {
+		return tableRef{}, fmt.Errorf("target config is required for watermark")
+	}
+
+	parts, err := splitTableRef(target.Table)
+	if err != nil {
+		return tableRef{}, err
+	}
+	if parts.Database != "" {
+		return tableRef{}, fmt.Errorf("target table must be table or schema.table")
+	}
+
+	return parts, nil
+}
+
+func splitTableRef(name string) (tableRef, error) {
+	trimmed := strings.TrimSpace(name)
+	if trimmed == "" {
+		return tableRef{}, fmt.Errorf("table name is required for watermark")
+	}
+
+	parts := strings.Split(trimmed, ".")
+	switch len(parts) {
+	case 1:
+		return tableRef{Table: parts[0]}, nil
+	case 2:
+		return tableRef{Schema: parts[0], Table: parts[1]}, nil
+	case 3:
+		return tableRef{Database: parts[0], Schema: parts[1], Table: parts[2]}, nil
+	default:
+		return tableRef{}, fmt.Errorf("table name must be table, schema.table, or db.schema.table")
+	}
+}
 
 // pgxExecutor 统一 pgx.Tx 与 *pgx.Conn 两个具体类型的执行方法。
 // 它不是「跨数据库」抽象：manager.job_data_sync 固定在 PostgreSQL，底层始终是 pgx。

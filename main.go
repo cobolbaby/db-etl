@@ -78,8 +78,6 @@ func main() {
 		tasks = dbTasks
 
 		// tasks = append(tasks, dbTasks...)
-		// TODO: 理论上跑了一遍的任务，任务状态都会更新到数据库中，所以加载的任务列表要进行一次去重，否则可能会有重复。
-		// 需要 review 一下 getWatermark 方法，获取哪个字段可能作为唯一标识符，然后与配置文件中的任务进行匹配去重。
 	}
 
 	if len(tasks) == 0 {
@@ -173,10 +171,6 @@ func (e *etl) runTask(ctx context.Context, task config.TaskConfig) error {
 		srcDB, ok := e.dbResolver.Resolve(src.ConnID, src.ConnName)
 		if !ok {
 			return fmt.Errorf("source db not found (conn_id=%q conn_name=%q)", src.ConnID, src.ConnName)
-		}
-		src.DBType = srcDB.Type
-		if err := config.ValidateSourceTableName(src.Table, src.DBType); err != nil {
-			return err
 		}
 
 		dstName := e.targetName(task.Target)

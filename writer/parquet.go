@@ -415,7 +415,7 @@ func defaultObjectKey(target *config.TargetConfig) string {
 // incrementalObjectKey 以本次抽取的起点水位命名增量对象（<table>_<incr_point>.parquet）。
 // 起点相同即写同一个对象，失败重跑会覆盖残留而非在桶里堆积孤儿对象，
 // 使「上传成功但水位写回失败」的重试幂等。正常调度下水位持续推进，各次增量自然落到不同对象。
-// incr_field 是 append/merge 的必填项（见 config.validateSource），故起点必然非空。
+// s3 目标的 append/merge 必须配置 incr_field（见 config.validateSource），故起点必然非空。
 func incrementalObjectKey(target *config.TargetConfig, source *config.SourceConfig) string {
 	return sanitizeFileName(target.Table) + "_" + sanitizeFileName(source.IncrPoint) + ".parquet"
 }

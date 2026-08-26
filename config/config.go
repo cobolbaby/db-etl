@@ -858,7 +858,6 @@ func validateTarget(target *TargetConfig, resolver DBResolver, s3Resolver S3Reso
 	return nil
 }
 
-
 func validateSource(source *SourceConfig, target *TargetConfig, resolver DBResolver) error {
 	if source == nil {
 		return fmt.Errorf("source must be specified")
@@ -895,10 +894,11 @@ func validateSource(source *SourceConfig, target *TargetConfig, resolver DBResol
 		source.BatchSize = 10000
 	}
 
-	// append 只追加不去重，没有 incr_field 就无从界定增量区间，重跑必然产生重复行，故必填。
-	if target.Mode == ModeTypeAppend && strings.TrimSpace(source.IncrField) == "" {
-		return fmt.Errorf("incr_field is required for %s mode", target.Mode)
-	}
+	// TODO: 待讨论，暂时将该验证注释掉，允许用户在 append 模式下不配置 incr_field，使用全量抽取的方式。
+	// // append 只追加不去重，没有 incr_field 就无从界定增量区间，重跑必然产生重复行，故必填。
+	// if target.Mode == ModeTypeAppend && strings.TrimSpace(source.IncrField) == "" {
+	// 	return fmt.Errorf("incr_field is required for %s mode", target.Mode)
+	// }
 
 	// merge 写 DB 时按 pk 做 DELETE + INSERT，重复抽取同一区间是幂等的，
 	// 允许不配 incr_field（由 SQL 自身圈定滚动窗口，如 date >= now() - interval '3 days'）。

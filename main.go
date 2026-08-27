@@ -247,11 +247,7 @@ func (e *etl) runPipeline(ctx context.Context, src *config.SourceConfig, srcDB c
 	// Transformer
 	// -----------------------------
 
-	columns, err := r.GetColumnMeta()
-	if err != nil {
-		return fmt.Errorf("get column meta: %w", err)
-	}
-	t := transform.NewTransformer(task.Transform, columns)
+	t := transform.NewTransformer(task.Transform)
 
 	// -----------------------------
 	// Pipeline

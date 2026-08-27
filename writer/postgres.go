@@ -4,7 +4,7 @@ import (
 	"bytes"
 	"context"
 	"db-etl/config"
-	"db-etl/transform"
+	"db-etl/reader"
 	"db-etl/util"
 	"fmt"
 	"io"
@@ -44,17 +44,17 @@ func (d *pgWriterDialect) close(ctx context.Context) error {
 }
 
 // drainFirstBatch 从 channel 中取出第一个非空 batch，用于获取列信息并启动后续写入。
-func drainFirstBatch(in <-chan transform.Batch) (transform.Batch, bool) {
+func drainFirstBatch(in <-chan reader.Batch) (reader.Batch, bool) {
 	for batch := range in {
 		if len(batch.Rows) == 0 {
 			continue
 		}
 		return batch, true
 	}
-	return transform.Batch{}, false
+	return reader.Batch{}, false
 }
 
-func (d *pgWriterDialect) writeFull(ctx context.Context, in <-chan transform.Batch, target *config.TargetConfig) error {
+func (d *pgWriterDialect) writeFull(ctx context.Context, in <-chan reader.Batch, target *config.TargetConfig) error {
 
 	firstBatch, foundRows := drainFirstBatch(in)
 
@@ -106,7 +106,7 @@ func (d *pgWriterDialect) writeFull(ctx context.Context, in <-chan transform.Bat
 	return tx.Commit(ctx)
 }
 
-func (d *pgWriterDialect) writeInitial(ctx context.Context, in <-chan transform.Batch, target *config.TargetConfig, source *config.SourceConfig, jobName string) error {
+func (d *pgWriterDialect) writeInitial(ctx context.Context, in <-chan reader.Batch, target *config.TargetConfig, source *config.SourceConfig, jobName string) error {
 	firstBatch, foundRows := drainFirstBatch(in)
 
 	// COPY 与「任务下线」放在同一事务内提交，保证 initial（首次全量）回填成功后
@@ -151,8 +151,8 @@ func (d *pgWriterDialect) deactivateInitialJob(ctx context.Context, tx pgx.Tx, t
 	return nil
 }
 
-func (d *pgWriterDialect) writeCopyWithFirstBatch(ctx context.Context, firstBatch transform.Batch, in <-chan transform.Batch, table string, conn *pgx.Conn) error {
-	return d.writeCopyStream(ctx, table, firstBatch.ColumnNames(), conn, func(write func(transform.Batch) error) error {
+func (d *pgWriterDialect) writeCopyWithFirstBatch(ctx context.Context, firstBatch reader.Batch, in <-chan reader.Batch, table string, conn *pgx.Conn) error {
+	return d.writeCopyStream(ctx, table, firstBatch.ColumnNames(), conn, func(write func(reader.Batch) error) error {
 		if err := write(firstBatch); err != nil {
 			return err
 		}
@@ -173,7 +173,7 @@ func (d *pgWriterDialect) writeCopyStream(
 	table string,
 	columns []string,
 	conn *pgx.Conn,
-	iterFn func(write func(transform.Batch) error) error,
+	iterFn func(write func(reader.Batch) error) error,
 ) error {
 	pr, pw := io.Pipe()
 
@@ -207,7 +207,7 @@ func (d *pgWriterDialect) writeCopyStream(
 	}
 	// CSV 文本编码在此处（而非 reader/transform）完成：它是 COPY 的输入格式要求，
 	// 与目标绑定；parquet 目标则直接消费原始值，无需经过字符串中转。
-	writeBatch := func(batch transform.Batch) error {
+	writeBatch := func(batch reader.Batch) error {
 		if len(batch.Rows) == 0 {
 			return nil
 		}
@@ -264,14 +264,14 @@ func buildCopySQL(table string, columns []string) string {
 	return base + " FROM STDIN WITH (FORMAT CSV, DELIMITER ',', QUOTE '\"', ESCAPE '\"', NULL '" + nullSentinel + "')"
 }
 
-func (d *pgWriterDialect) writeAppend(ctx context.Context, in <-chan transform.Batch, target *config.TargetConfig, source *config.SourceConfig, jobName string) error {
+func (d *pgWriterDialect) writeAppend(ctx context.Context, in <-chan reader.Batch, target *config.TargetConfig, source *config.SourceConfig, jobName string) error {
 	if target.CommitBatchSize > 0 {
 		return d.writeIncrChunked(ctx, in, target, source, jobName, false)
 	}
 	return d.writeIncrOnce(ctx, in, target, source, jobName, false)
 }
 
-func (d *pgWriterDialect) writeMerge(ctx context.Context, in <-chan transform.Batch, target *config.TargetConfig, source *config.SourceConfig, jobName string) error {
+func (d *pgWriterDialect) writeMerge(ctx context.Context, in <-chan reader.Batch, target *config.TargetConfig, source *config.SourceConfig, jobName string) error {
 	if target.CommitBatchSize > 0 {
 		return d.writeIncrChunked(ctx, in, target, source, jobName, true)
 	}
@@ -280,7 +280,7 @@ func (d *pgWriterDialect) writeMerge(ctx context.Context, in <-chan transform.Ba
 
 // writeIncrOnce 在单个事务中完成增量写入（append / merge 共用）。
 // needDelete=true 时先按 PK 从目标表删除重复行（merge 语义），false 时仅追加（append 语义）。
-func (d *pgWriterDialect) writeIncrOnce(ctx context.Context, in <-chan transform.Batch, target *config.TargetConfig, source *config.SourceConfig, jobName string, needDelete bool) error {
+func (d *pgWriterDialect) writeIncrOnce(ctx context.Context, in <-chan reader.Batch, target *config.TargetConfig, source *config.SourceConfig, jobName string, needDelete bool) error {
 	firstBatch, foundRows := drainFirstBatch(in)
 
 	if !foundRows {
@@ -343,7 +343,7 @@ func (d *pgWriterDialect) writeIncrOnce(ctx context.Context, in <-chan transform
 // writeIncrChunked 将增量写入拆成若干块，每 CommitBatchSize 个 batch 提交一次事务并更新水位。
 // needDelete=true 时每块先 DELETE 再 INSERT（merge），false 时仅 INSERT（append）。
 // 适用于超大表：中断后重启可从上次已提交的水位断点继续，而不必从头同步。
-func (d *pgWriterDialect) writeIncrChunked(ctx context.Context, in <-chan transform.Batch, target *config.TargetConfig, source *config.SourceConfig, jobName string, needDelete bool) error {
+func (d *pgWriterDialect) writeIncrChunked(ctx context.Context, in <-chan reader.Batch, target *config.TargetConfig, source *config.SourceConfig, jobName string, needDelete bool) error {
 	var totalDeleted, totalInserted int64
 	chunkIdx := 0
 
@@ -351,7 +351,7 @@ func (d *pgWriterDialect) writeIncrChunked(ctx context.Context, in <-chan transf
 	var (
 		currentTx      pgx.Tx
 		currentStaging string
-		feedCh         chan transform.Batch
+		feedCh         chan reader.Batch
 		copyDone       chan error
 		batchCount     int
 	)
@@ -369,10 +369,10 @@ func (d *pgWriterDialect) writeIncrChunked(ctx context.Context, in <-chan transf
 		}
 		currentTx = tx
 		currentStaging = staging
-		feedCh = make(chan transform.Batch, 1)
+		feedCh = make(chan reader.Batch, 1)
 		copyDone = make(chan error, 1)
 		go func(txConn *pgx.Conn) {
-			copyDone <- d.writeCopyStream(ctx, staging, columns, txConn, func(write func(transform.Batch) error) error {
+			copyDone <- d.writeCopyStream(ctx, staging, columns, txConn, func(write func(reader.Batch) error) error {
 				for b := range feedCh {
 					if err := write(b); err != nil {
 						return err

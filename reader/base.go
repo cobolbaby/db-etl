@@ -40,14 +40,9 @@ func (r *BaseReader) Close() error {
 	return nil
 }
 
-// GetColumnMeta 返回每列的列名、源库类型名与归一化语义类别，顺序与查询列一致。
-// 三者同源于一次列类型探测（WHERE 1=0），合并为单次调用可避免重复往返源库。
-func (r *BaseReader) GetColumnMeta() ([]ColumnMeta, error) {
-	colTypes, err := r.getColumnTypes()
-	if err != nil {
-		return nil, err
-	}
-
+// columnMeta 将结果集的列描述转为列名、源库类型名与归一化语义类别，顺序与查询列一致。
+// 三者同源于抽取查询自身的结果集描述，无需额外往返源库探测。
+func (r *BaseReader) columnMeta(colTypes []*sql.ColumnType) []ColumnMeta {
 	meta := make([]ColumnMeta, len(colTypes))
 	for i, ct := range colTypes {
 		typeName := ct.DatabaseTypeName()
@@ -57,26 +52,11 @@ func (r *BaseReader) GetColumnMeta() ([]ColumnMeta, error) {
 			Kind:     r.dialect.columnKind(typeName),
 		}
 	}
-	return meta, nil
+	return meta
 }
 
-func (r *BaseReader) getColumnTypes() ([]*sql.ColumnType, error) {
-	query, err := r.buildReadQuery(true)
-	if err != nil {
-		return nil, err
-	}
-
-	rows, err := r.conn.QueryContext(context.Background(), query)
-	if err != nil {
-		return nil, r.dialect.wrapError(fmt.Errorf("%w，sql: %s", err, query))
-	}
-	defer rows.Close()
-
-	return rows.ColumnTypes()
-}
-
-func (r *BaseReader) ReadBatch(ctx context.Context, cancel context.CancelFunc) <-chan RowBatch {
-	out := make(chan RowBatch, 8)
+func (r *BaseReader) ReadBatch(ctx context.Context, cancel context.CancelFunc) <-chan Batch {
+	out := make(chan Batch, 8)
 	go func() {
 		defer close(out)
 
@@ -87,7 +67,7 @@ func (r *BaseReader) ReadBatch(ctx context.Context, cancel context.CancelFunc) <
 			cancel()
 		}
 
-		query, err := r.buildReadQuery(false)
+		query, err := r.buildReadQuery()
 		if err != nil {
 			// 构建查询失败属于配置错误，重试无益，标记为不可重试。
 			fail(util.NonRetryable(fmt.Errorf("build query: %w，sql: %s", err, query)))
@@ -110,6 +90,10 @@ func (r *BaseReader) ReadBatch(ctx context.Context, cancel context.CancelFunc) <
 			fail(r.dialect.wrapError(fmt.Errorf("get columns: %w，sql: %s", err, query)))
 			return
 		}
+
+		// 列元数据取自本次查询的结果集描述，随每个批次下发；
+		// 各批次共享同一份切片，下游只读不改。
+		columns := r.columnMeta(colTypes)
 
 		// 驱动层的值表示差异在此归一，使下游只需面对 ColumnKind 约定的 Go 类型。
 		// 绝大多数列无需修正（normalizer 为 nil），故先探测是否有任何一列需要，
@@ -156,7 +140,7 @@ func (r *BaseReader) ReadBatch(ctx context.Context, cancel context.CancelFunc) <
 
 			// 监听 ctx：若下游（writer/transform）已失败并 cancel，及时退出避免 goroutine 泄漏。
 			select {
-			case out <- RowBatch{Rows: batch}:
+			case out <- Batch{Columns: columns, Rows: batch}:
 			case <-ctx.Done():
 				return
 			}
@@ -165,24 +149,23 @@ func (r *BaseReader) ReadBatch(ctx context.Context, cancel context.CancelFunc) <
 	return out
 }
 
-func (r *BaseReader) buildReadQuery(emptyResult bool) (string, error) {
+func (r *BaseReader) buildReadQuery() (string, error) {
 	projection, err := r.resolveProjection()
 	if err != nil {
 		return "", err
 	}
 
-	whereClause := r.buildWhereClause(emptyResult)
+	whereClause := r.buildWhereClause()
 	query, err := r.dialect.buildBaseQuery(r.Source, projection, whereClause)
 	if err != nil {
 		return "", err
 	}
 
-	// 仅实际抽取数据（非元数据探测 emptyResult）、增量模式（append/merge）才需要有序读取：
+	// 仅增量模式（append/merge）才需要有序读取：
 	// 增量小批次依赖 ORDER BY 才能按水位/断点续传稳定推进，table 与 sql（rawsql）源都需要；
 	// 全量模式（full/initial）无需排序，避免大表顺扫叠加排序开销。
 	// ORDER BY 在占位符替换之前拼接，使 order_by 中的 ${SRC_INCR_FIELD} 与 WHERE 中的占位符共用同一套方言加引号逻辑。
-	if !emptyResult &&
-		(r.Source.Mode == config.ModeTypeAppend || r.Source.Mode == config.ModeTypeMerge) &&
+	if (r.Source.Mode == config.ModeTypeAppend || r.Source.Mode == config.ModeTypeMerge) &&
 		r.Source.OrderBy != "" {
 		query += " ORDER BY " + r.Source.OrderBy
 	}
@@ -214,11 +197,7 @@ func (r *BaseReader) buildReadQuery(emptyResult bool) (string, error) {
 	return query, nil
 }
 
-func (r *BaseReader) buildWhereClause(emptyResult bool) string {
-	if emptyResult {
-		return "1=0"
-	}
-
+func (r *BaseReader) buildWhereClause() string {
 	if cond := strings.TrimSpace(r.Source.WhereStatement); cond != "" {
 		return cond
 	}

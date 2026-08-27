@@ -4,7 +4,6 @@ import (
 	"context"
 	"db-etl/config"
 	"db-etl/reader"
-	"db-etl/transform"
 	"db-etl/util"
 	"fmt"
 	"io"
@@ -74,7 +73,7 @@ func (d *parquetWriterDialect) close(ctx context.Context) error {
 	return d.metaConn.Close(ctx)
 }
 
-func (d *parquetWriterDialect) writeInitial(ctx context.Context, in <-chan transform.Batch, target *config.TargetConfig, source *config.SourceConfig, jobName string) error {
+func (d *parquetWriterDialect) writeInitial(ctx context.Context, in <-chan reader.Batch, target *config.TargetConfig, source *config.SourceConfig, jobName string) error {
 	// initial 视为一次性全量：覆盖写单对象；成功后置 inuse=false，避免下次重复回填。
 	if _, err := d.writeObject(ctx, in, defaultObjectKey(target), source); err != nil {
 		return err
@@ -88,24 +87,24 @@ func (d *parquetWriterDialect) writeInitial(ctx context.Context, in <-chan trans
 	return nil
 }
 
-func (d *parquetWriterDialect) writeFull(ctx context.Context, in <-chan transform.Batch, target *config.TargetConfig) error {
+func (d *parquetWriterDialect) writeFull(ctx context.Context, in <-chan reader.Batch, target *config.TargetConfig) error {
 	// full 全量刷新：覆盖写单对象。无水位、无 source 依赖。
 	_, err := d.writeObject(ctx, in, defaultObjectKey(target), nil)
 	return err
 }
 
-func (d *parquetWriterDialect) writeAppend(ctx context.Context, in <-chan transform.Batch, target *config.TargetConfig, source *config.SourceConfig, jobName string) error {
+func (d *parquetWriterDialect) writeAppend(ctx context.Context, in <-chan reader.Batch, target *config.TargetConfig, source *config.SourceConfig, jobName string) error {
 	return d.writeIncremental(ctx, in, target, source, jobName)
 }
 
-func (d *parquetWriterDialect) writeMerge(ctx context.Context, in <-chan transform.Batch, target *config.TargetConfig, source *config.SourceConfig, jobName string) error {
+func (d *parquetWriterDialect) writeMerge(ctx context.Context, in <-chan reader.Batch, target *config.TargetConfig, source *config.SourceConfig, jobName string) error {
 	// 对象存储不可按 PK 原地删除/更新，merge 与 append 一致：追加新对象，去重交由下游查询处理。
 	log.Printf("parquet target does not support in-place merge by pk; writing incremental object for table=%s (downstream must dedupe by pk=%s)", target.Table, target.PK)
 	return d.writeIncremental(ctx, in, target, source, jobName)
 }
 
 // writeIncremental 每次增量写一个新对象，并把最大水位写回 manager。
-func (d *parquetWriterDialect) writeIncremental(ctx context.Context, in <-chan transform.Batch, target *config.TargetConfig, source *config.SourceConfig, jobName string) error {
+func (d *parquetWriterDialect) writeIncremental(ctx context.Context, in <-chan reader.Batch, target *config.TargetConfig, source *config.SourceConfig, jobName string) error {
 	key := incrementalObjectKey(target, source)
 
 	wm, err := d.writeObject(ctx, in, key, source)
@@ -169,7 +168,7 @@ func resolveIncrIndex(columns []reader.ColumnMeta, source *config.SourceConfig) 
 }
 
 // encodeBatch 将一个 batch 的所有行编码进 pw，达到 flush 阈值时批量写出，并推进水位。
-func (e *parquetEncoder) encodeBatch(pw *parquet.GenericWriter[any], batch transform.Batch) error {
+func (e *parquetEncoder) encodeBatch(pw *parquet.GenericWriter[any], batch reader.Batch) error {
 	for _, row := range batch.Rows {
 		e.rb.Reset()
 		// row 与 batch.Columns 同源构造，长度必然一致。
@@ -223,7 +222,7 @@ func (e *parquetEncoder) flush(pw *parquet.GenericWriter[any]) error {
 // writeObject 从 channel 消费所有 batch，按首个 batch 的列与类型建立 schema，将 parquet 数据
 // 流式写入对象存储（经 io.Pipe 边序列化边上传，不落本地临时文件）。
 // 若 source 非 nil 且含增量字段，返回其最大值作为水位。
-func (d *parquetWriterDialect) writeObject(ctx context.Context, in <-chan transform.Batch, key string, source *config.SourceConfig) (string, error) {
+func (d *parquetWriterDialect) writeObject(ctx context.Context, in <-chan reader.Batch, key string, source *config.SourceConfig) (string, error) {
 	target := d.store.describe(key)
 
 	firstBatch, foundRows := drainFirstBatch(in)

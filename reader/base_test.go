@@ -7,11 +7,18 @@ import (
 	"time"
 )
 
-func TestBuildWhereClauseIgnoresPlaceholderWhenEmptyResult(t *testing.T) {
+func TestBuildWhereClauseUsesConfiguredStatement(t *testing.T) {
 	reader := &BaseReader{Source: &config.SourceConfig{WhereStatement: "updated_at > ${INCR_POINT}"}}
-	clause := reader.buildWhereClause(true)
-	if clause != "1=0" {
-		t.Fatalf("expected 1=0, got %q", clause)
+	clause := reader.buildWhereClause()
+	if clause != "updated_at > ${INCR_POINT}" {
+		t.Fatalf("expected where statement passthrough, got %q", clause)
+	}
+}
+
+func TestBuildWhereClauseDefaultsToAlwaysTrue(t *testing.T) {
+	reader := &BaseReader{Source: &config.SourceConfig{}}
+	if clause := reader.buildWhereClause(); clause != "1=1" {
+		t.Fatalf("expected 1=1, got %q", clause)
 	}
 }
 

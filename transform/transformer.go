@@ -6,56 +6,28 @@ import (
 	"sync"
 )
 
-// Batch 是转换链上的数据载体：列元数据 + 驱动返回的原始值。
-// 值不在此层序列化 —— 文本编码是写入端的格式细节（PG COPY 要 CSV 文本，
-// parquet 要类型化的列值），提前转成字符串会迫使 parquet 再解析回去，既有开销也有精度损失。
-type Batch struct {
-	Columns []reader.ColumnMeta
-	Rows    [][]any
-}
-
-// ColumnNames 提取列名切片，供只需列名的 writer（如 PG COPY 构建 SQL）使用。
-func (b Batch) ColumnNames() []string {
-	names := make([]string, len(b.Columns))
-	for i, c := range b.Columns {
-		names[i] = c.Name
-	}
-	return names
-}
-
-// Transformer 是转换链的统一入口：把 reader 抽取的 RowBatch 转换为带列元数据的 Batch。
-// pipeline 对每个批次只调用一次 Transform。
+// Transformer 是转换链上的一环：在 Batch 上做重塑（Batch -> Batch）。
+// 因输入输出同构而可按顺序自由串接；pipeline 对每个批次只调用一次 Transform。
+// 列元数据随 Batch 同行，故转换器无需在构造时预先获知源端列结构。
 type Transformer interface {
-	Transform(batch reader.RowBatch) Batch
+	Transform(batch reader.Batch) reader.Batch
 }
 
-// Step 是链上的转换步骤：在 Batch 上做进一步重塑（Batch -> Batch）。
-// 因输入输出同构而可按顺序自由串接。
-type Step interface {
-	Transform(batch Batch) Batch
-}
+// passthrough 是无转换配置时的空实现：原样透传批次。
+type passthrough struct{}
 
-// baseTransformer 是转换链的起点：把 reader 的原始行批与列元数据组合成 Batch。
-type baseTransformer struct {
-	columns []reader.ColumnMeta
-}
+func (passthrough) Transform(batch reader.Batch) reader.Batch { return batch }
 
-func (t *baseTransformer) Transform(batch reader.RowBatch) Batch {
-	return Batch{Columns: t.columns, Rows: batch.Rows}
-}
-
-// chainTransformer 以 baseTransformer 为基座，按顺序叠加若干 Step。
+// chainTransformer 按顺序依次应用各个转换器。
 type chainTransformer struct {
-	base  *baseTransformer
-	steps []Step
+	steps []Transformer
 }
 
-func (t *chainTransformer) Transform(batch reader.RowBatch) Batch {
-	out := t.base.Transform(batch)
+func (t *chainTransformer) Transform(batch reader.Batch) reader.Batch {
 	for _, step := range t.steps {
-		out = step.Transform(out)
+		batch = step.Transform(batch)
 	}
-	return out
+	return batch
 }
 
 // UnpivotTransformer 将宽表列转行：把 Columns 中列出的源列展开成 KeyField/ValueField 两列的多行，
@@ -76,7 +48,7 @@ type UnpivotTransformer struct {
 	warnOnce sync.Once
 }
 
-func (t *UnpivotTransformer) Transform(batch Batch) Batch {
+func (t *UnpivotTransformer) Transform(batch reader.Batch) reader.Batch {
 	// 每批根据当前列名重新解析标识列与待展开列：转换器实例在多个 worker 间共享，
 	// 将解析结果保留为局部变量（而非缓存到字段）可避免共享可变状态、天然并发安全；
 	// 解析成本为 O(列数)，相对每批的行处理可忽略。
@@ -132,7 +104,7 @@ func (t *UnpivotTransformer) Transform(batch Batch) Batch {
 		}
 	}
 
-	return Batch{Columns: outCols, Rows: outRows}
+	return reader.Batch{Columns: outCols, Rows: outRows}
 }
 
 // checkLayout 在首批数据上核对列布局，对易导致静默错误数据的配置问题发出告警：

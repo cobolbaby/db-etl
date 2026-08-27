@@ -19,7 +19,7 @@ func RunPipeline(ctx context.Context, source *config.SourceConfig, r reader.Read
 	defer cancel()
 
 	rowChan := r.ReadBatch(ctx, cancel)
-	batchChan := make(chan transform.Batch, 4)
+	batchChan := make(chan reader.Batch, 4)
 
 	var wg sync.WaitGroup
 	workers := min(runtime.NumCPU(), 2) // 4 is an empirical value, can be tuned

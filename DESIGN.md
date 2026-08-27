@@ -18,7 +18,7 @@
                           │          Pipeline                   │
                           │                                     │
   ┌──────────┐   chan     │  ┌────────────┐   chan   ┌───────┐ │
-  │  Reader  │──RowBatch──┼─▶│ Transformer│──Batch───▶ Writer│ │
+  │  Reader  │───Batch────┼─▶│ Transformer│──Batch───▶ Writer│ │
   └──────────┘            │  └────────────┘          └───────┘ │
                           └────────────────────────────────────┘
                                          ▲                 │
@@ -31,9 +31,9 @@
 
 ### 数据流
 
-1. **Reader** 执行 SQL 查询，按 `batch_size` 分批发送 `RowBatch`（`[][]any`）到 channel。
-   值保持驱动返回的原始 Go 类型，不做任何面向目标格式的序列化。
-2. **Transformer** 多 worker 并发消费 `RowBatch`，附上列元信息并做结构重塑（如 unpivot），输出 `Batch{Columns, Rows}`。
+1. **Reader** 执行 SQL 查询，按 `batch_size` 分批发送 `Batch{Columns, Rows}` 到 channel。
+   值保持驱动返回的原始 Go 类型，不做任何面向目标格式的序列化；列元数据取自本次查询的结果集描述。
+2. **Transformer** 多 worker 并发消费 `Batch`，做结构重塑（如 unpivot），输出同类型的 `Batch`。
 3. **Writer** 消费 `Batch`，按自身目标格式序列化：PG 走 `COPY FROM STDIN`（CSV 文本），S3 走 parquet 编码。
 
 所有阶段通过带缓冲 channel 连接，天然实现**背压（back-pressure）**控制。
@@ -283,7 +283,9 @@ buildReadQuery()             → 追加增量条件 + ORDER BY
 
 ### 4.2 类型处理
 
-`GetColumnMeta()` 只做一次列类型探测（`WHERE 1=0`），根据 `sql.ColumnType.DatabaseTypeName()`
+`Batch` 携带的列元数据直接来自抽取查询自身的结果集描述（`rows.ColumnTypes()`），
+无需额外的带外探测（早期版本另发一条 `WHERE 1=0` 查询，对存储过程源意味着多执行一次 SP）。
+根据 `sql.ColumnType.DatabaseTypeName()`
 为每一列返回 `ColumnMeta{Name, TypeName, Kind}`。`Kind` 由各方言的 `columnKind` 映射：
 
 | ColumnKind   | 覆盖类型                                      | 驱动返回的 Go 类型  |
@@ -305,31 +307,31 @@ buildReadQuery()             → 追加增量条件 + ORDER BY
 
 ### 4.3 Batch Channel 缓冲
 
-`make(chan RowBatch, 8)` — 8 个 batch 的缓冲平衡 Reader（网络 IO 密集）和 Writer（磁盘 IO 密集）的速度差异。
+`make(chan Batch, 8)` — 8 个 batch 的缓冲平衡 Reader（网络 IO 密集）和 Writer（磁盘 IO 密集）的速度差异。
 
 ---
 
 ## 5. Transform 层设计
 
-Transform 负责**附列元信息与结构重塑**，不做值的序列化：
+reader / transform / writer 共用同一个 `reader.Batch`：列元数据随批次同行，
+每一段都能自描述地知道「这批数据有哪些列」，转换器也无需在构造时预先获知源端列结构。
+Transform 负责**结构重塑**，不做值的序列化：
 
 ```go
+// reader 包
 type Batch struct {
-    Columns []reader.ColumnMeta
+    Columns []ColumnMeta
     Rows    [][]any
 }
 
+// transform 包
 type Transformer interface {
-    Transform(batch reader.RowBatch) Batch   // 入口：原始行 → 带列信息的批
-}
-
-type Step interface {
-    Transform(batch Batch) Batch             // 可链式叠加的转换步骤
+    Transform(batch reader.Batch) reader.Batch   // 输入输出同构，可自由串接
 }
 ```
 
-- `baseTransformer` 只把 `GetColumnMeta()` 的结果附到 batch 上；无 transform 配置时即为全部逻辑。
-- 配置了 transform 时，`chainTransformer` 在其后依次执行各 `Step`。
+- 无 transform 配置时返回 `passthrough`，原样透传批次。
+- 配置了 transform 时，`chainTransformer` 依次执行各转换器。
 - Pipeline 内使用 `min(NumCPU, 2)` 个 worker 并发执行 Transform，输出到 `batchChan`（缓冲 4）。
 
 ### 5.1 Unpivot（列转行）
@@ -410,12 +412,12 @@ main goroutine
 
 ## 9. 扩展点
 
-| 方向             | 当前状态                       | 扩展方式                       |
-| ---------------- | ------------------------------ | ------------------------------ |
-| 新数据源         | MSSQL / PG / GP / Oracle       | 实现 `readerDialect` 接口      |
-| 新目标端         | PG / GP（COPY）、S3（parquet） | 实现 `writerDialect` 接口      |
-| 新列类型         | 6 种 `ColumnKind`              | 新增 Kind + 各 writer 补全分支 |
-| 自定义 Transform | unpivot                        | 实现 `transform.Step` 接口     |
-| 监控指标         | log 打印耗时                   | 注入 metrics collector         |
-| 重试机制         | `util/retry.go` 指数退避       | 调整 `retry` 配置项            |
-| 密码管理         | YAML 支持 `${ENV}` 引用        | 对接 Vault 等外部密钥源        |
+| 方向             | 当前状态                       | 扩展方式                          |
+| ---------------- | ------------------------------ | --------------------------------- |
+| 新数据源         | MSSQL / PG / GP / Oracle       | 实现 `readerDialect` 接口         |
+| 新目标端         | PG / GP（COPY）、S3（parquet） | 实现 `writerDialect` 接口         |
+| 新列类型         | 6 种 `ColumnKind`              | 新增 Kind + 各 writer 补全分支    |
+| 自定义 Transform | unpivot                        | 实现 `transform.Transformer` 接口 |
+| 监控指标         | log 打印耗时                   | 注入 metrics collector            |
+| 重试机制         | `util/retry.go` 指数退避       | 调整 `retry` 配置项               |
+| 密码管理         | YAML 支持 `${ENV}` 引用        | 对接 Vault 等外部密钥源           |

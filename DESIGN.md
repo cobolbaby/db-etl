@@ -82,9 +82,9 @@ BaseWriter { Target, JobName, dialect writerDialect }
 
 `readerDialect` 中与类型相关的两个方法职责区分明确：
 
-| 方法 | 职责 |
-| --- | --- |
-| `columnKind` | 源类型名 → `ColumnKind`，纯映射，决定下游怎么落地 |
+| 方法              | 职责                                                             |
+| ----------------- | ---------------------------------------------------------------- |
+| `columnKind`      | 源类型名 → `ColumnKind`，纯映射，决定下游怎么落地                |
 | `valueNormalizer` | 修正驱动层的值表示差异，使同一 Kind 在各源库上呈现一致的 Go 类型 |
 
 绝大多数列不需要 normalizer（返回 nil）；目前唯一的使用者是 MSSQL 的
@@ -117,23 +117,23 @@ Reader → Transformer → [io.Pipe] → PgConn.CopyFrom(STDIN)
 
 **实现技巧：**
 
-| 技巧 | 原理 |
-| --- | --- |
-| `io.Pipe` 流式传输 | 生产端（CSV 编码）和消费端（COPY 协议）通过 pipe 连接，数据不落盘、不缓存全量 |
-| 4MB 写缓冲 | `bytes.Buffer` 初始 4MB，累积到 3MB flush 一次，减少 `write()` 系统调用 |
-| COPY goroutine 异步 | COPY 消费在独立 goroutine，生产阻塞即为背压信号 |
-| NULL 哨兵 | COPY 的 CSV 格式无法区分「空字符串」与「NULL」，故改用哨兵文本（见下） |
+| 技巧                | 原理                                                                          |
+| ------------------- | ----------------------------------------------------------------------------- |
+| `io.Pipe` 流式传输  | 生产端（CSV 编码）和消费端（COPY 协议）通过 pipe 连接，数据不落盘、不缓存全量 |
+| 4MB 写缓冲          | `bytes.Buffer` 初始 4MB，累积到 3MB flush 一次，减少 `write()` 系统调用       |
+| COPY goroutine 异步 | COPY 消费在独立 goroutine，生产阻塞即为背压信号                               |
+| NULL 哨兵           | COPY 的 CSV 格式无法区分「空字符串」与「NULL」，故改用哨兵文本（见下）        |
 
 **CSV 编码位置：**`writer/pgcopy.go` 集中了 COPY 格式的全部知识（`encodeCopyValue` / `sanitizeCSV`），
 在 COPY 写入时才把 `any` 编码为字段文本；`reader` 与 `transform` 对此一无所知。
 
-| 环节 | 处理 |
-| --- | --- |
-| NULL | 编码为 `__DB_ETL_NULL__` 哨兵，`COPY ... NULL '__DB_ETL_NULL__'` 据此识别 |
-| 空字符串 | 仍编码为空字段，与 NULL 彻底分开（能正确触发 NOT NULL 约束） |
-| 二进制（bytea） | 输出 `\x` 十六进制字面量 |
-| 控制字符 | 剔除会破坏 CSV 结构的不可见字符（保留 \t \n \r 交由引号包裹） |
-| 哨兵撞车 | 源数据恰好等于哨兵文本时强制加引号，确保作为普通文本入库 |
+| 环节            | 处理                                                                      |
+| --------------- | ------------------------------------------------------------------------- |
+| NULL            | 编码为 `__DB_ETL_NULL__` 哨兵，`COPY ... NULL '__DB_ETL_NULL__'` 据此识别 |
+| 空字符串        | 仍编码为空字段，与 NULL 彻底分开（能正确触发 NOT NULL 约束）              |
+| 二进制（bytea） | 输出 `\x` 十六进制字面量                                                  |
+| 控制字符        | 剔除会破坏 CSV 结构的不可见字符（保留 \t \n \r 交由引号包裹）             |
+| 哨兵撞车        | 源数据恰好等于哨兵文本时强制加引号，确保作为普通文本入库                  |
 
 ---
 
@@ -152,12 +152,12 @@ COMMIT
 
 **实现技巧：**
 
-| 技巧 | 原理 |
-| --- | --- |
-| TRUNCATE + COPY 同事务 | 原子性保证：失败自动回滚，不会出现"清空了但没写入"的中间态 |
-| Lock Timeout 退避 | `SET LOCAL lock_timeout = '30s'`；TRUNCATE 需要 ACCESS EXCLUSIVE 锁，若被阻塞则超时后退化为 `DELETE FROM`（仅需 ROW EXCLUSIVE 锁），避免长时间阻塞其他会话 |
-| 延迟启动 `drainFirstBatch()` | 先从 channel 取第一个非空 batch，若 Reader 无数据直接跳过，不执行无意义的 TRUNCATE |
-| `CREATE TEMP TABLE ... ON COMMIT DROP` | Full 模式不需要 staging 表，但 Merge/Append 需要——临时表随事务结束自动清理 |
+| 技巧                                   | 原理                                                                                                                                                       |
+| -------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| TRUNCATE + COPY 同事务                 | 原子性保证：失败自动回滚，不会出现"清空了但没写入"的中间态                                                                                                 |
+| Lock Timeout 退避                      | `SET LOCAL lock_timeout = '30s'`；TRUNCATE 需要 ACCESS EXCLUSIVE 锁，若被阻塞则超时后退化为 `DELETE FROM`（仅需 ROW EXCLUSIVE 锁），避免长时间阻塞其他会话 |
+| 延迟启动 `drainFirstBatch()`           | 先从 channel 取第一个非空 batch，源头无数据需要同步清空下游数据                                                                                            |
+| `CREATE TEMP TABLE ... ON COMMIT DROP` | Full 模式不需要 staging 表，但 Merge/Append 需要——临时表随事务结束自动清理                                                                                 |
 
 ---
 
@@ -176,12 +176,12 @@ COMMIT
 
 **实现技巧：**
 
-| 技巧 | 原理 |
-| --- | --- |
-| Staging 中转 | 先 COPY 到 temp table 再 `INSERT INTO ... SELECT`，比逐行 INSERT 快 1~2 个数量级 |
-| Watermark 原子更新 | 水位更新与数据写入在同一事务，保证一致性——不会出现"数据写了但水位没更新"导致重复同步 |
-| 分段提交 `commit_batch_size` | 超大表场景，每 N 个 batch 提交一次事务并推进水位；中断后从上次水位续传，避免从头同步 |
-| Watermark Fallback 链 | ① 查 `job_data_sync.incr_point` → ② 查目标表 `MAX(incr_field)` → ③ 按字段名推断默认值 |
+| 技巧                         | 原理                                                                                  |
+| ---------------------------- | ------------------------------------------------------------------------------------- |
+| Staging 中转                 | 先 COPY 到 temp table 再 `INSERT INTO ... SELECT`，比逐行 INSERT 快 1~2 个数量级      |
+| Watermark 原子更新           | 水位更新与数据写入在同一事务，保证一致性——不会出现"数据写了但水位没更新"导致重复同步  |
+| 分段提交 `commit_batch_size` | 超大表场景，每 N 个 batch 提交一次事务并推进水位；中断后从上次水位续传，避免从头同步  |
+| Watermark Fallback 链        | ① 查 `job_data_sync.incr_point` → ② 查目标表 `MAX(incr_field)` → ③ 按字段名推断默认值 |
 
 ---
 
@@ -201,12 +201,12 @@ COMMIT
 
 **实现技巧：**
 
-| 技巧 | 原理 |
-| --- | --- |
-| DELETE + INSERT 代替 ON CONFLICT | 不依赖 UNIQUE 约束，支持任意复合 PK（逗号分隔），兼容 Greenplum 等不完整支持 `ON CONFLICT` 的引擎 |
-| JOIN 条件自动构建 | `buildJoinCondition("t", "s", "pk1,pk2")` → `t.pk1=s.pk1 AND t.pk2=s.pk2` |
-| 与 Append 共用核心逻辑 | `writeIncrOnce` / `writeIncrSegmented` 通过 `needDelete bool` 参数区分，最大化代码复用 |
-| 分段模式防死锁 | `select { case feedCh <- batch; case <-copyDone }` 同时监听两个 channel，COPY goroutine 异常退出时主循环不会永久阻塞 |
+| 技巧                             | 原理                                                                                                                 |
+| -------------------------------- | -------------------------------------------------------------------------------------------------------------------- |
+| DELETE + INSERT 代替 ON CONFLICT | 不依赖 UNIQUE 约束，支持任意复合 PK（逗号分隔），兼容 Greenplum 等不完整支持 `ON CONFLICT` 的引擎                    |
+| JOIN 条件自动构建                | `buildJoinCondition("t", "s", "pk1,pk2")` → `t.pk1=s.pk1 AND t.pk2=s.pk2`                                            |
+| 与 Append 共用核心逻辑           | `writeIncrOnce` / `writeIncrSegmented` 通过 `needDelete bool` 参数区分，最大化代码复用                               |
+| 分段模式防死锁                   | `select { case feedCh <- batch; case <-copyDone }` 同时监听两个 channel，COPY goroutine 异常退出时主循环不会永久阻塞 |
 
 ---
 
@@ -243,22 +243,22 @@ flush (每 1024 行)            → GenericWriter[any]
 writeObject                   → io.Pipe → minio PutObject（size = -1，流式上传）
 ```
 
-| ColumnKind | Parquet 物理类型 |
-| --- | --- |
-| `KindInt` | `INT64` |
-| `KindFloat` | `DOUBLE` |
-| `KindBool` | `BOOLEAN` |
-| `KindTime` | `INT64` + `Timestamp(Millisecond)`，值按 `t.UTC().UnixMilli()` |
-| `KindBytes` | `BYTE_ARRAY` |
-| 其余 | `BYTE_ARRAY` + `String()` 逻辑类型 |
+| ColumnKind  | Parquet 物理类型                                               |
+| ----------- | -------------------------------------------------------------- |
+| `KindInt`   | `INT64`                                                        |
+| `KindFloat` | `DOUBLE`                                                       |
+| `KindBool`  | `BOOLEAN`                                                      |
+| `KindTime`  | `INT64` + `Timestamp(Millisecond)`，值按 `t.UTC().UnixMilli()` |
+| `KindBytes` | `BYTE_ARRAY`                                                   |
+| 其余        | `BYTE_ARRAY` + `String()` 逻辑类型                             |
 
 **与 PG 落地的关键差异：**
 
-| 维度 | PG COPY | S3 Parquet |
-| --- | --- | --- |
-| 值形态 | 一律 CSV 文本 | 保留原生类型（时间戳/浮点/二进制不经文本往返） |
-| 事务性 | 水位与数据在同一事务内提交 | 对象存储无事务，水位单独提交 |
-| 幂等保障 | 事务回滚 | 对象 key 确定：`<table>.parquet` / `<table>_<incr_point>.parquet`，重跑覆盖同名对象 |
+| 维度     | PG COPY                    | S3 Parquet                                                                          |
+| -------- | -------------------------- | ----------------------------------------------------------------------------------- |
+| 值形态   | 一律 CSV 文本              | 保留原生类型（时间戳/浮点/二进制不经文本往返）                                      |
+| 事务性   | 水位与数据在同一事务内提交 | 对象存储无事务，水位单独提交                                                        |
+| 幂等保障 | 事务回滚                   | 对象 key 确定：`<table>.parquet` / `<table>_<incr_point>.parquet`，重跑覆盖同名对象 |
 
 由于对象存储没有事务，增量模式的对象 key 刻意包含水位值：中断重跑会写到同一个 key 上并整体覆盖，
 从而在没有事务的前提下获得幂等性。
@@ -286,14 +286,14 @@ buildReadQuery()             → 追加增量条件 + ORDER BY
 `GetColumnMeta()` 只做一次列类型探测（`WHERE 1=0`），根据 `sql.ColumnType.DatabaseTypeName()`
 为每一列返回 `ColumnMeta{Name, TypeName, Kind}`。`Kind` 由各方言的 `columnKind` 映射：
 
-| ColumnKind | 覆盖类型 | 驱动返回的 Go 类型 |
-| --- | --- | --- |
+| ColumnKind   | 覆盖类型                                      | 驱动返回的 Go 类型  |
+| ------------ | --------------------------------------------- | ------------------- |
 | `KindString` | 文本类、NUMERIC/DECIMAL/NUMBER、PG 数组字面量 | `string` / `[]byte` |
-| `KindInt` | INT2/INT4/INT8、TINYINT..BIGINT | `int64` |
-| `KindFloat` | FLOAT4/FLOAT8、REAL/FLOAT | `float64` |
-| `KindBool` | BOOL、MSSQL BIT | `bool` 或 0/1 整数 |
-| `KindTime` | DATE/TIME/TIMESTAMP/DATETIME2/DATETIMEOFFSET | `time.Time` |
-| `KindBytes` | BYTEA、VARBINARY、Oracle RAW/BLOB | `[]byte` |
+| `KindInt`    | INT2/INT4/INT8、TINYINT..BIGINT               | `int64`             |
+| `KindFloat`  | FLOAT4/FLOAT8、REAL/FLOAT                     | `float64`           |
+| `KindBool`   | BOOL、MSSQL BIT                               | `bool` 或 0/1 整数  |
+| `KindTime`   | DATE/TIME/TIMESTAMP/DATETIME2/DATETIMEOFFSET  | `time.Time`         |
+| `KindBytes`  | BYTEA、VARBINARY、Oracle RAW/BLOB             | `[]byte`            |
 
 **为什么没有 `KindDecimal`：**NUMERIC / DECIMAL / NUMBER 一律归入 `KindString`。
 三个驱动都以文本返回这类列，按字符串透传恰好保住完整精度；转成 `float64` 反而会丢精度。
@@ -376,13 +376,13 @@ getWatermark()
 
 ## 7. 错误处理策略
 
-| 层级 | 策略 |
-| --- | --- |
-| Task 级 | `error_policy: abort` 立即退出 / `continue` 跳过当前 task |
-| Source 级 | 先按 `retry` 策略指数退避重试（仅可重试错误），仍失败则继续下一个 source |
-| 错误分类 | `util/pgerr.go` 等将 SQLSTATE 22/23/42 类（数据/约束/语法）标为不可重试 |
-| Pipeline 内部 | Reader 出错时 cancel ctx 令 writer 事务回滚；返回时 reader 错误优先 |
-| 分段模式 | 每段独立事务，已提交段不回滚；失败段回滚，程序退出后可从水位续传 |
+| 层级          | 策略                                                                     |
+| ------------- | ------------------------------------------------------------------------ |
+| Task 级       | `error_policy: abort` 立即退出 / `continue` 跳过当前 task                |
+| Source 级     | 先按 `retry` 策略指数退避重试（仅可重试错误），仍失败则继续下一个 source |
+| 错误分类      | `util/pgerr.go` 等将 SQLSTATE 22/23/42 类（数据/约束/语法）标为不可重试  |
+| Pipeline 内部 | Reader 出错时 cancel ctx 令 writer 事务回滚；返回时 reader 错误优先      |
+| 分段模式      | 每段独立事务，已提交段不回滚；失败段回滚，程序退出后可从水位续传         |
 
 ---
 
@@ -410,12 +410,12 @@ main goroutine
 
 ## 9. 扩展点
 
-| 方向 | 当前状态 | 扩展方式 |
-| --- | --- | --- |
-| 新数据源 | MSSQL / PG / GP / Oracle | 实现 `readerDialect` 接口 |
-| 新目标端 | PG / GP（COPY）、S3（parquet） | 实现 `writerDialect` 接口 |
-| 新列类型 | 6 种 `ColumnKind` | 新增 Kind + 各 writer 补全分支 |
-| 自定义 Transform | unpivot | 实现 `transform.Step` 接口 |
-| 监控指标 | log 打印耗时 | 注入 metrics collector |
-| 重试机制 | `util/retry.go` 指数退避 | 调整 `retry` 配置项 |
-| 密码管理 | YAML 支持 `${ENV}` 引用 | 对接 Vault 等外部密钥源 |
+| 方向             | 当前状态                       | 扩展方式                       |
+| ---------------- | ------------------------------ | ------------------------------ |
+| 新数据源         | MSSQL / PG / GP / Oracle       | 实现 `readerDialect` 接口      |
+| 新目标端         | PG / GP（COPY）、S3（parquet） | 实现 `writerDialect` 接口      |
+| 新列类型         | 6 种 `ColumnKind`              | 新增 Kind + 各 writer 补全分支 |
+| 自定义 Transform | unpivot                        | 实现 `transform.Step` 接口     |
+| 监控指标         | log 打印耗时                   | 注入 metrics collector         |
+| 重试机制         | `util/retry.go` 指数退避       | 调整 `retry` 配置项            |
+| 密码管理         | YAML 支持 `${ENV}` 引用        | 对接 Vault 等外部密钥源        |

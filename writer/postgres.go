@@ -58,10 +58,12 @@ func (d *pgWriterDialect) writeFull(ctx context.Context, in <-chan transform.Bat
 
 	firstBatch, foundRows := drainFirstBatch(in)
 
-	if !foundRows {
-		log.Printf("table=%s full refresh finished: no rows to load", target.Table)
-		return nil
-	}
+	// 源端为空同样是一种有效状态（数据被清空/条件过滤后无结果），仍需清表提交，
+	// 否则目标表会残留上一轮的过期数据。
+	// if !foundRows {
+	// 	log.Printf("table=%s full refresh finished: no rows to load", target.Table)
+	// 	return nil
+	// }
 
 	tx, err := d.conn.Begin(ctx)
 	if err != nil {
@@ -92,11 +94,15 @@ func (d *pgWriterDialect) writeFull(ctx context.Context, in <-chan transform.Bat
 	}
 
 	// 使用事务所在连接执行 COPY，确保 COPY 与清表操作在同一事务内原子提交。
-	if err := d.writeCopyWithFirstBatch(ctx, firstBatch, in, target.Table, tx.Conn()); err != nil {
-		return err
+	if foundRows {
+		if err := d.writeCopyWithFirstBatch(ctx, firstBatch, in, target.Table, tx.Conn()); err != nil {
+			return err
+		}
+		log.Printf("table=%s full refresh finished: target replaced", target.Table)
+	} else {
+		log.Printf("table=%s full refresh finished: source has no rows, target cleared", target.Table)
 	}
 
-	log.Printf("table=%s full refresh finished: target replaced", target.Table)
 	return tx.Commit(ctx)
 }
 

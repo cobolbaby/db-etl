@@ -6,6 +6,7 @@ import (
 	"db-etl/util"
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/google/uuid"
 )
@@ -16,12 +17,13 @@ type MSSQLReader struct {
 
 type mssqlDialect struct{}
 
-func NewMSSQLReader(db *sql.DB, src *config.SourceConfig) Reader {
+func NewMSSQLReader(db *sql.DB, src *config.SourceConfig, loc *time.Location) Reader {
 	return &MSSQLReader{
 		BaseReader: &BaseReader{
 			conn:    db,
 			Source:  src,
 			dialect: mssqlDialect{},
+			loc:     loc,
 		},
 	}
 }
@@ -85,26 +87,33 @@ func (mssqlDialect) columnKind(dbType string) ColumnKind {
 	}
 }
 
-// valueNormalizer 修正 uniqueidentifier 的字节序。
-// go-mssqldb 以 SQL Server 的混合字节序返回该类型的 16 字节值，
-// 需按 RFC 4122 重排后才是通用的 UUID 文本。
-func (mssqlDialect) valueNormalizer(dbType string) ValueNormalizer {
-	if strings.ToUpper(dbType) != "UNIQUEIDENTIFIER" {
-		return nil
-	}
-	return func(v any) any {
-		switch t := v.(type) {
-		case []byte:
-			s, err := MSSQLUUIDToString(t)
-			if err != nil {
+// valueNormalizer 修正驱动层的值表示差异。
+//   - 无时区日期时间（DATETIME/DATETIME2/SMALLDATETIME/DATE/TIME）：go-mssqldb 以
+//     「墙钟 + UTC Location」返回，贴回本地时区，避免下游按 UTC 归一时整体偏移时差。
+//     DATETIMEOFFSET 自带偏移、驱动已返回正确瞬时，故不在此列。
+//   - uniqueidentifier：go-mssqldb 以 SQL Server 的混合字节序返回 16 字节值，
+//     需按 RFC 4122 重排后才是通用的 UUID 文本。
+func (mssqlDialect) valueNormalizer(dbType string, loc *time.Location) ValueNormalizer {
+	switch strings.ToUpper(dbType) {
+	case "DATETIME", "DATETIME2", "SMALLDATETIME", "DATE", "TIME":
+		return NaiveTimeNormalizer(loc)
+	case "UNIQUEIDENTIFIER":
+		return func(v any) any {
+			switch t := v.(type) {
+			case []byte:
+				s, err := MSSQLUUIDToString(t)
+				if err != nil {
+					return v
+				}
+				return s
+			case string:
+				return strings.ToUpper(t)
+			default:
 				return v
 			}
-			return s
-		case string:
-			return strings.ToUpper(t)
-		default:
-			return v
 		}
+	default:
+		return nil
 	}
 }
 

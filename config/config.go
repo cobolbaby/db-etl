@@ -8,6 +8,7 @@ import (
 	"os"
 	"sort"
 	"strings"
+	"time"
 
 	"gopkg.in/yaml.v3"
 )
@@ -62,16 +63,37 @@ type DBConfig struct {
 	// 该参数在建连时注入，读取端（source）与写入端（target）连接均生效，与同步模式无关。
 	// <=0 时不注入，保持服务端默认。
 	LockTimeout int `yaml:"lock_timeout"`
-	// TimeZone 固定写入端 PostgreSQL 会话时区（如 "America/Mexico_City"、"UTC"、"+08"）。
-	// 源端 SQL Server DATETIME/DATETIME2 无时区，序列化为无时区字符串后写入 timestamptz 列时，
-	// PostgreSQL 会按会话时区解析。若不固定，会话时区将随运行环境（PGTZ/TZ/服务端默认）漂移，
-	// 导致同一份数据在不同客户端时区下入库为不同的绝对时刻。设置本项以获得确定性行为。
-	// 为空时不注入，保持服务端默认。
+	// TimeZone 声明本数据源的时区标签（IANA 名称如 "America/Mexico_City"、"Asia/Shanghai"，或 "UTC"），有两处用途：
+	//  1. 写入端 PostgreSQL/Greenplum：注入会话时区（-c TimeZone=），使无时区时间字符串写入
+	//     timestamptz 列时被确定性解析，不随运行环境（PGTZ/TZ/服务端默认）漂移。
+	//  2. 读取端：把无时区时间列（如 SQL Server DATETIME2、PostgreSQL TIMESTAMP）的墙钟
+	//     解释为该时区，从而在落地为绝对时刻（如 parquet 归一到 UTC）时携带正确的偏移。
+	//     运行节点与数据库节点时区可能不同，故必须显式声明而非依赖运行节点本地时区。
+	// 为空时：写入端不注入会话时区（保持服务端默认）；读取端回退到运行节点本地时区（time.Local）。
 	TimeZone string `yaml:"timezone"`
 	// PingTimeout 建连时探活超时（秒），默认 10 秒。
 	// 仅在 reader/hook 工厂的主动探活场景生效（writer 的 pgx.Connect 不走此参数）。
 	// 0 或负值时使用内置默认值 10 秒。
 	PingTimeout int `yaml:"ping_timeout"`
+}
+
+// Location 将 TimeZone 解析为 *time.Location，供读取端把无时区时间列的墙钟解释为该时区。
+// 支持 IANA 名称（如 "Asia/Shanghai"）与 "UTC"。TimeZone 为空时回退到运行节点本地时区（time.Local）。
+func (db DBConfig) Location() (*time.Location, error) {
+	return parseTimeZone(db.TimeZone)
+}
+
+// parseTimeZone 解析 IANA 时区名（或 "UTC"）为 *time.Location。空串回退 time.Local。
+func parseTimeZone(tz string) (*time.Location, error) {
+	tz = strings.TrimSpace(tz)
+	if tz == "" {
+		return time.Local, nil
+	}
+	loc, err := time.LoadLocation(tz)
+	if err != nil {
+		return nil, fmt.Errorf("invalid timezone %q: %w", tz, err)
+	}
+	return loc, nil
 }
 
 // DefaultPingTimeout 是探活超时的默认值（秒）。

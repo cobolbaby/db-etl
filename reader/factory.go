@@ -21,14 +21,21 @@ func NewReader(db config.DBConfig, src *config.SourceConfig) (Reader, error) {
 		db.StatementTimeout = config.InitialModeDefaultTimeoutSec
 	}
 
+	// loc 由源库配置的 timezone 解析而来，供把无时区时间列的墙钟解释为源库所在时区。
+	// 解析失败属配置错误，重试无益。
+	loc, err := db.Location()
+	if err != nil {
+		return nil, util.NonRetryable(fmt.Errorf("parse source timezone failed: %w", err))
+	}
+
 	var build func(*sql.DB) Reader
 	switch db.Type {
 	case config.DBTypeMSSQL:
-		build = func(conn *sql.DB) Reader { return NewMSSQLReader(conn, src) }
+		build = func(conn *sql.DB) Reader { return NewMSSQLReader(conn, src, loc) }
 	case config.DBTypePG, config.DBTypeGP:
-		build = func(conn *sql.DB) Reader { return NewPGReader(conn, src) }
+		build = func(conn *sql.DB) Reader { return NewPGReader(conn, src, loc) }
 	case config.DBTypeOracle:
-		build = func(conn *sql.DB) Reader { return NewOracleReader(conn, src) }
+		build = func(conn *sql.DB) Reader { return NewOracleReader(conn, src, loc) }
 	default:
 		// 不支持的类型属配置错误，重试无益。
 		return nil, util.NonRetryable(fmt.Errorf("unsupported source db type: %s", db.Type))

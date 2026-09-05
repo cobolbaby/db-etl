@@ -6,6 +6,7 @@ import (
 	"db-etl/util"
 	"fmt"
 	"strings"
+	"time"
 )
 
 type OracleReader struct {
@@ -14,12 +15,13 @@ type OracleReader struct {
 
 type oracleDialect struct{}
 
-func NewOracleReader(db *sql.DB, src *config.SourceConfig) Reader {
+func NewOracleReader(db *sql.DB, src *config.SourceConfig, loc *time.Location) Reader {
 	return &OracleReader{
 		BaseReader: &BaseReader{
 			conn:    db,
 			Source:  src,
 			dialect: oracleDialect{},
+			loc:     loc,
 		},
 	}
 }
@@ -76,4 +78,4 @@ func (oracleDialect) columnKind(dbType string) ColumnKind {
 }
 
 // valueNormalizer Oracle 驱动返回的值已符合各 ColumnKind 的约定，无需修正。
-func (oracleDialect) valueNormalizer(string) ValueNormalizer { return nil }
+func (oracleDialect) valueNormalizer(string, *time.Location) ValueNormalizer { return nil }

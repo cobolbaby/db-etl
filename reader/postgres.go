@@ -6,6 +6,7 @@ import (
 	"db-etl/util"
 	"fmt"
 	"strings"
+	"time"
 )
 
 type PGReader struct {
@@ -14,12 +15,13 @@ type PGReader struct {
 
 type pgDialect struct{}
 
-func NewPGReader(db *sql.DB, src *config.SourceConfig) Reader {
+func NewPGReader(db *sql.DB, src *config.SourceConfig, loc *time.Location) Reader {
 	return &PGReader{
 		BaseReader: &BaseReader{
 			conn:    db,
 			Source:  src,
 			dialect: pgDialect{},
+			loc:     loc,
 		},
 	}
 }
@@ -79,5 +81,15 @@ func (pgDialect) columnKind(dbType string) ColumnKind {
 	}
 }
 
-// valueNormalizer PostgreSQL 驱动返回的值已符合各 ColumnKind 的约定，无需修正。
-func (pgDialect) valueNormalizer(string) ValueNormalizer { return nil }
+// valueNormalizer 修正驱动层的值表示差异。
+// 无时区日期时间（TIMESTAMP/DATE/TIME）：pgx 以「墙钟 + UTC Location」返回，
+// 贴回本地时区，避免下游按 UTC 归一时整体偏移时差。
+// TIMESTAMPTZ / TIMETZ 自带时区、驱动已返回正确瞬时，故不在此列；其余类型无需修正。
+func (pgDialect) valueNormalizer(dbType string, loc *time.Location) ValueNormalizer {
+	switch strings.ToUpper(dbType) {
+	case "TIMESTAMP", "DATE", "TIME":
+		return NaiveTimeNormalizer(loc)
+	default:
+		return nil
+	}
+}

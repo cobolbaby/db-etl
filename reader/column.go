@@ -69,6 +69,32 @@ type ColumnMeta struct {
 // 仅少数类型需要（如 MSSQL uniqueidentifier 的混合字节序），其余列为 nil。
 type ValueNormalizer func(any) any
 
+// NaiveTimeNormalizer 返回一个把「无时区时间列」的墙钟重新贴上 loc 时区的修正函数。
+//
+// 各驱动对 TIMESTAMP / DATETIME2 等无时区列，返回的是「数据库里的墙钟数字 + UTC Location」，
+// 并非真正的 UTC 瞬时。若直接按 UTC 归一（如 parquet 的 t.UTC().UnixMilli()），
+// 就把墙钟当成了 UTC，写出的绝对时刻会整体偏移「loc 与 UTC 的时差」。
+// 此处仅替换 Location 为 loc、保持墙钟数字不变，使墙钟被解释为源库所在时区，
+// 从而携带正确的绝对时刻；而按墙钟文本落地的路径（FormatText）渲染结果不变，不受影响。
+//
+// loc 由源库配置的 timezone 显式提供（见 config.DBConfig.Location），
+// 因为运行节点与数据库节点时区可能不同，不能依赖运行节点本地时区。
+//
+// 带时区列（TIMESTAMPTZ / DATETIMEOFFSET / TIMESTAMP WITH TIME ZONE 等）驱动已返回正确瞬时，
+// 不应走此修正，否则会二次偏移。
+func NaiveTimeNormalizer(loc *time.Location) ValueNormalizer {
+	if loc == nil {
+		loc = time.Local
+	}
+	return func(v any) any {
+		t, ok := v.(time.Time)
+		if !ok {
+			return v
+		}
+		return time.Date(t.Year(), t.Month(), t.Day(), t.Hour(), t.Minute(), t.Second(), t.Nanosecond(), loc)
+	}
+}
+
 // FormatText 将值渲染为规范文本形式：只做「Go 值 → 字符串」，
 // 不含任何目标格式的转义或 NULL 表示，那些由各 writer 在此结果之上叠加。
 // nil 返回空串，调用方应先自行区分 NULL。

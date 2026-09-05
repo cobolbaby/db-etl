@@ -162,11 +162,11 @@ func TestPGDialectResolvesArrayColumnKind(t *testing.T) {
 }
 
 func TestMSSQLDialectNormalizesUniqueidentifierOnly(t *testing.T) {
-	if got := (mssqlDialect{}).valueNormalizer("VARCHAR"); got != nil {
+	if got := (mssqlDialect{}).valueNormalizer("VARCHAR", nil); got != nil {
 		t.Fatal("expected no normalizer for varchar")
 	}
 
-	normalize := (mssqlDialect{}).valueNormalizer("uniqueidentifier")
+	normalize := (mssqlDialect{}).valueNormalizer("uniqueidentifier", nil)
 	if normalize == nil {
 		t.Fatal("expected a normalizer for uniqueidentifier")
 	}
@@ -179,5 +179,25 @@ func TestMSSQLDialectNormalizesUniqueidentifierOnly(t *testing.T) {
 	}
 	if want := "12345678-9ABC-DEF0-0102-030405060708"; got != want {
 		t.Fatalf("expected %q, got %q", want, got)
+	}
+}
+
+func TestNaiveTimeNormalizerRelabelsWallClockToLocation(t *testing.T) {
+	// 驱动对无时区列返回「墙钟数字 + UTC」，此处应把墙钟原样贴到目标时区。
+	loc := time.FixedZone("+08", 8*3600)
+	normalize := NaiveTimeNormalizer(loc)
+
+	in := time.Date(2025, 4, 12, 19, 48, 24, 147224600, time.UTC)
+	out, ok := normalize(in).(time.Time)
+	if !ok {
+		t.Fatalf("expected time.Time, got %T", normalize(in))
+	}
+
+	// 墙钟数字保持不变，但时区变为 +08，故绝对时刻整体前移 8 小时。
+	if out.Hour() != 19 || out.Location() != loc {
+		t.Fatalf("expected wall clock 19:00 in %v, got %v", loc, out)
+	}
+	if want := time.Date(2025, 4, 12, 11, 48, 24, 147224600, time.UTC); !out.UTC().Equal(want) {
+		t.Fatalf("expected UTC instant %v, got %v", want, out.UTC())
 	}
 }

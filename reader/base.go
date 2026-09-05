@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"time"
 )
 
 type readerDialect interface {
@@ -15,7 +16,8 @@ type readerDialect interface {
 	// columnKind 将本方言的类型名映射到归一化的 ColumnKind。
 	columnKind(dbType string) ColumnKind
 	// valueNormalizer 返回该类型所需的值修正函数；无需修正时返回 nil。
-	valueNormalizer(dbType string) ValueNormalizer
+	// loc 为源库时区，供无时区时间列的墙钟解释使用。
+	valueNormalizer(dbType string, loc *time.Location) ValueNormalizer
 	quoteIdentifier(identifier string) string
 	// wrapError 按方言对底层驱动错误做归一化，将无法通过重试解决的错误
 	//（语法错误、无效列名、约束冲突等）标记为 NonRetryable。
@@ -26,6 +28,9 @@ type BaseReader struct {
 	conn    *sql.DB
 	Source  *config.SourceConfig
 	dialect readerDialect
+	// loc 为源库时区（由 config.DBConfig.Location 解析），
+	// 用于把无时区时间列的墙钟解释为该时区；nil 时回退 time.Local。
+	loc     *time.Location
 	err     error // ReadBatch 异步执行期间捕获的错误，通过 Err() 暴露
 }
 
@@ -101,7 +106,7 @@ func (r *BaseReader) ReadBatch(ctx context.Context, cancel context.CancelFunc) <
 		normalizers := make([]ValueNormalizer, len(colTypes))
 		needNormalize := false
 		for i, ct := range colTypes {
-			if n := r.dialect.valueNormalizer(ct.DatabaseTypeName()); n != nil {
+			if n := r.dialect.valueNormalizer(ct.DatabaseTypeName(), r.loc); n != nil {
 				normalizers[i] = n
 				needNormalize = true
 			}

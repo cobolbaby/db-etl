@@ -8,7 +8,6 @@ import (
 	"fmt"
 	"io"
 	"log"
-	"strconv"
 	"strings"
 	"time"
 	"unicode"
@@ -75,7 +74,7 @@ func (d *parquetWriterDialect) close(ctx context.Context) error {
 
 func (d *parquetWriterDialect) writeInitial(ctx context.Context, in <-chan reader.Batch, target *config.TargetConfig, source *config.SourceConfig, jobName string) error {
 	// initial 视为一次性全量：覆盖写单对象；成功后置 inuse=false，避免下次重复回填。
-	if _, err := d.writeObject(ctx, in, defaultObjectKey(target), source); err != nil {
+	if _, err := d.writeObject(ctx, in, defaultObjectKey(target), source, target.Table); err != nil {
 		return err
 	}
 	if d.metaConn != nil {
@@ -89,7 +88,7 @@ func (d *parquetWriterDialect) writeInitial(ctx context.Context, in <-chan reade
 
 func (d *parquetWriterDialect) writeFull(ctx context.Context, in <-chan reader.Batch, target *config.TargetConfig) error {
 	// full 全量刷新：覆盖写单对象。无水位、无 source 依赖。
-	_, err := d.writeObject(ctx, in, defaultObjectKey(target), nil)
+	_, err := d.writeObject(ctx, in, defaultObjectKey(target), nil, target.Table)
 	return err
 }
 
@@ -107,7 +106,7 @@ func (d *parquetWriterDialect) writeMerge(ctx context.Context, in <-chan reader.
 func (d *parquetWriterDialect) writeIncremental(ctx context.Context, in <-chan reader.Batch, target *config.TargetConfig, source *config.SourceConfig, jobName string) error {
 	key := incrementalObjectKey(target, source)
 
-	wm, err := d.writeObject(ctx, in, key, source)
+	wm, err := d.writeObject(ctx, in, key, source, target.Table)
 	if err != nil {
 		return err
 	}
@@ -119,38 +118,55 @@ func (d *parquetWriterDialect) writeIncremental(ctx context.Context, in <-chan r
 	return upsertWatermark(ctx, d.metaConn, wm, target, source, jobName)
 }
 
-// parquetEncoder 持有单个对象的编码状态：列映射、类型、增量水位追踪与行缓冲，
+// parquetEncoder 持有单个对象的编码状态：schema、列映射、类型、增量水位追踪与行缓冲，
 // 负责把 Batch 逐行编码写入 parquet.GenericWriter。
 type parquetEncoder struct {
+	schema   *parquet.Schema
 	columns  []reader.ColumnMeta
 	colIndex []int // 输入列序 → schema 叶子列序（parquet.Group 为 map，叶子顺序由库决定）
-	incrIdx  int   // 增量字段所在列下标，-1 表示无
+	incrIdx  int               // 增量字段所在列下标，-1 表示无
+	incrKind reader.ColumnKind // 增量列的语义类别，缓存以免逐行查
 	rb       *parquet.RowBuilder
 	buf      []parquet.Row
-	maxWM    string // 已见最大水位
-	warned   bool   // 是否已打印过转换失败告警（避免刷屏）
+	hasMax   bool // 是否已见过非 NULL 的增量值
+	maxVal   any  // 已见最大增量值（原生类型，仅在结束时格式化为文本水位）
+	warned   bool // 是否已打印过转换失败告警（避免刷屏）
 }
 
-// newParquetEncoder 依首个 batch 的列信息构造 schema 与编码器。
-func newParquetEncoder(columns []reader.ColumnMeta, source *config.SourceConfig) (*parquetEncoder, *parquet.Schema, error) {
-	schema := buildParquetSchema(columns)
+// newParquetEncoder 依首个 batch 的列信息构造 schema 与编码器。schemaName 作为 parquet schema 根节点名（复用目标表名）。
+func newParquetEncoder(columns []reader.ColumnMeta, source *config.SourceConfig, schemaName string) (*parquetEncoder, error) {
+	schema := buildParquetSchema(columns, schemaName)
 
+	// buildParquetSchema 以列名为 map 键，重名列会互相覆盖；字段数对不上即说明存在重名。
+	// 若放任不管，两个输入列会映射到同一个叶子列而写出错乱的行。
+	if len(schema.Fields()) != len(columns) {
+		return nil, util.NonRetryable(fmt.Errorf(
+			"duplicate column names in result set: %d columns map to only %d parquet fields (columns: %v)",
+			len(columns), len(schema.Fields()), reader.Batch{Columns: columns}.ColumnNames()))
+	}
+
+	// schema 由 columns 构造且已确认无重名，故每个列名必然能查到对应叶子。
 	colIndex := make([]int, len(columns))
 	for i, col := range columns {
-		leaf, ok := schema.Lookup(col.Name)
-		if !ok {
-			return nil, nil, fmt.Errorf("column %q not found in parquet schema", col.Name)
-		}
+		leaf, _ := schema.Lookup(col.Name)
 		colIndex[i] = leaf.ColumnIndex
 	}
 
+	incrIdx := resolveIncrIndex(columns, source)
+	var incrKind reader.ColumnKind
+	if incrIdx >= 0 {
+		incrKind = columns[incrIdx].Kind
+	}
+
 	return &parquetEncoder{
+		schema:   schema,
 		columns:  columns,
 		colIndex: colIndex,
-		incrIdx:  resolveIncrIndex(columns, source),
+		incrIdx:  incrIdx,
+		incrKind: incrKind,
 		rb:       parquet.NewRowBuilder(schema),
 		buf:      make([]parquet.Row, 0, parquetFlushRows),
-	}, schema, nil
+	}, nil
 }
 
 // resolveIncrIndex 返回增量字段（目标列名）在列中的下标；无增量字段返回 -1。
@@ -195,16 +211,29 @@ func (e *parquetEncoder) encodeBatch(pw *parquet.GenericWriter[any], batch reade
 }
 
 // trackWatermark 依增量列更新已见最大水位。
-// 水位以文本形式回填 incr_point 并参与下轮 SQL 的 ${INCR_POINT} 替换，
-// 故取规范文本而非 parquet 落地值。
+// 逐行只做原生类型比较（int64/float64/time.Time），不在热路径上格式化/解析字符串；
+// 真正的文本水位由 watermark() 在结束时一次性生成。
 func (e *parquetEncoder) trackWatermark(row []any) {
-	if e.incrIdx < 0 || row[e.incrIdx] == nil {
+	if e.incrIdx < 0 {
 		return
 	}
-	kind := e.columns[e.incrIdx].Kind
-	if v := reader.FormatText(kind, row[e.incrIdx]); wmGreater(kind, v, e.maxWM) {
-		e.maxWM = v
+	v := row[e.incrIdx]
+	if v == nil {
+		return
 	}
+	if !e.hasMax || rawWatermarkGreater(e.incrKind, v, e.maxVal) {
+		e.hasMax = true
+		e.maxVal = v
+	}
+}
+
+// watermark 把已见最大增量值格式化为规范文本水位（回填 incr_point 并参与下轮 ${INCR_POINT} 替换）。
+// 未见任何非 NULL 增量值时返回空串。
+func (e *parquetEncoder) watermark() string {
+	if !e.hasMax {
+		return ""
+	}
+	return reader.FormatText(e.incrKind, e.maxVal)
 }
 
 // flush 将缓冲行写入 pw 并清空缓冲。
@@ -221,8 +250,9 @@ func (e *parquetEncoder) flush(pw *parquet.GenericWriter[any]) error {
 
 // writeObject 从 channel 消费所有 batch，按首个 batch 的列与类型建立 schema，将 parquet 数据
 // 流式写入对象存储（经 io.Pipe 边序列化边上传，不落本地临时文件）。
+// schemaName 作为 parquet schema 根节点名（复用目标表名）。
 // 若 source 非 nil 且含增量字段，返回其最大值作为水位。
-func (d *parquetWriterDialect) writeObject(ctx context.Context, in <-chan reader.Batch, key string, source *config.SourceConfig) (string, error) {
+func (d *parquetWriterDialect) writeObject(ctx context.Context, in <-chan reader.Batch, key string, source *config.SourceConfig, schemaName string) (string, error) {
 	target := d.store.describe(key)
 
 	firstBatch, foundRows := drainFirstBatch(in)
@@ -231,7 +261,7 @@ func (d *parquetWriterDialect) writeObject(ctx context.Context, in <-chan reader
 		return "", nil
 	}
 
-	enc, schema, err := newParquetEncoder(firstBatch.Columns, source)
+	enc, err := newParquetEncoder(firstBatch.Columns, source, schemaName)
 	if err != nil {
 		return "", err
 	}
@@ -244,7 +274,7 @@ func (d *parquetWriterDialect) writeObject(ctx context.Context, in <-chan reader
 		uploadDone <- d.store.put(ctx, key, pr)
 	}()
 
-	pw := parquet.NewGenericWriter[any](pipeW, schema)
+	pw := parquet.NewGenericWriter[any](pipeW, enc.schema)
 
 	// abort 用根因错误关闭 pipe 写端，唤醒并等待上传协程结束，再回传该错误。
 	abort := func(err error) (string, error) {
@@ -271,7 +301,6 @@ func (d *parquetWriterDialect) writeObject(ctx context.Context, in <-chan reader
 		return abort(err)
 	}
 
-	// 刷出 parquet 尾部（footer 等）到 pipe，但不关闭底层 pipe 写端。
 	if err := pw.Close(); err != nil {
 		return abort(fmt.Errorf("close parquet writer failed: %w", err))
 	}
@@ -287,7 +316,7 @@ func (d *parquetWriterDialect) writeObject(ctx context.Context, in <-chan reader
 	}
 
 	log.Printf("parquet write finished: object=%s", target)
-	return enc.maxWM, nil
+	return enc.watermark(), nil
 }
 
 func (d *parquetWriterDialect) getWatermark(target *config.TargetConfig, source *config.SourceConfig, jobName string) (string, error) {
@@ -312,7 +341,8 @@ func (d *parquetWriterDialect) getWatermark(target *config.TargetConfig, source 
 }
 
 // buildParquetSchema 依列名与 ColumnKind 构造 parquet schema（全部为 optional 以容纳 NULL）。
-func buildParquetSchema(columns []reader.ColumnMeta) *parquet.Schema {
+// name 为 schema 根节点名，复用目标表名（已由 config.validateTarget 保证非空）。
+func buildParquetSchema(columns []reader.ColumnMeta, name string) *parquet.Schema {
 	group := parquet.Group{}
 	for _, col := range columns {
 		var node parquet.Node
@@ -324,7 +354,7 @@ func buildParquetSchema(columns []reader.ColumnMeta) *parquet.Schema {
 		case reader.KindBool:
 			node = parquet.Leaf(parquet.BooleanType)
 		case reader.KindTime:
-			node = parquet.Timestamp(parquet.Millisecond)
+			node = parquet.Timestamp(parquet.Microsecond)
 		case reader.KindBytes:
 			node = parquet.Leaf(parquet.ByteArrayType)
 		default:
@@ -332,7 +362,7 @@ func buildParquetSchema(columns []reader.ColumnMeta) *parquet.Schema {
 		}
 		group[col.Name] = parquet.Optional(node)
 	}
-	return parquet.NewSchema("etl", group)
+	return parquet.NewSchema(name, group)
 }
 
 // parquetValue 将驱动返回的原始值转为对应 ColumnKind 的 parquet 值。
@@ -366,8 +396,9 @@ func parquetValue(kind reader.ColumnKind, v any) (parquet.Value, error) {
 		}
 	case reader.KindTime:
 		if t, ok := v.(time.Time); ok {
-			// 先归一到 UTC 再取毫秒，保留驱动携带的时区信息。
-			return parquet.Int64Value(t.UTC().UnixMilli()), nil
+			// 归一到 UTC 再取微秒。无时区列已由 reader.NaiveTimeNormalizer 贴上源库时区，
+			// 带时区列驱动本就返回正确瞬时，故此处 UTC 归一得到的是正确的绝对时刻。
+			return parquet.Int64Value(t.UTC().UnixMicro()), nil
 		}
 	case reader.KindBytes:
 		if b, ok := v.([]byte); ok {
@@ -381,31 +412,32 @@ func parquetValue(kind reader.ColumnKind, v any) (parquet.Value, error) {
 	return parquet.Value{}, fmt.Errorf("cannot convert %T to %s", v, kind)
 }
 
-// wmGreater 判断 a 是否比当前水位 cur 更大（cur 为空视为最小）。
-func wmGreater(kind reader.ColumnKind, a, cur string) bool {
-	if cur == "" {
-		return true
-	}
-	a, cur = strings.TrimSpace(a), strings.TrimSpace(cur)
-
+// rawWatermarkGreater 判断原生值 a 是否比当前最大值 cur 更大。
+// int64/float64/time.Time 直接原生比较；其余类别（文本等）回退到规范文本的字典序比较。
+// 调用方已保证 cur 非 nil（hasMax），故无需处理空值。
+func rawWatermarkGreater(kind reader.ColumnKind, a, cur any) bool {
 	switch kind {
 	case reader.KindInt:
-		// 整数不借道 float64 比较：雪花 ID 等超过 2^53 的值会丢精度而误判。
-		if ai, err := strconv.ParseInt(a, 10, 64); err == nil {
-			if ci, err := strconv.ParseInt(cur, 10, 64); err == nil {
-				return ai > ci
-			}
+		av, aok := a.(int64)
+		cv, cok := cur.(int64)
+		if aok && cok {
+			return av > cv
 		}
 	case reader.KindFloat:
-		if af, err := strconv.ParseFloat(a, 64); err == nil {
-			if cf, err := strconv.ParseFloat(cur, 64); err == nil {
-				return af > cf
-			}
+		av, aok := a.(float64)
+		cv, cok := cur.(float64)
+		if aok && cok {
+			return av > cv
+		}
+	case reader.KindTime:
+		av, aok := a.(time.Time)
+		cv, cok := cur.(time.Time)
+		if aok && cok {
+			return av.After(cv)
 		}
 	}
-
-	// 时间戳采用固定布局，字典序与时间序一致；字符串同样按字典序。
-	return a > cur
+	// 类型不符或文本类：回退到文本字典序（时间戳固定布局，字典序与时间序一致）。
+	return reader.FormatText(kind, a) > reader.FormatText(kind, cur)
 }
 
 // defaultObjectKey 返回 full/initial 模式覆盖写的单对象 key（<table>.parquet）；前缀由 s3Store 追加。

@@ -123,7 +123,7 @@ func (d *parquetWriterDialect) writeIncremental(ctx context.Context, in <-chan r
 type parquetEncoder struct {
 	schema   *parquet.Schema
 	columns  []reader.ColumnMeta
-	colIndex []int // 输入列序 → schema 叶子列序（parquet.Group 为 map，叶子顺序由库决定）
+	colIndex []int             // 输入列序 → schema 叶子列序（parquet.Group 为 map，叶子顺序由库决定）
 	incrIdx  int               // 增量字段所在列下标，-1 表示无
 	incrKind reader.ColumnKind // 增量列的语义类别，缓存以免逐行查
 	rb       *parquet.RowBuilder
@@ -274,7 +274,11 @@ func (d *parquetWriterDialect) writeObject(ctx context.Context, in <-chan reader
 		uploadDone <- d.store.put(ctx, key, pr)
 	}()
 
-	pw := parquet.NewGenericWriter[any](pipeW, enc.schema)
+	// 按列 Zstd 压缩：parquet 列内同类型数据高度冗余（尤其 JSON 文本列跨行重复大量 key），
+	// 压缩率远高于不压；Zstd 在压缩率/CPU 上优于 Snappy/Gzip，作为离线 ETL 默认编码。
+	pw := parquet.NewGenericWriter[any](pipeW, enc.schema,
+		parquet.Compression(&parquet.Zstd),
+	)
 
 	// abort 用根因错误关闭 pipe 写端，唤醒并等待上传协程结束，再回传该错误。
 	abort := func(err error) (string, error) {

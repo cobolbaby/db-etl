@@ -169,8 +169,8 @@ func rowToTaskConfig(r JobDataSyncRow, metaDB DBConfig, resolver DBResolver) (Ta
 		} else {
 			src.Table = r.SrcSchemaName + "." + r.SrcTableName
 		}
-		// DB 加载路径不走 validateSource，表名形态在此就地校验，避免留到运行期才失败。
-		if err := ValidateSourceTableName(src.Table, src.DBType); err != nil {
+		// DB 加载路径不走 source.Validate，表名形态在此就地校验，避免留到运行期才失败。
+		if err := ValidateTableName(src.Table, src.DBType); err != nil {
 			return TaskConfig{}, err
 		}
 	}

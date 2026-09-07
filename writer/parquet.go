@@ -30,6 +30,8 @@ const parquetFlushRows = 1024
 type parquetWriterDialect struct {
 	store    *s3Store
 	metaConn *pgx.Conn
+	target   *config.TargetConfig
+	jobName  string
 }
 
 // NewParquetWriter 构建写 parquet 到对象存储的 Writer。
@@ -56,10 +58,9 @@ func NewParquetWriter(s3 config.S3Config, metaDB config.DBConfig, target *config
 	}
 
 	base := &BaseWriter{
-		Target:  target,
-		JobName: jobName,
+		Target: target,
 	}
-	base.dialect = &parquetWriterDialect{store: store, metaConn: metaConn}
+	base.dialect = &parquetWriterDialect{store: store, metaConn: metaConn, target: target, jobName: jobName}
 
 	return base, nil
 }
@@ -72,9 +73,11 @@ func (d *parquetWriterDialect) close(ctx context.Context) error {
 	return d.metaConn.Close(ctx)
 }
 
-func (d *parquetWriterDialect) writeInitial(ctx context.Context, in <-chan reader.Batch, target *config.TargetConfig, source *config.SourceConfig, jobName string) error {
+func (d *parquetWriterDialect) writeInitial(ctx context.Context, in <-chan reader.Batch, source *config.SourceConfig) error {
+	target := d.target
+	jobName := d.jobName
 	// initial 视为一次性全量：覆盖写单对象；成功后置 inuse=false，避免下次重复回填。
-	if _, err := d.writeObject(ctx, in, defaultObjectKey(target), source, target.Table); err != nil {
+	if _, err := d.writeObject(ctx, in, defaultObjectKey(target), source); err != nil {
 		return err
 	}
 	if d.metaConn != nil {
@@ -86,27 +89,30 @@ func (d *parquetWriterDialect) writeInitial(ctx context.Context, in <-chan reade
 	return nil
 }
 
-func (d *parquetWriterDialect) writeFull(ctx context.Context, in <-chan reader.Batch, target *config.TargetConfig) error {
+func (d *parquetWriterDialect) writeFull(ctx context.Context, in <-chan reader.Batch) error {
+	target := d.target
 	// full 全量刷新：覆盖写单对象。无水位、无 source 依赖。
-	_, err := d.writeObject(ctx, in, defaultObjectKey(target), nil, target.Table)
+	_, err := d.writeObject(ctx, in, defaultObjectKey(target), nil)
 	return err
 }
 
-func (d *parquetWriterDialect) writeAppend(ctx context.Context, in <-chan reader.Batch, target *config.TargetConfig, source *config.SourceConfig, jobName string) error {
-	return d.writeIncremental(ctx, in, target, source, jobName)
+func (d *parquetWriterDialect) writeAppend(ctx context.Context, in <-chan reader.Batch, source *config.SourceConfig) error {
+	return d.writeIncremental(ctx, in, source)
 }
 
-func (d *parquetWriterDialect) writeMerge(ctx context.Context, in <-chan reader.Batch, target *config.TargetConfig, source *config.SourceConfig, jobName string) error {
+func (d *parquetWriterDialect) writeMerge(ctx context.Context, in <-chan reader.Batch, source *config.SourceConfig) error {
+	target := d.target
 	// 对象存储不可按 PK 原地删除/更新，merge 与 append 一致：追加新对象，去重交由下游查询处理。
 	log.Printf("parquet target does not support in-place merge by pk; writing incremental object for table=%s (downstream must dedupe by pk=%s)", target.Table, target.PK)
-	return d.writeIncremental(ctx, in, target, source, jobName)
+	return d.writeIncremental(ctx, in, source)
 }
 
 // writeIncremental 每次增量写一个新对象，并把最大水位写回 manager。
-func (d *parquetWriterDialect) writeIncremental(ctx context.Context, in <-chan reader.Batch, target *config.TargetConfig, source *config.SourceConfig, jobName string) error {
+func (d *parquetWriterDialect) writeIncremental(ctx context.Context, in <-chan reader.Batch, source *config.SourceConfig) error {
+	target := d.target
 	key := incrementalObjectKey(target, source)
 
-	wm, err := d.writeObject(ctx, in, key, source, target.Table)
+	wm, err := d.writeObject(ctx, in, key, source)
 	if err != nil {
 		return err
 	}
@@ -115,7 +121,7 @@ func (d *parquetWriterDialect) writeIncremental(ctx context.Context, in <-chan r
 	if wm == "" || d.metaConn == nil || source == nil {
 		return nil
 	}
-	return upsertWatermark(ctx, d.metaConn, wm, target, source, jobName)
+	return upsertWatermark(ctx, d.metaConn, wm, target, source, d.jobName)
 }
 
 // parquetEncoder 持有单个对象的编码状态：schema、列映射、类型、增量水位追踪与行缓冲，
@@ -250,9 +256,9 @@ func (e *parquetEncoder) flush(pw *parquet.GenericWriter[any]) error {
 
 // writeObject 从 channel 消费所有 batch，按首个 batch 的列与类型建立 schema，将 parquet 数据
 // 流式写入对象存储（经 io.Pipe 边序列化边上传，不落本地临时文件）。
-// schemaName 作为 parquet schema 根节点名（复用目标表名）。
+// parquet schema 根节点名复用目标表名。
 // 若 source 非 nil 且含增量字段，返回其最大值作为水位。
-func (d *parquetWriterDialect) writeObject(ctx context.Context, in <-chan reader.Batch, key string, source *config.SourceConfig, schemaName string) (string, error) {
+func (d *parquetWriterDialect) writeObject(ctx context.Context, in <-chan reader.Batch, key string, source *config.SourceConfig) (string, error) {
 	target := d.store.describe(key)
 
 	firstBatch, foundRows := drainFirstBatch(in)
@@ -261,7 +267,7 @@ func (d *parquetWriterDialect) writeObject(ctx context.Context, in <-chan reader
 		return "", nil
 	}
 
-	enc, err := newParquetEncoder(firstBatch.Columns, source, schemaName)
+	enc, err := newParquetEncoder(firstBatch.Columns, source, d.target.Table)
 	if err != nil {
 		return "", err
 	}
@@ -323,7 +329,9 @@ func (d *parquetWriterDialect) writeObject(ctx context.Context, in <-chan reader
 	return enc.watermark(), nil
 }
 
-func (d *parquetWriterDialect) getWatermark(target *config.TargetConfig, source *config.SourceConfig, jobName string) (string, error) {
+func (d *parquetWriterDialect) getWatermark(source *config.SourceConfig) (string, error) {
+	target := d.target
+	jobName := d.jobName
 	if source == nil || source.IncrField == "" {
 		return "", nil
 	}
@@ -445,8 +453,9 @@ func rawWatermarkGreater(kind reader.ColumnKind, a, cur any) bool {
 }
 
 // defaultObjectKey 返回 full/initial 模式覆盖写的单对象 key（<table>.parquet）；前缀由 s3Store 追加。
+// 表名已在配置加载阶段校验（见 config.ValidateTableName），仅含字母、数字、'_'、'.'，可直接拼接。
 func defaultObjectKey(target *config.TargetConfig) string {
-	return sanitizeFileName(target.Table) + ".parquet"
+	return target.Table + ".parquet"
 }
 
 // incrementalObjectKey 以本次抽取的起点水位命名增量对象（<table>_<incr_point>.parquet）。
@@ -454,22 +463,23 @@ func defaultObjectKey(target *config.TargetConfig) string {
 // 使「上传成功但水位写回失败」的重试幂等。正常调度下水位持续推进，各次增量自然落到不同对象。
 // s3 目标的 append/merge 必须配置 incr_field（见 config.validateSource），故起点必然非空。
 func incrementalObjectKey(target *config.TargetConfig, source *config.SourceConfig) string {
-	return sanitizeFileName(target.Table) + "_" + sanitizeFileName(source.IncrPoint) + ".parquet"
+	return target.Table + "_" + sanitizeWatermark(source.IncrPoint) + ".parquet"
 }
 
-// sanitizeFileName 将表名或水位值转为安全的对象名片段：
-// 仅保留字母、数字、'_' 与 '-'，其余字符（'.'、'/'、空格、':' 等）一律替换为 '_'。
-func sanitizeFileName(s string) string {
+// sanitizeWatermark 将水位值（整型或时间戳）转为安全的对象名片段：
+// 仅保留字母与数字，其余字符（'-'、空格、':'、'.' 等）一律删除。
+// 比如 2026-09-07 12:34:56.789 归一为紧凑的 20260907123456789。
+func sanitizeWatermark(s string) string {
 	name := strings.Map(func(r rune) rune {
 		switch {
-		case unicode.IsLetter(r), unicode.IsDigit(r), r == '_', r == '-':
+		case unicode.IsLetter(r), unicode.IsDigit(r):
 			return r
 		default:
-			return '_'
+			return -1
 		}
 	}, strings.TrimSpace(s))
 	if name == "" {
-		return "data"
+		return "0"
 	}
 	return name
 }

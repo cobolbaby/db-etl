@@ -12,27 +12,27 @@ type stubWriterDialect struct {
 	called string
 }
 
-func (d *stubWriterDialect) writeInitial(ctx context.Context, in <-chan reader.Batch, target *config.TargetConfig, source *config.SourceConfig, jobName string) error {
+func (d *stubWriterDialect) writeInitial(ctx context.Context, in <-chan reader.Batch, source *config.SourceConfig) error {
 	d.called = "initial"
 	return nil
 }
 
-func (d *stubWriterDialect) writeFull(ctx context.Context, in <-chan reader.Batch, target *config.TargetConfig) error {
+func (d *stubWriterDialect) writeFull(ctx context.Context, in <-chan reader.Batch) error {
 	d.called = "full"
 	return nil
 }
 
-func (d *stubWriterDialect) writeAppend(ctx context.Context, in <-chan reader.Batch, target *config.TargetConfig, source *config.SourceConfig, jobName string) error {
+func (d *stubWriterDialect) writeAppend(ctx context.Context, in <-chan reader.Batch, source *config.SourceConfig) error {
 	d.called = "append"
 	return nil
 }
 
-func (d *stubWriterDialect) writeMerge(ctx context.Context, in <-chan reader.Batch, target *config.TargetConfig, source *config.SourceConfig, jobName string) error {
+func (d *stubWriterDialect) writeMerge(ctx context.Context, in <-chan reader.Batch, source *config.SourceConfig) error {
 	d.called = "merge"
 	return nil
 }
 
-func (d *stubWriterDialect) getWatermark(target *config.TargetConfig, source *config.SourceConfig, jobName string) (string, error) {
+func (d *stubWriterDialect) getWatermark(source *config.SourceConfig) (string, error) {
 	return "", nil
 }
 

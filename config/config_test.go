@@ -141,19 +141,19 @@ func TestFieldsMappingValidateRejectsReservedTargetKeyword(t *testing.T) {
 	}
 }
 
-func TestValidateSourceTableNameAllowsThreePartForMSSQL(t *testing.T) {
-	if err := ValidateSourceTableName("sales.dbo.orders", DBTypeMSSQL); err != nil {
+func TestValidateTableNameAllowsThreePartForMSSQL(t *testing.T) {
+	if err := ValidateTableName("sales.dbo.orders", DBTypeMSSQL); err != nil {
 		t.Fatalf("expected mssql three-part table to be allowed, got %v", err)
 	}
 }
 
-func TestValidateSourceTableNameRejectsThreePartForNonMSSQL(t *testing.T) {
+func TestValidateTableNameRejectsThreePartForNonMSSQL(t *testing.T) {
 	for _, dbType := range []DBType{"", DBTypePG, DBTypeGP} {
-		err := ValidateSourceTableName("sales.public.orders", dbType)
+		err := ValidateTableName("sales.public.orders", dbType)
 		if err == nil {
 			t.Fatalf("expected db type %q to reject three-part table", dbType)
 		}
-		if !strings.Contains(err.Error(), "only supported for mssql sources") {
+		if !strings.Contains(err.Error(), "only supported for mssql") {
 			t.Fatalf("unexpected error for db type %q: %v", dbType, err)
 		}
 	}

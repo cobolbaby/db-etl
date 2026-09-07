@@ -17,16 +17,17 @@ import (
 )
 
 type pgWriterDialect struct {
-	conn *pgx.Conn
+	conn    *pgx.Conn
+	target  *config.TargetConfig
+	jobName string
 }
 
 func NewPGWriter(conn *pgx.Conn, target *config.TargetConfig, jobName string) Writer {
 	base := &BaseWriter{
-		Target:  target,
-		JobName: jobName,
+		Target: target,
 	}
 
-	base.dialect = &pgWriterDialect{conn: conn}
+	base.dialect = &pgWriterDialect{conn: conn, target: target, jobName: jobName}
 
 	return base
 }
@@ -50,7 +51,8 @@ func drainFirstBatch(in <-chan reader.Batch) (reader.Batch, bool) {
 	return reader.Batch{}, false
 }
 
-func (d *pgWriterDialect) writeFull(ctx context.Context, in <-chan reader.Batch, target *config.TargetConfig) error {
+func (d *pgWriterDialect) writeFull(ctx context.Context, in <-chan reader.Batch) error {
+	target := d.target
 
 	firstBatch, foundRows := drainFirstBatch(in)
 
@@ -102,7 +104,9 @@ func (d *pgWriterDialect) writeFull(ctx context.Context, in <-chan reader.Batch,
 	return tx.Commit(ctx)
 }
 
-func (d *pgWriterDialect) writeInitial(ctx context.Context, in <-chan reader.Batch, target *config.TargetConfig, source *config.SourceConfig, jobName string) error {
+func (d *pgWriterDialect) writeInitial(ctx context.Context, in <-chan reader.Batch, source *config.SourceConfig) error {
+	target := d.target
+	jobName := d.jobName
 	firstBatch, foundRows := drainFirstBatch(in)
 
 	// COPY 与「任务下线」放在同一事务内提交，保证 initial（首次全量）回填成功后
@@ -260,14 +264,18 @@ func buildCopySQL(table string, columns []string) string {
 	return base + " FROM STDIN WITH (FORMAT CSV, DELIMITER ',', QUOTE '\"', ESCAPE '\"', NULL '" + nullSentinel + "')"
 }
 
-func (d *pgWriterDialect) writeAppend(ctx context.Context, in <-chan reader.Batch, target *config.TargetConfig, source *config.SourceConfig, jobName string) error {
+func (d *pgWriterDialect) writeAppend(ctx context.Context, in <-chan reader.Batch, source *config.SourceConfig) error {
+	target := d.target
+	jobName := d.jobName
 	if target.CommitBatchSize > 0 {
 		return d.writeIncrChunked(ctx, in, target, source, jobName, false)
 	}
 	return d.writeIncrOnce(ctx, in, target, source, jobName, false)
 }
 
-func (d *pgWriterDialect) writeMerge(ctx context.Context, in <-chan reader.Batch, target *config.TargetConfig, source *config.SourceConfig, jobName string) error {
+func (d *pgWriterDialect) writeMerge(ctx context.Context, in <-chan reader.Batch, source *config.SourceConfig) error {
+	target := d.target
+	jobName := d.jobName
 	if target.CommitBatchSize > 0 {
 		return d.writeIncrChunked(ctx, in, target, source, jobName, true)
 	}
@@ -586,7 +594,9 @@ func (d *pgWriterDialect) updateWatermark(ctx context.Context, tx pgx.Tx, wm str
 	return upsertWatermark(ctx, tx, wm, target, source, jobName)
 }
 
-func (d *pgWriterDialect) getWatermark(target *config.TargetConfig, source *config.SourceConfig, jobName string) (string, error) {
+func (d *pgWriterDialect) getWatermark(source *config.SourceConfig) (string, error) {
+	target := d.target
+	jobName := d.jobName
 	ctx := context.Background()
 	wm, err := readWatermarkPoint(ctx, d.conn, target, source, jobName)
 	if err != nil {

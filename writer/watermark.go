@@ -41,7 +41,7 @@ func sourceIdentity(source *config.SourceConfig) (wmSource, error) {
 		if err != nil {
 			return wmSource{}, err
 		}
-		// 三段式表名仅 MSSQL 合法，已在加载阶段由 config.ValidateSourceTableName 保证；
+		// 三段式表名仅 MSSQL 合法，已在加载阶段由 config.ValidateTableName 保证；
 		// 此处只做归属推导：以表名内的库名为准，否则回退到数据源连接的库名，
 		// 确保 watermark 的 src_db_name 始终反映真实的源库。
 		if parts.Database == "" {

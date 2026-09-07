@@ -690,6 +690,11 @@ const InitialModeDefaultTimeoutSec = 7200
 // defaultTruncateTimeoutSec 是 full 模式下 TRUNCATE 等锁超时的默认值（秒）。
 const defaultTruncateTimeoutSec = 10
 
+// defaultMaxRowsPerRowGroup 是写 parquet 时单个 row group 的默认最大行数。
+// 按目标 row group ~128MB / 典型单行大小换算的经验值，避免单个对象退化为单个
+// 超大 row group（峰值内存随总行数无限增长、下游难以并行读）。
+const defaultMaxRowsPerRowGroup = 200000
+
 type TargetConfig struct {
 	ConnID    string   `yaml:"conn_id"`   // 优先按 conn_id 匹配数据源，为空时回退到 conn_name
 	ConnName  string   `yaml:"conn_name"` // 引用 databases[].name
@@ -702,6 +707,11 @@ type TargetConfig struct {
 	// 0 表示不分段，整个任务在单个事务中完成（原有行为）。
 	// 适用于超大表，设置后可在中断重启后从上次水位断点续传。
 	CommitBatchSize int `yaml:"commit_batch_size"`
+	// MaxRowsPerRowGroup 控制写 parquet 时单个 row group 的最大行数（仅对象存储目标生效）。
+	// 未配置（0）时回填默认值 defaultMaxRowsPerRowGroup（见 (TargetConfig).Validate）：
+	// 将对象内部按行数切分多个 row group，降低峰值内存并提升下游读取并行度。
+	// 显式设为负值可关闭切分（整个对象为单个 row group，须等 Close 写 footer 时才落盘）。
+	MaxRowsPerRowGroup int64 `yaml:"max_rows_per_row_group"`
 	// TruncateTimeout full 模式下 TRUNCATE 尝试获取锁的超时时间（秒）。
 	// 超时后自动退避为 DELETE FROM，以避免长时间阻塞下游。
 	// 0 表示使用默认值（defaultTruncateTimeoutSec 秒）。
@@ -750,13 +760,20 @@ func (target *TargetConfig) Validate(resolver DBResolver, s3Resolver S3Resolver)
 		return fmt.Errorf("pk is required for merge mode (target table %q)", target.Table)
 	}
 
-	// s3 目标无需回填 DB 相关默认值。
+	// s3 目标：回填对象存储相关默认值。
 	if hasS3 {
-		return nil
+		// row group 行数：未配置（0）回填默认值；显式负值表示关闭切分（归一为 0 交给写入端跳过）。
+		if target.MaxRowsPerRowGroup <= 0 {
+			target.MaxRowsPerRowGroup = defaultMaxRowsPerRowGroup
+		}
 	}
-	// TruncateTimeout 未配置时使用默认值
-	if target.TruncateTimeout == 0 {
-		target.TruncateTimeout = defaultTruncateTimeoutSec
+
+	// DB 目标：回填 DB 相关默认值。
+	if hasDB {
+		// TruncateTimeout 未配置时使用默认值。
+		if target.TruncateTimeout == 0 {
+			target.TruncateTimeout = defaultTruncateTimeoutSec
+		}
 	}
 	return nil
 }

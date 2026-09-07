@@ -16,12 +16,11 @@ import (
 	"github.com/parquet-go/parquet-go"
 )
 
-// parquetFlushRows 控制每积攒多少行调用一次 WriteRows，平衡内存与调用开销。
-const parquetFlushRows = 1024
-
 // parquetWriterDialect 将 Batch 序列化为 parquet 并流式上传到对象存储。
-//   - full/initial：覆盖写单个 <table>.parquet 对象（每次全量刷新）。
-//   - append/merge：每次增量写一个以起点水位命名的对象，并把水位写回 manager.job_data_sync。
+//   - full/initial：覆盖写单个 <table>.parquet 对象（每次全量刷新，不分卷）。
+//   - append/merge：每次增量写一个以起点水位命名的对象，并把水位写回 manager.job_data_sync；
+//     当 commit_batch_size>0 且可写回水位时改为分段断点续传，每块独立成对象并逐块提交水位
+//     （见 writeChunkedObjects）。
 //
 // metaConn 指向存放 manager.job_data_sync 的 PostgreSQL；为 nil 时跳过水位写回/读取
 // （退化为无状态增量，起点由 defaultIncrPoint 兜底）。
@@ -77,7 +76,7 @@ func (d *parquetWriterDialect) writeInitial(ctx context.Context, in <-chan reade
 	target := d.target
 	jobName := d.jobName
 	// initial 视为一次性全量：覆盖写单对象；成功后置 inuse=false，避免下次重复回填。
-	if _, err := d.writeObject(ctx, in, defaultObjectKey(target), source); err != nil {
+	if _, err := d.writeSingleObject(ctx, in, defaultObjectKey(target), source); err != nil {
 		return err
 	}
 	if d.metaConn != nil {
@@ -92,7 +91,7 @@ func (d *parquetWriterDialect) writeInitial(ctx context.Context, in <-chan reade
 func (d *parquetWriterDialect) writeFull(ctx context.Context, in <-chan reader.Batch) error {
 	target := d.target
 	// full 全量刷新：覆盖写单对象。无水位、无 source 依赖。
-	_, err := d.writeObject(ctx, in, defaultObjectKey(target), nil)
+	_, err := d.writeSingleObject(ctx, in, defaultObjectKey(target), nil)
 	return err
 }
 
@@ -108,11 +107,21 @@ func (d *parquetWriterDialect) writeMerge(ctx context.Context, in <-chan reader.
 }
 
 // writeIncremental 每次增量写一个新对象，并把最大水位写回 manager。
+//
+// 当 target.CommitBatchSize > 0 且可写回水位时切换为分段断点续传（见 writeChunkedObjects）：
+// 每满 CommitBatchSize 个 batch 收尾一个对象并提交其水位，中断后重跑从上次已提交的断点续传，
+// 而非从任务起点全量重导。否则退化为单对象：整段写完后一次性提交水位。
 func (d *parquetWriterDialect) writeIncremental(ctx context.Context, in <-chan reader.Batch, source *config.SourceConfig) error {
 	target := d.target
-	key := incrementalObjectKey(target, source)
 
-	wm, err := d.writeObject(ctx, in, key, source)
+	// 分段断点续传要求：能写回水位（metaConn 非空）且有增量字段可作断点。
+	// 三者缺一则无法按块提交/续传，退化为单对象一次性提交。
+	if target.CommitBatchSize > 0 && d.metaConn != nil && source != nil && source.IncrField != "" {
+		return d.writeChunkedObjects(ctx, in, source)
+	}
+
+	key := incrementalObjectKey(target, source)
+	wm, err := d.writeSingleObject(ctx, in, key, source)
 	if err != nil {
 		return err
 	}
@@ -122,6 +131,172 @@ func (d *parquetWriterDialect) writeIncremental(ctx context.Context, in <-chan r
 		return nil
 	}
 	return upsertWatermark(ctx, d.metaConn, wm, target, source, d.jobName)
+}
+
+// writeChunkedObjects 把增量写入拆成若干块做断点续传，语义与 PG 的 writeIncrChunked 对齐：
+// 每满 CommitBatchSize 个 batch 收尾一个独立 parquet 对象，提交其最大水位，并把 source.IncrPoint
+// 推进到该值。若后续块失败并触发外层 util.Retry 重跑整条 pipeline，reader 会从已提交的断点续读，
+// 已成功上传的块不再重复导出。
+//
+// 每块以「当前 source.IncrPoint」（即上一块的水位）命名，故对象名随水位单调推进、天然唯一，
+// 无需 _partNNNN 之类的序号后缀；重跑只覆盖尚未提交的那一块，已提交的对象名互不相同、不会被误覆盖。
+// 这依赖 reader 在 commit_batch_size>0 时强制的 ORDER BY incr_field ASC（保证每块水位单调递增）。
+func (d *parquetWriterDialect) writeChunkedObjects(ctx context.Context, in <-chan reader.Batch, source *config.SourceConfig) error {
+	target := d.target
+
+	firstBatch, foundRows := drainFirstBatch(in)
+	if !foundRows {
+		log.Printf("parquet incremental finished: no rows to load (table=%s)", target.Table)
+		return nil
+	}
+
+	enc, err := newParquetEncoder(target.Table, firstBatch.Columns, source)
+	if err != nil {
+		return err
+	}
+
+	chunkBatches := target.CommitBatchSize
+
+	var (
+		part         *parquetPart
+		batchInChunk int
+	)
+
+	// openChunk 按当前 IncrPoint 命名并打开下一个块对象。
+	openChunk := func() {
+		part = d.startPart(ctx, incrementalObjectKey(target, source), enc.schema)
+		batchInChunk = 0
+	}
+
+	// commitChunk 收尾对象、提交本块水位并推进断点。
+	commitChunk := func() error {
+		if err := part.finish(); err != nil {
+			return err
+		}
+		// 行有序（ORDER BY ASC），此刻 enc 的全局最大值即本块最大水位。
+		wm := enc.watermark()
+		if wm != "" {
+			if err := upsertWatermark(ctx, d.metaConn, wm, target, source, d.jobName); err != nil {
+				return err
+			}
+			// 推进断点：既供下一块对象命名，也让失败重跑从此处续传而非从任务起点重导。
+			source.IncrPoint = wm
+		}
+		rgCount, rgRows := part.rowGroups()
+		log.Printf("parquet chunk finished: object=%s watermark=%s row_groups=%d rows=%v", d.store.describe(part.key), wm, rgCount, rgRows)
+		part = nil
+		return nil
+	}
+
+	// writeOne 把一个 batch 写进当前块：必要时先开块，写满 chunkBatches 后提交收块。
+	writeOne := func(batch reader.Batch) error {
+		if part == nil {
+			openChunk()
+		}
+		if err := enc.encodeBatch(part.pw, batch); err != nil {
+			return part.abort(err)
+		}
+		batchInChunk++
+		if batchInChunk >= chunkBatches {
+			return commitChunk()
+		}
+		return nil
+	}
+
+	if err := writeOne(firstBatch); err != nil {
+		return err
+	}
+	for batch := range in {
+		if err := writeOne(batch); err != nil {
+			return err
+		}
+	}
+
+	// reader 出错会 cancel(ctx)：必须在收尾提交前拦截，中止仍打开的块，
+	// 否则会把不完整的末块 finish、上传并提交其水位。交由上层返回根因错误。
+	if err := ctx.Err(); err != nil {
+		if part != nil {
+			return part.abort(err)
+		}
+		return err
+	}
+
+	// 收尾最后一个未满的块。
+	if part != nil {
+		if err := commitChunk(); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// writeSingleObject 从 channel 消费所有 batch，按首个 batch 的列与类型建立 schema，将 parquet 数据
+// 流式写入对象存储的单个对象（经 io.Pipe 边序列化边上传，不落本地临时文件）。
+// parquet schema 根节点名复用目标表名。
+//
+// full/initial 全量与「不满足断点续传条件」的增量都走这里：整段写完后一次性收尾。
+// 增量的分段断点续传见 writeChunkedObjects。
+//
+// 若 source 非 nil 且含增量字段，返回其最大值作为水位。
+func (d *parquetWriterDialect) writeSingleObject(ctx context.Context, in <-chan reader.Batch, key string, source *config.SourceConfig) (string, error) {
+	firstBatch, foundRows := drainFirstBatch(in)
+	if !foundRows {
+		log.Printf("parquet write finished: no rows to load (object=%s)", d.store.describe(key))
+		return "", nil
+	}
+
+	enc, err := newParquetEncoder(d.target.Table, firstBatch.Columns, source)
+	if err != nil {
+		return "", err
+	}
+
+	part := d.startPart(ctx, key, enc.schema)
+
+	if err := enc.encodeBatch(part.pw, firstBatch); err != nil {
+		return "", part.abort(err)
+	}
+	for batch := range in {
+		if err := enc.encodeBatch(part.pw, batch); err != nil {
+			return "", part.abort(err)
+		}
+	}
+
+	// reader 出错会 cancel(ctx)：必须在收尾前拦截，中止对象写入，
+	// 否则会把不完整的对象 finish 并上传上去。交由上层返回根因错误。
+	if err := ctx.Err(); err != nil {
+		return "", part.abort(err)
+	}
+
+	if err := part.finish(); err != nil {
+		return "", err
+	}
+	rgCount, rgRows := part.rowGroups()
+	log.Printf("parquet write finished: object=%s row_groups=%d rows=%v", d.store.describe(key), rgCount, rgRows)
+
+	return enc.watermark(), nil
+}
+
+func (d *parquetWriterDialect) getWatermark(source *config.SourceConfig) (string, error) {
+	target := d.target
+	jobName := d.jobName
+	if source == nil || source.IncrField == "" {
+		return "", nil
+	}
+
+	if d.metaConn != nil {
+		wm, err := readWatermarkPoint(context.Background(), d.metaConn, target, source, jobName)
+		if err != nil {
+			return "", err
+		}
+		if wm != "" {
+			return wm, nil
+		}
+	}
+
+	// 文件目标没有可查询的目标表，只能按字段名推算兑底起点。
+	wm := defaultIncrPoint(source.IncrField)
+	log.Printf("parquet watermark fallback: using default %s=%s", source.IncrField, wm)
+	return wm, nil
 }
 
 // parquetEncoder 持有单个对象的编码状态：schema、列映射、类型、增量水位追踪与行缓冲，
@@ -140,8 +315,8 @@ type parquetEncoder struct {
 }
 
 // newParquetEncoder 依首个 batch 的列信息构造 schema 与编码器。schemaName 作为 parquet schema 根节点名（复用目标表名）。
-func newParquetEncoder(columns []reader.ColumnMeta, source *config.SourceConfig, schemaName string) (*parquetEncoder, error) {
-	schema := buildParquetSchema(columns, schemaName)
+func newParquetEncoder(schemaName string, columns []reader.ColumnMeta, source *config.SourceConfig) (*parquetEncoder, error) {
+	schema := buildParquetSchema(schemaName, columns)
 
 	// buildParquetSchema 以列名为 map 键，重名列会互相覆盖；字段数对不上即说明存在重名。
 	// 若放任不管，两个输入列会映射到同一个叶子列而写出错乱的行。
@@ -171,7 +346,6 @@ func newParquetEncoder(columns []reader.ColumnMeta, source *config.SourceConfig,
 		incrIdx:  incrIdx,
 		incrKind: incrKind,
 		rb:       parquet.NewRowBuilder(schema),
-		buf:      make([]parquet.Row, 0, parquetFlushRows),
 	}, nil
 }
 
@@ -189,8 +363,11 @@ func resolveIncrIndex(columns []reader.ColumnMeta, source *config.SourceConfig) 
 	return -1
 }
 
-// encodeBatch 将一个 batch 的所有行编码进 pw，达到 flush 阈值时批量写出，并推进水位。
+// encodeBatch 将一个 batch 的所有行编码后一次性写入 pw，并推进水位。
+// 一次 WriteRows 写完整个 batch：parquet 内部自行按 row group 缓冲/落盘（见 MaxRowsPerRowGroup），
+// 无需在此再叠一层按行数的中间批次；e.buf 仅作跨 batch 复用的临时暂存。
 func (e *parquetEncoder) encodeBatch(pw *parquet.GenericWriter[any], batch reader.Batch) error {
+	e.buf = e.buf[:0]
 	for _, row := range batch.Rows {
 		e.rb.Reset()
 		// row 与 batch.Columns 同源构造，长度必然一致。
@@ -207,11 +384,12 @@ func (e *parquetEncoder) encodeBatch(pw *parquet.GenericWriter[any], batch reade
 		}
 		e.trackWatermark(row)
 		e.buf = append(e.buf, e.rb.Row().Clone())
-		if len(e.buf) >= parquetFlushRows {
-			if err := e.flush(pw); err != nil {
-				return err
-			}
-		}
+	}
+	if len(e.buf) == 0 {
+		return nil
+	}
+	if _, err := pw.WriteRows(e.buf); err != nil {
+		return fmt.Errorf("write parquet rows failed: %w", err)
 	}
 	return nil
 }
@@ -242,119 +420,79 @@ func (e *parquetEncoder) watermark() string {
 	return reader.FormatText(e.incrKind, e.maxVal)
 }
 
-// flush 将缓冲行写入 pw 并清空缓冲。
-func (e *parquetEncoder) flush(pw *parquet.GenericWriter[any]) error {
-	if len(e.buf) == 0 {
-		return nil
-	}
-	if _, err := pw.WriteRows(e.buf); err != nil {
-		return fmt.Errorf("write parquet rows failed: %w", err)
-	}
-	e.buf = e.buf[:0]
-	return nil
+// parquetPart 封装单个 parquet 对象的写入生命周期：io.Pipe + 上传协程 + GenericWriter。
+// dialect 往 pw 写行，上传协程从 pipe 读端流式 PUT 到对象存储，避免"先落本地临时文件再上传"的二次写入。
+type parquetPart struct {
+	key        string
+	pw         *parquet.GenericWriter[any]
+	pipeW      *io.PipeWriter
+	uploadDone chan error
 }
 
-// writeObject 从 channel 消费所有 batch，按首个 batch 的列与类型建立 schema，将 parquet 数据
-// 流式写入对象存储（经 io.Pipe 边序列化边上传，不落本地临时文件）。
-// parquet schema 根节点名复用目标表名。
-// 若 source 非 nil 且含增量字段，返回其最大值作为水位。
-func (d *parquetWriterDialect) writeObject(ctx context.Context, in <-chan reader.Batch, key string, source *config.SourceConfig) (string, error) {
-	target := d.store.describe(key)
-
-	firstBatch, foundRows := drainFirstBatch(in)
-	if !foundRows {
-		log.Printf("parquet write finished: no rows to load (object=%s)", target)
-		return "", nil
-	}
-
-	enc, err := newParquetEncoder(firstBatch.Columns, source, d.target.Table)
-	if err != nil {
-		return "", err
-	}
-
-	// 流式上传：parquet 直接写入 pipe 写端，上传协程从读端消费并 PUT 到对象存储，
-	// 避免"先落本地临时文件再上传"的二次写入。
+// startPart 打开一个新 parquet 对象：建立 pipe、拉起上传协程、构造 GenericWriter。
+func (d *parquetWriterDialect) startPart(ctx context.Context, key string, schema *parquet.Schema) *parquetPart {
 	pr, pipeW := io.Pipe()
 	uploadDone := make(chan error, 1)
 	go func() {
 		uploadDone <- d.store.put(ctx, key, pr)
 	}()
 
-	// 按列 Zstd 压缩：parquet 列内同类型数据高度冗余（尤其 JSON 文本列跨行重复大量 key），
-	// 压缩率远高于不压；Zstd 在压缩率/CPU 上优于 Snappy/Gzip，作为离线 ETL 默认编码。
-	pw := parquet.NewGenericWriter[any](pipeW, enc.schema,
+	opts := []parquet.WriterOption{
+		schema,
+		// 按列 Zstd 压缩：parquet 列内同类型数据高度冗余（尤其 JSON 文本列跨行重复大量 key），
+		// 压缩率远高于不压；Zstd 在压缩率/CPU 上优于 Snappy/Gzip，作为离线 ETL 默认编码。
 		parquet.Compression(&parquet.Zstd),
-	)
-
-	// abort 用根因错误关闭 pipe 写端，唤醒并等待上传协程结束，再回传该错误。
-	abort := func(err error) (string, error) {
-		pipeW.CloseWithError(err)
-		<-uploadDone
-		return "", err
+		// 限制单个 row group 的行数：不设时整个对象为单个 row group，须等 Close 才落盘，
+		// 峰值内存随对象总行数增长；设为正值可切分多个 row group，压低峰值内存并利于下游并行读。
+		parquet.MaxRowsPerRowGroup(d.target.MaxRowsPerRowGroup),
+		// 写入方标识与血缘元数据：落进 footer，供下游/运维直接读出对象由谁、哪个 job、哪张源表产出，
+		// 便于溯源排查（不影响数据本身，读取端可忽略）。
+		parquet.CreatedBy("db-etl", "", ""),
+		parquet.KeyValueMetadata("db-etl.job", d.jobName),
+		parquet.KeyValueMetadata("db-etl.table", d.target.Table),
 	}
-
-	if err := enc.encodeBatch(pw, firstBatch); err != nil {
-		return abort(err)
-	}
-	for batch := range in {
-		if err := enc.encodeBatch(pw, batch); err != nil {
-			return abort(err)
-		}
-	}
-
-	// reader 出错会 cancel(ctx)：此时中止上传，交由上层返回根因错误。
-	if err := ctx.Err(); err != nil {
-		return abort(err)
-	}
-
-	if err := enc.flush(pw); err != nil {
-		return abort(err)
-	}
-
-	if err := pw.Close(); err != nil {
-		return abort(fmt.Errorf("close parquet writer failed: %w", err))
-	}
-
-	// 关闭 pipe 写端，向上传协程发出 EOF，触发其读完并完成 PUT。
-	if err := pipeW.Close(); err != nil {
-		<-uploadDone
-		return "", fmt.Errorf("close parquet stream failed: %w", err)
-	}
-
-	if err := <-uploadDone; err != nil {
-		return "", err
-	}
-
-	log.Printf("parquet write finished: object=%s", target)
-	return enc.watermark(), nil
+	pw := parquet.NewGenericWriter[any](pipeW, opts...)
+	return &parquetPart{key: key, pw: pw, pipeW: pipeW, uploadDone: uploadDone}
 }
 
-func (d *parquetWriterDialect) getWatermark(source *config.SourceConfig) (string, error) {
-	target := d.target
-	jobName := d.jobName
-	if source == nil || source.IncrField == "" {
-		return "", nil
-	}
+// abort 用根因错误关闭 pipe 写端，唤醒并等待上传协程结束，再回传该错误。
+func (p *parquetPart) abort(err error) error {
+	p.pipeW.CloseWithError(err)
+	<-p.uploadDone
+	return err
+}
 
-	if d.metaConn != nil {
-		wm, err := readWatermarkPoint(context.Background(), d.metaConn, target, source, jobName)
-		if err != nil {
-			return "", err
-		}
-		if wm != "" {
-			return wm, nil
-		}
+// rowGroups 返回本对象已写入的 row group 数量及各组行数；须在 finish（即 pw.Close 写完 footer）
+// 之后调用，否则 File() 尚不可用返回 0/nil。用于日志核对 MaxRowsPerRowGroup 的切分是否生效。
+func (p *parquetPart) rowGroups() (int, []int64) {
+	fv := p.pw.File()
+	if fv == nil {
+		return 0, nil
 	}
+	rgs := fv.Metadata().RowGroups
+	rows := make([]int64, len(rgs))
+	for i := range rgs {
+		rows[i] = rgs[i].NumRows
+	}
+	return len(rgs), rows
+}
 
-	// 文件目标没有可查询的目标表，只能按字段名推算兜底起点。
-	wm := defaultIncrPoint(source.IncrField)
-	log.Printf("parquet watermark fallback: using default %s=%s", source.IncrField, wm)
-	return wm, nil
+// finish 收尾当前对象：pw 关闭触发写入 footer，关闭 pipe 触发上传读完并完成 PUT，返回上传结果。
+func (p *parquetPart) finish() error {
+	if err := p.pw.Close(); err != nil {
+		return p.abort(fmt.Errorf("close parquet writer failed: %w", err))
+	}
+	// 关闭 pipe 写端，向上传协程发出 EOF，触发其读完并完成 PUT。
+	if err := p.pipeW.Close(); err != nil {
+		<-p.uploadDone
+		return fmt.Errorf("close parquet stream failed: %w", err)
+	}
+	return <-p.uploadDone
 }
 
 // buildParquetSchema 依列名与 ColumnKind 构造 parquet schema（全部为 optional 以容纳 NULL）。
 // name 为 schema 根节点名，复用目标表名（已由 config.validateTarget 保证非空）。
-func buildParquetSchema(columns []reader.ColumnMeta, name string) *parquet.Schema {
+func buildParquetSchema(name string, columns []reader.ColumnMeta) *parquet.Schema {
 	group := parquet.Group{}
 	for _, col := range columns {
 		var node parquet.Node

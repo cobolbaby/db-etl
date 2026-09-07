@@ -16,10 +16,6 @@ import (
 	"github.com/jackc/pgx/v5/pgconn"
 )
 
-type PGWriter struct {
-	*BaseWriter
-}
-
 type pgWriterDialect struct {
 	conn *pgx.Conn
 }
@@ -32,7 +28,7 @@ func NewPGWriter(conn *pgx.Conn, target *config.TargetConfig, jobName string) Wr
 
 	base.dialect = &pgWriterDialect{conn: conn}
 
-	return &PGWriter{BaseWriter: base}
+	return base
 }
 
 // close 关闭 pgx 连接。

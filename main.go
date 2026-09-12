@@ -63,21 +63,26 @@ func main() {
 	var metaDB config.DBConfig
 
 	if cfg.MetaDB != "" {
-		// 从数据库加载任务列表，job_name 取自 config.yaml 的 name 字段
+		// meta_db 首先是「水位/元数据存储库」：解析后交给下游 writer 回写增量指针。
 		var ok bool
 		metaDB, ok = dbResolver.Resolve(cfg.MetaDB, cfg.MetaDB)
 		if !ok {
 			log.Fatalf("meta_db %q not found in databases config", cfg.MetaDB)
 		}
 
-		dbTasks, err := config.LoadTasksFromDB(context.Background(), metaDB, cfg.Name, dbResolver)
-		if err != nil {
-			log.Fatalf("load tasks from db failed: %v", err)
+		// 任务来源与水位存储解耦：yaml 显式定义的 tasks 优先；
+		// 仅当 yaml 未定义任务时，才回退到从 manager.job_data_sync 按 name 加载。
+		// 这样批量导出 parquet 等场景可以「任务写在 yaml、水位记到 meta_db」。
+		if len(cfg.Tasks) == 0 {
+			dbTasks, err := config.LoadTasksFromDB(context.Background(), metaDB, cfg.Name, dbResolver)
+			if err != nil {
+				log.Fatalf("load tasks from db failed: %v", err)
+			}
+			log.Printf("loaded %d task(s) from manager.job_data_sync for job_name=%q", len(dbTasks), cfg.Name)
+			tasks = dbTasks
+		} else {
+			log.Printf("using %d task(s) from config file; meta_db %q used for watermark storage", len(cfg.Tasks), cfg.MetaDB)
 		}
-		log.Printf("loaded %d task(s) from manager.job_data_sync for job_name=%q", len(dbTasks), cfg.Name)
-		tasks = dbTasks
-
-		// tasks = append(tasks, dbTasks...)
 	}
 
 	if len(tasks) == 0 {

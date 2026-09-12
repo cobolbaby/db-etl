@@ -81,7 +81,7 @@ tasks:
 - `error_policy`：任务失败策略，`abort`（默认，遇错立即退出）或 `continue`（跳过失败任务继续执行）。
 - `databases`：数据库连接定义列表。
 - `s3`：对象存储落地端定义列表，供 `target.s3` 引用。
-- `meta_db`：存放 `manager.job_data_sync` 的数据库别名（引用 `databases[].name`）。配置后任务列表改从该表按 `name` 加载，而非使用 `tasks`；未配置时不回写水位。
+- `meta_db`：存放 `manager.job_data_sync` 的数据库别名（引用 `databases[].name`），作为水位（增量指针）的存储库；未配置时不回写水位。任务来源与水位存储解耦：yaml 中显式定义了 `tasks` 时优先使用 `tasks`，`meta_db` 仅用于回写水位；仅当 yaml 未定义 `tasks` 时，才回退为按 `name` 从 `manager.job_data_sync` 加载任务列表。
 - `retry`：失败重试策略（按 source 粒度），见下。
 - `tasks`：任务定义列表。
 

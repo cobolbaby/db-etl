@@ -631,11 +631,16 @@ func (source *SourceConfig) Validate(resolver DBResolver, target *TargetConfig) 
 	}
 
 	// TODO: 待讨论，暂时将该验证注释掉，允许用户在 append 模式下不配置 incr_field，使用全量抽取的方式。
-	// // append 只追加不去重，没有 incr_field 就无从界定增量区间，重跑必然产生重复行，故必填。
+	// append 写 DB 只追加不去重：未配置 incr_field 时重复执行会把同一批数据反复插入造成重复行，故建议必填。
 	// if target.Mode == ModeTypeAppend && strings.TrimSpace(source.IncrField) == "" {
 	// 	return fmt.Errorf("incr_field is required for %s mode", target.Mode)
 	// }
 
+	// append 写对象存储时，增量对象的 key 同样由起点水位命名（见 incrementalObjectKey），
+	// 缺少 incr_field 会让每次增量都覆盖同一个对象，故此场景 incr_field 必填。
+	if target.Mode == ModeTypeAppend && strings.TrimSpace(target.S3) != "" && strings.TrimSpace(source.IncrField) == "" {
+		return fmt.Errorf("incr_field is required for %s mode when target is s3", target.Mode)
+	}
 	// merge 写 DB 时按 pk 做 DELETE + INSERT，重复抽取同一区间是幂等的，
 	// 允许不配 incr_field（由 SQL 自身圈定滚动窗口，如 date >= now() - interval '3 days'）。
 	// 但 merge 写对象存储时，增量对象的 key 由起点水位命名（见 incrementalObjectKey），

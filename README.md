@@ -22,15 +22,8 @@ CREATE TABLE IF NOT EXISTS manager.job_data_sync
     dst_pk character varying(100) COLLATE pg_catalog."default",
     fields_mapping jsonb,
     incr_point text COLLATE pg_catalog."default",
-<<<<<<< HEAD
-    cdt timestamp without time zone,
-    udt timestamp without time zone,
-    created_by character varying(50) COLLATE pg_catalog."default",
-    modified_by character varying(50) COLLATE pg_catalog."default",
-=======
     cdt timestamp without time zone NOT NULL DEFAULT now(),
     udt timestamp without time zone NOT NULL DEFAULT now(),
->>>>>>> main
     remark text COLLATE pg_catalog."default",
     inuse boolean NOT NULL DEFAULT true,
     src_conn_name character varying(50) COLLATE pg_catalog."default",

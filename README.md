@@ -11,29 +11,55 @@ CREATE SCHEMA IF NOT EXISTS manager;
 CREATE TABLE IF NOT EXISTS manager.job_data_sync
 (
     job_id serial primary key,
-    job_name character varying(50) COLLATE pg_catalog."default",
     src_schema_name character varying(100) COLLATE pg_catalog."default",
     src_table_name character varying(100) COLLATE pg_catalog."default",
-    src_rawsql text COLLATE pg_catalog."default",
-    dst_schema_name character varying(100) COLLATE pg_catalog."default",
-    dst_table_name character varying(100) COLLATE pg_catalog."default",
-    src_where_statement text COLLATE pg_catalog."default",
-    sync_mode character varying(10) COLLATE pg_catalog."default",
-    src_incr_field character varying(100) COLLATE pg_catalog."default",
+    dst_schema_name character varying(100) COLLATE pg_catalog."default" NOT NULL,
+    dst_table_name character varying(100) COLLATE pg_catalog."default" NOT NULL,
+    src_select_statement text COLLATE pg_catalog."default" NOT NULL DEFAULT '*'::text,
+    src_where_statement text COLLATE pg_catalog."default" NOT NULL DEFAULT '${SRC_INCR_FIELD} > ''${INCR_POINT}'''::text,
+    sync_mode character varying(10) COLLATE pg_catalog."default" NOT NULL,
+    src_incr_field character varying(100) COLLATE pg_catalog."default" NOT NULL DEFAULT ''::character varying,
     dst_pk character varying(100) COLLATE pg_catalog."default",
     fields_mapping jsonb,
     incr_point text COLLATE pg_catalog."default",
-    cdt timestamp without time zone,
-    udt timestamp without time zone,
-    created_by character varying(50) COLLATE pg_catalog."default",
-    modified_by character varying(50) COLLATE pg_catalog."default",
+    cdt timestamp without time zone NOT NULL DEFAULT now(),
+    udt timestamp without time zone NOT NULL DEFAULT now(),
     remark text COLLATE pg_catalog."default",
-    inuse boolean,
+    inuse boolean NOT NULL DEFAULT true,
     src_conn_name character varying(50) COLLATE pg_catalog."default",
-    src_db_name character varying(50) COLLATE pg_catalog."default",
-    src_conn_id integer
+    src_db_name character varying(50) COLLATE pg_catalog."default" NOT NULL,
+    job_name character varying(50) COLLATE pg_catalog."default" NOT NULL,
+    src_conn_id integer,
+    dst_distributed_by character varying(100) COLLATE pg_catalog."default",
+    created_by character varying(50) COLLATE pg_catalog."default" NOT NULL DEFAULT ''::character varying,
+    modified_by character varying(50) COLLATE pg_catalog."default" NOT NULL DEFAULT ''::character varying,
+    dst_data_type character varying(50) COLLATE pg_catalog."default",
+    dst_conn_id integer,
+    src_rawsql text COLLATE pg_catalog."default",
+    last_status integer,
+    weight numeric
 )
 TABLESPACE pg_default;
+
+COMMENT ON TABLE manager.job_data_sync
+    IS 'DTS 数据同步配置表';
+
+COMMENT ON COLUMN manager.job_data_sync.src_select_statement
+    IS '已弃用，最初是服务于 Kettle 同步模版的。
+
+先别删，可能后面另做它用';
+
+COMMENT ON COLUMN manager.job_data_sync.src_conn_name
+    IS '保留字段，但需要确保 src_conn_name 和 src_conn_id 不能都为 null';
+
+COMMENT ON COLUMN manager.job_data_sync.dst_distributed_by
+    IS '保留字段，暂时忽略';
+
+COMMENT ON COLUMN manager.job_data_sync.dst_data_type
+    IS '用于标识同步数据是否要保存为 parquet 文件格式，是要临时文件转储 还是 直接洛表。';
+
+COMMENT ON COLUMN manager.job_data_sync.dst_conn_id
+    IS '保留字段，用于后期将同一个厂区所有配置表都汇总到 DTS 库。';
 
 ```
 
@@ -106,14 +132,14 @@ tasks:
 
 任务定义列表。每个任务将多个 `sources` 的数据写入一个 `target`。
 
-| 字段      | 说明                                                                        |
-| --------- | --------------------------------------------------------------------------- |
-| `name`    | 任务名称，配置了 `incr_field` 时必填，写入 `manager.job_data_sync.job_name` |
-| `type`    | 任务类型，目前支持 `query`                                                  |
-| `sources` | 源配置列表，见下节                                                          |
-| `target`  | 目标配置，见下节                                                            |
-| `transform` | 可选。转换步骤列表（在类型序列化之后、写入之前按顺序执行），见下节        |
-| `hooks`   | 前置/后置 SQL hook，见下节                                                  |
+| 字段        | 说明                                                                        |
+| ----------- | --------------------------------------------------------------------------- |
+| `name`      | 任务名称，配置了 `incr_field` 时必填，写入 `manager.job_data_sync.job_name` |
+| `type`      | 任务类型，目前支持 `query`                                                  |
+| `sources`   | 源配置列表，见下节                                                          |
+| `target`    | 目标配置，见下节                                                            |
+| `transform` | 可选。转换步骤列表（在类型序列化之后、写入之前按顺序执行），见下节          |
+| `hooks`     | 前置/后置 SQL hook，见下节                                                  |
 
 ## `sources` 配置
 
@@ -168,10 +194,10 @@ tasks:
         table: dbo.output_by_day
     transform:
       - unpivot:
-          key_field: day       # 承载“列标签”的目标列名
-          value_field: qty     # 承载“列值”的目标列名
-          drop_null: true      # 源列值为 NULL 的展开行跳过
-          columns:             # 宽表源列名 -> 写入 key_field 的标签
+          key_field: day # 承载“列标签”的目标列名
+          value_field: qty # 承载“列值”的目标列名
+          drop_null: true # 源列值为 NULL 的展开行跳过
+          columns: # 宽表源列名 -> 写入 key_field 的标签
             Day1: "1"
             Day2: "2"
             Day3: "3"
@@ -184,12 +210,12 @@ tasks:
 
 把宽表中一组列展开成 `key_field` / `value_field` 两列的多行：`columns` 中的每一个源列产生一行，其余未列举的列作为标识列在每行重复保留。适用于 Day1..Day31 这类周期性宽表：源端仍按宽表抽取（网络传输量小），在转换阶段才展开为长表。
 
-| 字段          | 必填 | 说明                                                                          |
-| ------------- | ---- | ----------------------------------------------------------------------------- |
-| `key_field`   | 是   | 输出中承载“列标签”的目标列名（如 `day`）；不能与 `value_field` 相同            |
-| `value_field` | 是   | 输出中承载“列值”的目标列名（如 `qty`）                                        |
+| 字段          | 必填 | 说明                                                                              |
+| ------------- | ---- | --------------------------------------------------------------------------------- |
+| `key_field`   | 是   | 输出中承载“列标签”的目标列名（如 `day`）；不能与 `value_field` 相同               |
+| `value_field` | 是   | 输出中承载“列值”的目标列名（如 `qty`）                                            |
 | `columns`     | 是   | 「宽表源列名 -> 写入 `key_field` 的标签」映射；未出现在此映射中的列作为标识列保留 |
-| `drop_null`   |      | 为 `true` 时，源列值为 NULL 的展开行会被跳过（默认 `false`）                    |
+| `drop_null`   |      | 为 `true` 时，源列值为 NULL 的展开行会被跳过（默认 `false`）                      |
 
 > `key_field` / `value_field` 只允许字母、数字、下划线，且不能为保留关键字。
 
@@ -398,10 +424,10 @@ go run . -version
 
 可用参数：
 
-| 参数       | 说明                              |
-| ---------- | --------------------------------- |
+| 参数       | 说明                             |
+| ---------- | -------------------------------- |
 | `-config`  | 配置文件路径，默认 `config.yaml` |
-| `-version` | 打印版本信息后退出              |
+| `-version` | 打印版本信息后退出               |
 
 > 程序为单次执行（跑完所有任务即退出）；定时调度请交由外部（如 cron）驱动。
 

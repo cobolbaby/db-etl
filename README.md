@@ -193,16 +193,10 @@ s3:
 | ----------- | --------------------------------------------------------------------------- |
 | `name`      | 任务名称，配置了 `incr_field` 时必填，写入 `manager.job_data_sync.job_name` |
 | `type`      | 任务类型，目前支持 `query`                                                  |
-<<<<<<< HEAD
 | `comment`   | 可选备注                                                                    |
 | `sources`   | 源配置列表，见下节                                                          |
 | `target`    | 目标配置，见下节                                                            |
 | `transform` | 转换链，在写入前对数据做结构重塑，见下节                                    |
-=======
-| `sources`   | 源配置列表，见下节                                                          |
-| `target`    | 目标配置，见下节                                                            |
-| `transform` | 可选。转换步骤列表（在类型序列化之后、写入之前按顺序执行），见下节          |
->>>>>>> main
 | `hooks`     | 前置/后置 SQL hook，见下节                                                  |
 
 ## `sources` 配置
@@ -248,7 +242,6 @@ s3:
 
 ## `transform` 配置
 
-<<<<<<< HEAD
 `transform` 是 `tasks[]` 下的转换步骤列表，在 reader 之后、writer 之前按顺序执行。每个步骤只能指定一种转换类型，目前支持 `unpivot`。
 
 ### `unpivot`（列转行）
@@ -268,27 +261,10 @@ tasks:
           value_field: qty # 承载「列值」的目标列名
           drop_null: true # 源列值为 NULL 时跳过该行，默认 false
           columns: # 源列名 -> 写入 key_field 的标签
-=======
-`transform` 是任务级的**转换步骤列表**，在列类型序列化之后、写入目标之前按顺序执行。未配置时为纯序列化透传。目前支持的步骤类型为 `unpivot`（列转行）。
-
-```yaml
-tasks:
-  - name: daily_output
-    sources:
-      - conn_name: src_db
-        table: dbo.output_by_day
-    transform:
-      - unpivot:
-          key_field: day # 承载“列标签”的目标列名
-          value_field: qty # 承载“列值”的目标列名
-          drop_null: true # 源列值为 NULL 的展开行跳过
-          columns: # 宽表源列名 -> 写入 key_field 的标签
->>>>>>> main
             Day1: "1"
             Day2: "2"
             Day3: "3"
     target:
-<<<<<<< HEAD
       conn_name: target-pg
       table: ods.monthly_plan_long
       mode: full
@@ -302,24 +278,6 @@ tasks:
 | `drop_null`   |      | 为 `true` 时跳过源列值为 NULL 的展开行                           |
 
 > `value_field` 汇聚的是多个异构源列的取值，因此统一以文本输出（时间采用 `2006-01-02 15:04:05.999999999` 格式）。源列为 NULL 时仍保持 NULL。
-=======
-      conn_name: dst_db
-      table: public.output_long
-```
-
-### `unpivot`（列转行 / 宽表转长表）
-
-把宽表中一组列展开成 `key_field` / `value_field` 两列的多行：`columns` 中的每一个源列产生一行，其余未列举的列作为标识列在每行重复保留。适用于 Day1..Day31 这类周期性宽表：源端仍按宽表抽取（网络传输量小），在转换阶段才展开为长表。
-
-| 字段          | 必填 | 说明                                                                              |
-| ------------- | ---- | --------------------------------------------------------------------------------- |
-| `key_field`   | 是   | 输出中承载“列标签”的目标列名（如 `day`）；不能与 `value_field` 相同               |
-| `value_field` | 是   | 输出中承载“列值”的目标列名（如 `qty`）                                            |
-| `columns`     | 是   | 「宽表源列名 -> 写入 `key_field` 的标签」映射；未出现在此映射中的列作为标识列保留 |
-| `drop_null`   |      | 为 `true` 时，源列值为 NULL 的展开行会被跳过（默认 `false`）                      |
-
-> `key_field` / `value_field` 只允许字母、数字、下划线，且不能为保留关键字。
->>>>>>> main
 
 ## `target` 配置
 
@@ -551,16 +509,9 @@ tasks:
 ## 运行
 
 ```bash
-<<<<<<< HEAD
 go run . -config config.yaml
 
 # 查看版本信息
-=======
-# 使用默认的 config.yaml
-go run . -config config.yaml
-
-# 打印版本信息
->>>>>>> main
 go run . -version
 ```
 

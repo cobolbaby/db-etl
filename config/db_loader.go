@@ -12,6 +12,7 @@ import (
 type JobDataSyncRow struct {
 	JobName           string
 	SrcConnID         string // 引用 config.yaml 中 databases[].id
+	SrcConnName       string // 引用 config.yaml 中 databases[].name
 	SrcDBName         string
 	SrcSchemaName     string
 	SrcTableName      string
@@ -41,7 +42,8 @@ func LoadTasksFromDB(ctx context.Context, metaDB DBConfig, jobName string, resol
 	const query = `
 		SELECT
 			job_name,
-			src_conn_id,
+			COALESCE(src_conn_id::text, '')    AS src_conn_id,
+			COALESCE(src_conn_name, '')        AS src_conn_name,
 			COALESCE(src_db_name, '')         AS src_db_name,
 			COALESCE(src_schema_name, '')     AS src_schema_name,
 			COALESCE(src_table_name, '')      AS src_table_name,
@@ -73,6 +75,7 @@ func LoadTasksFromDB(ctx context.Context, metaDB DBConfig, jobName string, resol
 		if err := rows.Scan(
 			&r.JobName,
 			&r.SrcConnID,
+			&r.SrcConnName,
 			&r.SrcDBName,
 			&r.SrcSchemaName,
 			&r.SrcTableName,
@@ -117,8 +120,8 @@ func LoadTasksFromDB(ctx context.Context, metaDB DBConfig, jobName string, resol
 //     写入 source.WhereStatement / source.FieldsMapping，留到 reader 阶段再拼装查询。
 func rowToTaskConfig(r JobDataSyncRow, metaDB DBConfig, resolver DBResolver) (TaskConfig, error) {
 
-	if r.SrcConnID == "" {
-		return TaskConfig{}, fmt.Errorf("src_conn_id is empty")
+	if r.SrcConnID == "" && r.SrcConnName == "" {
+		return TaskConfig{}, fmt.Errorf("src_conn_id and src_conn_name are both empty")
 	}
 	if r.DstSchemaName == "" || r.DstTableName == "" {
 		return TaskConfig{}, fmt.Errorf("dst_schema_name / dst_table_name is empty")
@@ -129,8 +132,9 @@ func rowToTaskConfig(r JobDataSyncRow, metaDB DBConfig, resolver DBResolver) (Ta
 	}
 
 	src := &SourceConfig{
-		// 通过 src_conn_id 匹配数据源。
-		ConnID: r.SrcConnID,
+		// 通过 src_conn_id / src_conn_name 匹配数据源（id 优先，name 兼容按名称配置的 datasource）。
+		ConnID:   r.SrcConnID,
+		ConnName: r.SrcConnName,
 		// Database 直接取自 job_data_sync 的 src_db_name，作为 watermark 的 src_db_name。
 		// 它反映真实的源库（可能与数据源连接默认库不同），后续流程不得用连接配置的库名覆盖。
 		Database:       strings.TrimSpace(r.SrcDBName),
@@ -150,7 +154,7 @@ func rowToTaskConfig(r JobDataSyncRow, metaDB DBConfig, resolver DBResolver) (Ta
 		src.FieldsMapping = parsedMapping
 	}
 
-	srcDB, srcDBFound := resolver.Resolve(r.SrcConnID, "")
+	srcDB, srcDBFound := resolver.Resolve(r.SrcConnID, r.SrcConnName)
 	if srcDBFound {
 		src.DBType = srcDB.Type
 	}

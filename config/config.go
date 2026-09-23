@@ -562,6 +562,7 @@ func (s *SourceConfig) normalize() {
 
 // ValidateTableName 校验表名（source 与 target 共用）：
 //  1. 仅允许字母、数字、'_' 与 '.'（'.' 用于区隔 schema.table），其余字符（'/'、空格、':' 等）一律非法；
+//     MSSQL 额外允许 '[' 与 ']'，以支持用方括号包裹保留字/特殊标识符（如 dbo.[File]）；
 //  2. 允许 table / schema.table；三段式 db.schema.table 仅 MSSQL 合法。
 //
 // 空表名返回 nil（source 在 SQL 模式下 table 可为空；target 的非空约束由调用方单独保证）。
@@ -575,6 +576,8 @@ func ValidateTableName(table string, dbType DBType) error {
 		switch {
 		case unicode.IsLetter(r), unicode.IsDigit(r), r == '_', r == '.':
 			// 合法字符
+		case (r == '[' || r == ']') && dbType == DBTypeMSSQL:
+			// SQL Server 用方括号包裹保留字/含特殊字符的标识符，如 dbo.[File]。
 		default:
 			return fmt.Errorf("table %q contains illegal character %q; only letters, digits, '_' and '.' are allowed", trimmed, r)
 		}

@@ -210,6 +210,70 @@ func upsertWatermark(ctx context.Context, ex pgxExecutor, wm string, target *con
 	return util.WrapPgError(err)
 }
 
+// SyncStatus 是 manager.job_data_sync.last_status 的取值：
+//   - SyncStatusSuccess(0)：最近一次同步成功。
+//   - SyncStatusFailed(1)：最近一次同步失败（当前统一预设为 1，后续可细化为不同错误码）。
+const (
+	SyncStatusSuccess = 0
+	SyncStatusFailed  = 1
+)
+
+// execUpdateLastStatus 把最近一次同步结果写回 manager.job_data_sync.last_status：
+// 按 (job_name + 源标识 + 目标标识) 定位记录（与 upsertWatermark 一致），命中则更新并返回受影响行数。
+// ex 可传入 pgx.Tx（PG writer）或 *pgx.Conn（parquet writer）。
+func execUpdateLastStatus(ctx context.Context, ex pgxExecutor, status int, target *config.TargetConfig, source *config.SourceConfig, jobName string) (int64, error) {
+	funcName := watermarkJobName(jobName)
+	src, err := sourceIdentity(source)
+	if err != nil {
+		return 0, err
+	}
+	dst, err := targetIdentity(target)
+	if err != nil {
+		return 0, err
+	}
+
+	// 与 upsertWatermark 保持一致：仅约束本次运行实际携带的连接标识（参数为空则不约束该列）。
+	var tag pgconn.CommandTag
+	if src.RawSQL != "" {
+		tag, err = ex.Exec(
+			ctx,
+			`UPDATE manager.job_data_sync
+			    SET last_status = $1,
+			        udt         = now()
+			  WHERE job_name        = $2
+			    AND src_db_name     = $3
+			    AND src_rawsql      = $4
+			    AND dst_schema_name = $5
+			    AND dst_table_name  = $6
+			    AND ($7::int IS NULL OR src_conn_id = $7::int)
+			    AND ($8::text IS NULL OR src_conn_name = $8::text)`,
+			status, funcName, src.Database, src.RawSQL, dst.Schema, dst.Table,
+			src.ConnID, src.ConnName,
+		)
+	} else {
+		tag, err = ex.Exec(
+			ctx,
+			`UPDATE manager.job_data_sync
+			    SET last_status = $1,
+			        udt         = now()
+			  WHERE job_name        = $2
+			    AND src_db_name     = $3
+			    AND src_schema_name = $4
+			    AND src_table_name  = $5
+			    AND dst_schema_name = $6
+			    AND dst_table_name  = $7
+			    AND ($8::int IS NULL OR src_conn_id = $8::int)
+			    AND ($9::text IS NULL OR src_conn_name = $9::text)`,
+			status, funcName, src.Database, src.Schema, src.Table, dst.Schema, dst.Table,
+			src.ConnID, src.ConnName,
+		)
+	}
+	if err != nil {
+		return 0, util.WrapPgError(err)
+	}
+	return tag.RowsAffected(), nil
+}
+
 // nullIfEmpty 将空字符串归一为 nil，使 pgx 写入 SQL NULL 而非空串，
 // 以满足 src_conn_name 与 src_conn_id 的“不能同时非空串/非空”约束语义。
 func nullIfEmpty(s string) any {

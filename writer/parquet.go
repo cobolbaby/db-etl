@@ -72,6 +72,31 @@ func (d *parquetWriterDialect) close(ctx context.Context) error {
 	return d.metaConn.Close(ctx)
 }
 
+// recordSyncResult 登记最近一次同步结果到 manager.job_data_sync.last_status。
+//
+// best-effort（尽力而为）：last_status 仅供监控/观测，写不回不影响“数据是否已上传”。
+// 下列三种“无处可记”情形均不报错、不阻断主流程：
+//   1. 未配置 meta_db（metaConn 为 nil）：无处存放状态，直接跳过。
+//   2. manager.job_data_sync 表不存在（42P01）：meta_db 未建 DTS 配置表，跳过。
+//   3. 表存在但无匹配行（affected==0）：该 源+目标 组合未被登记进配置表，仅记日志。
+func (d *parquetWriterDialect) recordSyncResult(ctx context.Context, source *config.SourceConfig, status int) error {
+	if d.metaConn == nil {
+		return nil
+	}
+	affected, err := execUpdateLastStatus(ctx, d.metaConn, status, d.target, source, d.jobName)
+	if err != nil {
+		if util.IsPgUndefinedTable(err) {
+			return nil
+		}
+		return err
+	}
+	if affected == 0 {
+		log.Printf("no matching job_data_sync row to record last_status=%d (job=%s table=%s)",
+			status, watermarkJobName(d.jobName), d.target.Table)
+	}
+	return nil
+}
+
 func (d *parquetWriterDialect) writeInitial(ctx context.Context, in <-chan reader.Batch, source *config.SourceConfig) error {
 	target := d.target
 	jobName := d.jobName

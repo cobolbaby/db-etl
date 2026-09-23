@@ -13,6 +13,8 @@ type writerDialect interface {
 	writeAppend(ctx context.Context, in <-chan reader.Batch, source *config.SourceConfig) error
 	writeMerge(ctx context.Context, in <-chan reader.Batch, source *config.SourceConfig) error
 	getWatermark(source *config.SourceConfig) (string, error)
+	// recordSyncResult 把最近一次同步结果（成功/失败）登记到 manager.job_data_sync.last_status。
+	recordSyncResult(ctx context.Context, source *config.SourceConfig, status int) error
 	// close 释放底层连接。
 	close(ctx context.Context) error
 }
@@ -48,6 +50,16 @@ func (w *BaseWriter) WriteBatch(ctx context.Context, source *config.SourceConfig
 
 func (w *BaseWriter) GetWatermark(source *config.SourceConfig) (string, error) {
 	return w.dialect.getWatermark(source)
+}
+
+// RecordSyncResult 登记最近一次同步结果（成功 0 / 失败 1）到 manager.job_data_sync.last_status。
+// 刻意使用独立的 background context：管道因取消/超时失败时，沿用被取消的 ctx 会导致
+// 连该状态也写不回；用新 context 保证失败状态（last_status=1）仍能落库。
+func (w *BaseWriter) RecordSyncResult(source *config.SourceConfig, status int) error {
+	if w.dialect == nil {
+		return nil
+	}
+	return w.dialect.recordSyncResult(context.Background(), source, status)
 }
 
 // Close 释放底层数据库连接。

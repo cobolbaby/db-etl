@@ -36,6 +36,12 @@ func IsPgLockTimeout(err error) bool {
 	return errors.As(err, &pgErr) && pgErr.Code == "55P03"
 }
 
+// IsPgUndefinedTable 判断是否为「表/视图不存在」错误（错误码 42P01）。
+func IsPgUndefinedTable(err error) bool {
+	var pgErr *pgconn.PgError
+	return errors.As(err, &pgErr) && pgErr.Code == "42P01"
+}
+
 // pgEnrich 用 pgErr 的 DETAIL 与 CONTEXT 字段包装 err，
 // 使打印错误的调用方能看到完整诊断上下文，而不仅仅是简短的错误消息。
 // 使用 %w 保留错误链，便于 errors.Is / errors.As。

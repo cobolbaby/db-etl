@@ -36,6 +36,10 @@ func (d *stubWriterDialect) getWatermark(source *config.SourceConfig) (string, e
 	return "", nil
 }
 
+func (d *stubWriterDialect) recordSyncResult(ctx context.Context, source *config.SourceConfig, status int) error {
+	return nil
+}
+
 func (d *stubWriterDialect) close(ctx context.Context) error {
 	d.called = "close"
 	return nil

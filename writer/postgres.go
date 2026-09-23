@@ -151,6 +151,31 @@ func (d *pgWriterDialect) deactivateInitialJob(ctx context.Context, tx pgx.Tx, t
 	return nil
 }
 
+// recordSyncResult 登记最近一次同步结果到 manager.job_data_sync.last_status。
+// PG/GP 目标要求 manager.job_data_sync 与目标表在同一数据库实例，故直接复用目标连接
+// （d.conn）执行独立 UPDATE，无需像 parquet writer 那样另建 meta_db 连接。
+//
+// best-effort（尽力而为）：last_status 仅供监控/观测，写不写得进去不影响“数据是否已同步”
+// 这个事实，因此下列两种“无处可记”情形均不报错、不阻断主流程：
+//  1. 表本身不存在（42P01）：任务完全定义在 config.yaml、且目标库未建 manager.job_data_sync
+//     这张 DTS 配置表（纯 config 任务，不依赖 meta_db）——根本无配置表可写，跳过。
+//  2. 表存在但无匹配行（affected==0）：该 源+目标 组合未被登记进 DTS 配置表
+//     （例如仅在 yaml 里配了任务、未往配置表插记录），无行可更新，仅记日志。
+func (d *pgWriterDialect) recordSyncResult(ctx context.Context, source *config.SourceConfig, status int) error {
+	affected, err := execUpdateLastStatus(ctx, d.conn, status, d.target, source, d.jobName)
+	if err != nil {
+		if util.IsPgUndefinedTable(err) {
+			return nil
+		}
+		return err
+	}
+	if affected == 0 {
+		log.Printf("no matching job_data_sync row to record last_status=%d (job=%s table=%s)",
+			status, watermarkJobName(d.jobName), d.target.Table)
+	}
+	return nil
+}
+
 func (d *pgWriterDialect) writeCopyWithFirstBatch(ctx context.Context, firstBatch reader.Batch, in <-chan reader.Batch, table string, conn *pgx.Conn) error {
 	return d.writeCopyStream(ctx, table, firstBatch.ColumnNames(), conn, func(write func(reader.Batch) error) error {
 		if err := write(firstBatch); err != nil {

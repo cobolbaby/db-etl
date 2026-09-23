@@ -14,6 +14,9 @@ type BatchWriter interface {
 
 type WatermarkStore interface {
 	GetWatermark(source *config.SourceConfig) (string, error)
+	// RecordSyncResult 登记最近一次同步结果到 manager.job_data_sync.last_status
+	// （成功 0 / 失败 1，best-effort）。
+	RecordSyncResult(source *config.SourceConfig, status int) error
 }
 
 type Writer interface {

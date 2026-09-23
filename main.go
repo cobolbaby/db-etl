@@ -270,6 +270,20 @@ func (e *etl) runPipeline(ctx context.Context, src *config.SourceConfig, srcDB c
 	err = pipeline.RunPipeline(ctx, src, r, t, w)
 	// mc.Finish(pm, err)
 
+	// 登记本次同步结果到 manager.job_data_sync.last_status（成功 0 / 失败 1）。
+	// best-effort（尽力而为）：last_status 仅供监控/观测，状态写不写得回都不改变
+	// “数据是否已同步成功”这个事实，故回写失败仅记日志，绝不覆盖/掩盖真实的同步结果。
+	syncStatus := writer.SyncStatusSuccess
+	if err != nil {
+		syncStatus = writer.SyncStatusFailed
+	}
+	if serr := w.RecordSyncResult(src, syncStatus); serr != nil {
+		log.Printf(
+			"record last_status=%d failed %s (%s) -> %s (%s): %v",
+			syncStatus, srcDB.Name, src.Table, dstName, task.Target.Table, serr,
+		)
+	}
+
 	if err != nil {
 		return fmt.Errorf(
 			"pipeline failed %s (%s) -> %s (%s) cost=%s: %w",

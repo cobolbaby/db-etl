@@ -37,7 +37,9 @@ CREATE TABLE IF NOT EXISTS manager.job_data_sync
     dst_conn_id integer,
     src_rawsql text COLLATE pg_catalog."default",
     last_status integer,
-    weight numeric
+    weight numeric,
+    CONSTRAINT chk_src_conn_not_both_null
+        CHECK (src_conn_id IS NOT NULL OR src_conn_name IS NOT NULL)
 )
 TABLESPACE pg_default;
 
@@ -60,6 +62,12 @@ COMMENT ON COLUMN manager.job_data_sync.dst_data_type
 
 COMMENT ON COLUMN manager.job_data_sync.dst_conn_id
     IS '保留字段，用于后期将同一个厂区所有配置表都汇总到 DTS 库。';
+
+COMMENT ON COLUMN manager.job_data_sync.last_status
+    IS '最后一次同步的结果状态码：0 表示成功，非 0 表示失败。';
+
+COMMENT ON COLUMN manager.job_data_sync.weight
+    IS '该表在近期一段时间窗口内的平均同步速度，作为调度权重的参考。';
 
 ```
 

@@ -11,29 +11,70 @@ CREATE SCHEMA IF NOT EXISTS manager;
 CREATE TABLE IF NOT EXISTS manager.job_data_sync
 (
     job_id serial primary key,
-    job_name character varying(50) COLLATE pg_catalog."default",
     src_schema_name character varying(100) COLLATE pg_catalog."default",
     src_table_name character varying(100) COLLATE pg_catalog."default",
-    src_rawsql text COLLATE pg_catalog."default",
-    dst_schema_name character varying(100) COLLATE pg_catalog."default",
-    dst_table_name character varying(100) COLLATE pg_catalog."default",
-    src_where_statement text COLLATE pg_catalog."default",
-    sync_mode character varying(10) COLLATE pg_catalog."default",
-    src_incr_field character varying(100) COLLATE pg_catalog."default",
+    dst_schema_name character varying(100) COLLATE pg_catalog."default" NOT NULL,
+    dst_table_name character varying(100) COLLATE pg_catalog."default" NOT NULL,
+    src_select_statement text COLLATE pg_catalog."default" NOT NULL DEFAULT '*'::text,
+    src_where_statement text COLLATE pg_catalog."default" NOT NULL DEFAULT '${SRC_INCR_FIELD} > ''${INCR_POINT}'''::text,
+    sync_mode character varying(10) COLLATE pg_catalog."default" NOT NULL,
+    src_incr_field character varying(100) COLLATE pg_catalog."default" NOT NULL DEFAULT ''::character varying,
     dst_pk character varying(100) COLLATE pg_catalog."default",
     fields_mapping jsonb,
     incr_point text COLLATE pg_catalog."default",
+<<<<<<< HEAD
     cdt timestamp without time zone,
     udt timestamp without time zone,
     created_by character varying(50) COLLATE pg_catalog."default",
     modified_by character varying(50) COLLATE pg_catalog."default",
+=======
+    cdt timestamp without time zone NOT NULL DEFAULT now(),
+    udt timestamp without time zone NOT NULL DEFAULT now(),
+>>>>>>> main
     remark text COLLATE pg_catalog."default",
-    inuse boolean,
+    inuse boolean NOT NULL DEFAULT true,
     src_conn_name character varying(50) COLLATE pg_catalog."default",
-    src_db_name character varying(50) COLLATE pg_catalog."default",
-    src_conn_id integer
+    src_db_name character varying(50) COLLATE pg_catalog."default" NOT NULL,
+    job_name character varying(50) COLLATE pg_catalog."default" NOT NULL,
+    src_conn_id integer,
+    dst_distributed_by character varying(100) COLLATE pg_catalog."default",
+    created_by character varying(50) COLLATE pg_catalog."default" NOT NULL DEFAULT ''::character varying,
+    modified_by character varying(50) COLLATE pg_catalog."default" NOT NULL DEFAULT ''::character varying,
+    dst_data_type character varying(50) COLLATE pg_catalog."default",
+    dst_conn_id integer,
+    src_rawsql text COLLATE pg_catalog."default",
+    last_status integer,
+    weight numeric,
+    CONSTRAINT chk_src_conn_not_both_null
+        CHECK (src_conn_id IS NOT NULL OR src_conn_name IS NOT NULL)
 )
 TABLESPACE pg_default;
+
+COMMENT ON TABLE manager.job_data_sync
+    IS 'DTS 数据同步配置表';
+
+COMMENT ON COLUMN manager.job_data_sync.src_select_statement
+    IS '已弃用，最初是服务于 Kettle 同步模版的。
+
+先别删，可能后面另做它用';
+
+COMMENT ON COLUMN manager.job_data_sync.src_conn_name
+    IS '保留字段，但需要确保 src_conn_name 和 src_conn_id 不能都为 null';
+
+COMMENT ON COLUMN manager.job_data_sync.dst_distributed_by
+    IS '保留字段，暂时忽略';
+
+COMMENT ON COLUMN manager.job_data_sync.dst_data_type
+    IS '用于标识同步数据是否要保存为 parquet 文件格式，是要临时文件转储 还是 直接洛表。';
+
+COMMENT ON COLUMN manager.job_data_sync.dst_conn_id
+    IS '保留字段，用于后期将同一个厂区所有配置表都汇总到 DTS 库。';
+
+COMMENT ON COLUMN manager.job_data_sync.last_status
+    IS '最后一次同步的结果状态码：0 表示成功，非 0 表示失败。';
+
+COMMENT ON COLUMN manager.job_data_sync.weight
+    IS '该表在近期一段时间窗口内的平均同步速度，作为调度权重的参考。';
 
 ```
 
@@ -45,8 +86,8 @@ TABLESPACE pg_default;
 
 ```yaml
 name: my_etl_job # 全局任务名，必填
-comment: 可选备注
-error_policy: abort # abort（默认）或 continue
+comment: 可选备注 # 仅注释用途，程序不使用
+error_policy: continue # continue（默认）或 abort
 
 databases:
   - name: source-mssql
@@ -77,8 +118,9 @@ tasks:
 ### 顶层字段
 
 - `name`：全局任务名，必填。写入 watermark 表时作为 `job_name` 的默认值（可被 `tasks[].name` 覆盖）。
-- `comment`：可选备注。
-- `error_policy`：任务失败策略，`abort`（默认，遇错立即退出）或 `continue`（跳过失败任务继续执行）。
+- `comment`：可选备注，仅作为配置注释，程序不读取也不会影响行为。
+- `error_policy`：任务失败策略，`continue`（默认，跳过失败任务继续执行）或 `abort`（遇错立即退出）。
+- `meta_db`：可选。指定存放 `manager.job_data_sync` 配置表的数据库别名（引用 `databases[].name`）。配置后任务列表改为从该库按 `job_name = name` 加载，忽略 `tasks`。
 - `databases`：数据库连接定义列表。
 - `s3`：对象存储落地端定义列表，供 `target.s3` 引用。
 - `meta_db`：存放 `manager.job_data_sync` 的数据库别名（引用 `databases[].name`），作为水位（增量指针）的存储库；未配置时不回写水位。任务来源与水位存储解耦：yaml 中显式定义了 `tasks` 时优先使用 `tasks`，`meta_db` 仅用于回写水位；仅当 yaml 未定义 `tasks` 时，才回退为按 `name` 从 `manager.job_data_sync` 加载任务列表。
@@ -158,10 +200,16 @@ s3:
 | ----------- | --------------------------------------------------------------------------- |
 | `name`      | 任务名称，配置了 `incr_field` 时必填，写入 `manager.job_data_sync.job_name` |
 | `type`      | 任务类型，目前支持 `query`                                                  |
+<<<<<<< HEAD
 | `comment`   | 可选备注                                                                    |
 | `sources`   | 源配置列表，见下节                                                          |
 | `target`    | 目标配置，见下节                                                            |
 | `transform` | 转换链，在写入前对数据做结构重塑，见下节                                    |
+=======
+| `sources`   | 源配置列表，见下节                                                          |
+| `target`    | 目标配置，见下节                                                            |
+| `transform` | 可选。转换步骤列表（在类型序列化之后、写入之前按顺序执行），见下节          |
+>>>>>>> main
 | `hooks`     | 前置/后置 SQL hook，见下节                                                  |
 
 ## `sources` 配置
@@ -207,6 +255,7 @@ s3:
 
 ## `transform` 配置
 
+<<<<<<< HEAD
 `transform` 是 `tasks[]` 下的转换步骤列表，在 reader 之后、writer 之前按顺序执行。每个步骤只能指定一种转换类型，目前支持 `unpivot`。
 
 ### `unpivot`（列转行）
@@ -226,10 +275,27 @@ tasks:
           value_field: qty # 承载「列值」的目标列名
           drop_null: true # 源列值为 NULL 时跳过该行，默认 false
           columns: # 源列名 -> 写入 key_field 的标签
+=======
+`transform` 是任务级的**转换步骤列表**，在列类型序列化之后、写入目标之前按顺序执行。未配置时为纯序列化透传。目前支持的步骤类型为 `unpivot`（列转行）。
+
+```yaml
+tasks:
+  - name: daily_output
+    sources:
+      - conn_name: src_db
+        table: dbo.output_by_day
+    transform:
+      - unpivot:
+          key_field: day # 承载“列标签”的目标列名
+          value_field: qty # 承载“列值”的目标列名
+          drop_null: true # 源列值为 NULL 的展开行跳过
+          columns: # 宽表源列名 -> 写入 key_field 的标签
+>>>>>>> main
             Day1: "1"
             Day2: "2"
             Day3: "3"
     target:
+<<<<<<< HEAD
       conn_name: target-pg
       table: ods.monthly_plan_long
       mode: full
@@ -243,6 +309,24 @@ tasks:
 | `drop_null`   |      | 为 `true` 时跳过源列值为 NULL 的展开行                           |
 
 > `value_field` 汇聚的是多个异构源列的取值，因此统一以文本输出（时间采用 `2006-01-02 15:04:05.999999999` 格式）。源列为 NULL 时仍保持 NULL。
+=======
+      conn_name: dst_db
+      table: public.output_long
+```
+
+### `unpivot`（列转行 / 宽表转长表）
+
+把宽表中一组列展开成 `key_field` / `value_field` 两列的多行：`columns` 中的每一个源列产生一行，其余未列举的列作为标识列在每行重复保留。适用于 Day1..Day31 这类周期性宽表：源端仍按宽表抽取（网络传输量小），在转换阶段才展开为长表。
+
+| 字段          | 必填 | 说明                                                                              |
+| ------------- | ---- | --------------------------------------------------------------------------------- |
+| `key_field`   | 是   | 输出中承载“列标签”的目标列名（如 `day`）；不能与 `value_field` 相同               |
+| `value_field` | 是   | 输出中承载“列值”的目标列名（如 `qty`）                                            |
+| `columns`     | 是   | 「宽表源列名 -> 写入 `key_field` 的标签」映射；未出现在此映射中的列作为标识列保留 |
+| `drop_null`   |      | 为 `true` 时，源列值为 NULL 的展开行会被跳过（默认 `false`）                      |
+
+> `key_field` / `value_field` 只允许字母、数字、下划线，且不能为保留关键字。
+>>>>>>> main
 
 ## `target` 配置
 
@@ -474,11 +558,27 @@ tasks:
 ## 运行
 
 ```bash
+<<<<<<< HEAD
 go run . -config config.yaml
 
 # 查看版本信息
+=======
+# 使用默认的 config.yaml
+go run . -config config.yaml
+
+# 打印版本信息
+>>>>>>> main
 go run . -version
 ```
+
+可用参数：
+
+| 参数       | 说明                             |
+| ---------- | -------------------------------- |
+| `-config`  | 配置文件路径，默认 `config.yaml` |
+| `-version` | 打印版本信息后退出               |
+
+> 程序为单次执行（跑完所有任务即退出）；定时调度请交由外部（如 cron）驱动。
 
 或构建后执行：
 

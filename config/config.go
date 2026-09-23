@@ -154,7 +154,7 @@ type DBConfig struct {
 	// 匹配数据源时 ID 优先级高于 Name；Name 可为空。
 	ID       string `yaml:"id"`
 	Name     string `yaml:"name"`
-	Type     DBType `yaml:"type"` // mssql / pg
+	Type     DBType `yaml:"type"` // mssql / postgres / greenplum / oracle
 	Host     string `yaml:"host"`
 	Port     int    `yaml:"port"`
 	User     string `yaml:"user"`

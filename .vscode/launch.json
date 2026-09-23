@@ -14,13 +14,40 @@
       "args": ["--config", "./config-DTSNHP.yaml"]
     },
     {
-      "name": "Launch MES3 Sync",
+      "name": "Launch MES3 Parquet Sync",
       "type": "go",
       "request": "launch",
       "mode": "debug",
       "program": "main.go",
       "cwd": "${workspaceFolder}",
-      "args": ["--config", "./config-MES3-IMX.yaml"]
+      "args": ["--config", "./config-MES3-parquet.yaml"]
+    },
+    {
+      "name": "Launch ITC Debug",
+      "type": "go",
+      "request": "launch",
+      "mode": "debug",
+      "program": "main.go",
+      "cwd": "${workspaceFolder}",
+      "args": ["--config", "./config.yaml"]
+    },
+    {
+      "name": "Launch TAO ICT Debug",
+      "type": "go",
+      "request": "launch",
+      "mode": "debug",
+      "program": "main.go",
+      "cwd": "${workspaceFolder}",
+      "args": ["--config", "./config-ict.yaml"]
+    },
+    {
+      "name": "Launch ITC WW Debug",
+      "type": "go",
+      "request": "launch",
+      "mode": "debug",
+      "program": "main.go",
+      "cwd": "${workspaceFolder}",
+      "args": ["--config", "./config-WW.yaml"]
     }
   ]
 }

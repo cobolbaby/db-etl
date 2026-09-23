@@ -113,7 +113,6 @@ tasks:
 - `name`：全局任务名，必填。写入 watermark 表时作为 `job_name` 的默认值（可被 `tasks[].name` 覆盖）。
 - `comment`：可选备注，仅作为配置注释，程序不读取也不会影响行为。
 - `error_policy`：任务失败策略，`continue`（默认，跳过失败任务继续执行）或 `abort`（遇错立即退出）。
-- `meta_db`：可选。指定存放 `manager.job_data_sync` 配置表的数据库别名（引用 `databases[].name`）。配置后任务列表改为从该库按 `job_name = name` 加载，忽略 `tasks`。
 - `databases`：数据库连接定义列表。
 - `s3`：对象存储落地端定义列表，供 `target.s3` 引用。
 - `meta_db`：存放 `manager.job_data_sync` 的数据库别名（引用 `databases[].name`），作为水位（增量指针）的存储库；未配置时不回写水位。任务来源与水位存储解耦：yaml 中显式定义了 `tasks` 时优先使用 `tasks`，`meta_db` 仅用于回写水位；仅当 yaml 未定义 `tasks` 时，才回退为按 `name` 从 `manager.job_data_sync` 加载任务列表。

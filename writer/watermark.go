@@ -26,15 +26,23 @@ type tableRef struct {
 
 // wmSource 在表标识之上多一个 RawSQL 分支：
 // 源可以是一张表，也可以是一段自定义 SQL，两者互斥。
+// ConnID/ConnName 是源连接标识（已归一化：空串转为 nil，供 pgx 写入 SQL NULL），
+// 用于区分「同名源库/表经不同连接同步到同一目标」的场景。
 type wmSource struct {
 	tableRef
-	RawSQL string
+	RawSQL   string
+	ConnID   any
+	ConnName any
 }
 
 func sourceIdentity(source *config.SourceConfig) (wmSource, error) {
 	if source == nil {
 		return wmSource{}, fmt.Errorf("source config is required for watermark")
 	}
+
+	// 源连接标识对表/SQL 两种分支都适用，统一归一化后回填。
+	connID := nullIfEmpty(source.ConnID)
+	connName := nullIfEmpty(source.ConnName)
 
 	if table := strings.TrimSpace(source.Table); table != "" {
 		parts, err := splitTableRef(table)
@@ -47,13 +55,15 @@ func sourceIdentity(source *config.SourceConfig) (wmSource, error) {
 		if parts.Database == "" {
 			parts.Database = strings.TrimSpace(source.Database)
 		}
-		return wmSource{tableRef: parts}, nil
+		return wmSource{tableRef: parts, ConnID: connID, ConnName: connName}, nil
 	}
 
 	if sql := strings.TrimSpace(source.SQL); sql != "" {
 		return wmSource{
 			tableRef: tableRef{Database: strings.TrimSpace(source.Database)},
 			RawSQL:   sql,
+			ConnID:   connID,
+			ConnName: connName,
 		}, nil
 	}
 
@@ -117,6 +127,10 @@ func upsertWatermark(ctx context.Context, ex pgxExecutor, wm string, target *con
 		return err
 	}
 
+	// 源连接标识参与匹配键，用于区分「同名源库/表经不同连接同步到同一目标」的场景。
+	// 但因历史原因，conn_id / conn_name 通常只有其一非空（另一个可能为 NULL），
+	// 故只约束本次运行实际携带的那个标识：($p IS NULL OR col = $p)——
+	// 参数为空则不约束该列，避免历史空值导致漏配、进而重复 INSERT 或水位重置。
 	var tag pgconn.CommandTag
 	var execErr error
 	if src.RawSQL != "" {
@@ -132,9 +146,12 @@ func upsertWatermark(ctx context.Context, ex pgxExecutor, wm string, target *con
 			    AND src_db_name     = $6
 			    AND src_rawsql      = $7
 			    AND dst_schema_name = $8
-			    AND dst_table_name  = $9`,
+			    AND dst_table_name  = $9
+			    AND ($10::int IS NULL OR src_conn_id = $10::int)
+			    AND ($11::text IS NULL OR src_conn_name = $11::text)`,
 			wm, string(target.Mode), source.IncrField, target.PK,
 			funcName, src.Database, src.RawSQL, dst.Schema, dst.Table,
+			src.ConnID, src.ConnName,
 		)
 	} else {
 		tag, execErr = ex.Exec(
@@ -150,9 +167,12 @@ func upsertWatermark(ctx context.Context, ex pgxExecutor, wm string, target *con
 			    AND src_schema_name = $7
 			    AND src_table_name  = $8
 			    AND dst_schema_name = $9
-			    AND dst_table_name  = $10`,
+			    AND dst_table_name  = $10
+			    AND ($11::int IS NULL OR src_conn_id = $11::int)
+			    AND ($12::text IS NULL OR src_conn_name = $12::text)`,
 			wm, string(target.Mode), source.IncrField, target.PK,
 			funcName, src.Database, src.Schema, src.Table, dst.Schema, dst.Table,
+			src.ConnID, src.ConnName,
 		)
 	}
 	if execErr != nil {
@@ -163,28 +183,40 @@ func upsertWatermark(ctx context.Context, ex pgxExecutor, wm string, target *con
 		return nil
 	}
 
+	// 新建水位行时写入源连接标识：src_conn_id 与 src_conn_name 至少有一个非空
+	// （由 manager.job_data_sync 的 CHECK 约束 chk_src_conn_not_both_null 保证）。
+	// ConnID / ConnName 已由 sourceIdentity 归一化：空串转为 nil，pgx 写入 SQL NULL。
 	if src.RawSQL != "" {
 		_, err = ex.Exec(
 			ctx,
 			`INSERT INTO manager.job_data_sync
-			    (job_name, src_db_name, src_rawsql, dst_schema_name, dst_table_name,
+			    (job_name, src_db_name, src_conn_id, src_conn_name, src_rawsql, dst_schema_name, dst_table_name,
 			     incr_point, sync_mode, src_incr_field, dst_pk, cdt, udt)
-			  VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, now(), now())`,
-			funcName, src.Database, src.RawSQL, dst.Schema, dst.Table,
+			  VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, now(), now())`,
+			funcName, src.Database, src.ConnID, src.ConnName, src.RawSQL, dst.Schema, dst.Table,
 			wm, string(target.Mode), source.IncrField, target.PK,
 		)
 	} else {
 		_, err = ex.Exec(
 			ctx,
 			`INSERT INTO manager.job_data_sync
-			    (job_name, src_db_name, src_schema_name, src_table_name, dst_schema_name, dst_table_name,
+			    (job_name, src_db_name, src_conn_id, src_conn_name, src_schema_name, src_table_name, dst_schema_name, dst_table_name,
 			     incr_point, sync_mode, src_incr_field, dst_pk, cdt, udt)
-			  VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, now(), now())`,
-			funcName, src.Database, src.Schema, src.Table, dst.Schema, dst.Table,
+			  VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, now(), now())`,
+			funcName, src.Database, src.ConnID, src.ConnName, src.Schema, src.Table, dst.Schema, dst.Table,
 			wm, string(target.Mode), source.IncrField, target.PK,
 		)
 	}
 	return util.WrapPgError(err)
+}
+
+// nullIfEmpty 将空字符串归一为 nil，使 pgx 写入 SQL NULL 而非空串，
+// 以满足 src_conn_name 与 src_conn_id 的“不能同时非空串/非空”约束语义。
+func nullIfEmpty(s string) any {
+	if strings.TrimSpace(s) == "" {
+		return nil
+	}
+	return s
 }
 
 // readWatermarkPoint 从 manager.job_data_sync 读取已记录的 incr_point。
@@ -200,6 +232,7 @@ func readWatermarkPoint(ctx context.Context, ex pgxExecutor, target *config.Targ
 		return "", err
 	}
 
+	// 与 upsertWatermark 保持一致：仅约束本次运行实际携带的连接标识（参数为空则不约束该列）。
 	var wm string
 	if src.RawSQL != "" {
 		err = ex.QueryRow(
@@ -211,8 +244,11 @@ func readWatermarkPoint(ctx context.Context, ex pgxExecutor, target *config.Targ
 			    AND src_rawsql = $3
 			    AND dst_schema_name = $4
 			    AND dst_table_name = $5
+			    AND ($6::int IS NULL OR src_conn_id = $6::int)
+			    AND ($7::text IS NULL OR src_conn_name = $7::text)
 			  LIMIT 1`,
 			funcName, src.Database, src.RawSQL, dst.Schema, dst.Table,
+			src.ConnID, src.ConnName,
 		).Scan(&wm)
 	} else {
 		err = ex.QueryRow(
@@ -225,8 +261,11 @@ func readWatermarkPoint(ctx context.Context, ex pgxExecutor, target *config.Targ
 			    AND src_table_name = $4
 			    AND dst_schema_name = $5
 			    AND dst_table_name = $6
+			    AND ($7::int IS NULL OR src_conn_id = $7::int)
+			    AND ($8::text IS NULL OR src_conn_name = $8::text)
 			  LIMIT 1`,
 			funcName, src.Database, src.Schema, src.Table, dst.Schema, dst.Table,
+			src.ConnID, src.ConnName,
 		).Scan(&wm)
 	}
 
@@ -249,6 +288,7 @@ func execDeactivateInitialJob(ctx context.Context, ex pgxExecutor, target *confi
 		return 0, err
 	}
 
+	// 与 upsertWatermark 保持一致：仅约束本次运行实际携带的连接标识（参数为空则不约束该列）。
 	var tag pgconn.CommandTag
 	if src.RawSQL != "" {
 		tag, err = ex.Exec(
@@ -260,8 +300,11 @@ func execDeactivateInitialJob(ctx context.Context, ex pgxExecutor, target *confi
 			    AND src_db_name     = $2
 			    AND src_rawsql      = $3
 			    AND dst_schema_name = $4
-			    AND dst_table_name  = $5`,
+			    AND dst_table_name  = $5
+			    AND ($6::int IS NULL OR src_conn_id = $6::int)
+			    AND ($7::text IS NULL OR src_conn_name = $7::text)`,
 			funcName, src.Database, src.RawSQL, dst.Schema, dst.Table,
+			src.ConnID, src.ConnName,
 		)
 	} else {
 		tag, err = ex.Exec(
@@ -274,8 +317,11 @@ func execDeactivateInitialJob(ctx context.Context, ex pgxExecutor, target *confi
 			    AND src_schema_name = $3
 			    AND src_table_name  = $4
 			    AND dst_schema_name = $5
-			    AND dst_table_name  = $6`,
+			    AND dst_table_name  = $6
+			    AND ($7::int IS NULL OR src_conn_id = $7::int)
+			    AND ($8::text IS NULL OR src_conn_name = $8::text)`,
 			funcName, src.Database, src.Schema, src.Table, dst.Schema, dst.Table,
+			src.ConnID, src.ConnName,
 		)
 	}
 	if err != nil {

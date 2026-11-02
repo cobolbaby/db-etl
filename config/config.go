@@ -22,12 +22,13 @@ import (
 // ============================================================================
 
 type Config struct {
-	ErrorPolicy string       `yaml:"error_policy"`
-	Databases   []DBConfig   `yaml:"databases"`
-	S3          []S3Config   `yaml:"s3"`
-	Tasks       []TaskConfig `yaml:"tasks"`
-	Name        string       `yaml:"name"`
-	Comment     string       `yaml:"comment"`
+	ErrorPolicy string            `yaml:"error_policy"`
+	Databases   []DBConfig        `yaml:"databases"`
+	S3          []S3Config        `yaml:"s3"`
+	AzureBlob   []AzureBlobConfig `yaml:"azure_blob"`
+	Tasks       []TaskConfig      `yaml:"tasks"`
+	Name        string            `yaml:"name"`
+	Comment     string            `yaml:"comment"`
 	// MetaDB 指定存放 manager.job_data_sync 配置表的数据库别名（引用 databases[].name）。
 	MetaDB string `yaml:"meta_db"`
 	// Retry 配置任务失败时的重试策略。
@@ -90,7 +91,12 @@ func (c *Config) Validate() error {
 		return err
 	}
 
-	if err := c.validateTasks(resolver, s3Resolver); err != nil {
+	azureBlobResolver, err := c.validateAzureBlob()
+	if err != nil {
+		return err
+	}
+
+	if err := c.validateTasks(resolver, s3Resolver, azureBlobResolver); err != nil {
 		return err
 	}
 
@@ -447,6 +453,83 @@ func (r S3Resolver) Resolve(name string) (S3Config, bool) {
 	return s, ok
 }
 
+// ============================================================================
+// 对象存储配置（azure_blob）
+// ----------------------------------------------------------------------------
+// AzureBlobConfig 描述 parquet-on-Azure-Blob 落地端；AzureBlobResolver 供 target 通过 name 引用解析。
+// 与 s3 共用 parquetWriterDialect，仅对象存储客户端（objectStore 实现）不同。
+// ============================================================================
+
+// AzureBlobConfig 描述一个 Azure Blob Storage 落地端。
+// target 通过 azure_blob 字段引用 azure_blob[].name，与 conn_id/conn_name/s3 互斥。
+// AccountKey / SASToken / ConnectionString 支持 ${ENV} 引用，由 ResolveSecrets 解析。
+type AzureBlobConfig struct {
+	Name   string   `yaml:"name"`
+	Format S3Format `yaml:"format"` // 目前仅 parquet，空值按 parquet 处理
+	// 认证三选一，优先级：connection_string > sas_token > account_key。
+	ConnectionString string `yaml:"connection_string"` // 完整连接串（支持 ${ENV}）
+	AccountName      string `yaml:"account_name"`      // 存储账户名，配合 account_key / sas_token 使用
+	AccountKey       string `yaml:"account_key"`       // 存储账户密钥（支持 ${ENV}）
+	SASToken         string `yaml:"sas_token"`         // SAS 令牌（支持 ${ENV}），推荐最小权限场景使用
+	// ServiceURL 默认 https://<account_name>.blob.core.windows.net；
+	// 国内版（.chinacloudapi.cn）、政务云或私有化部署需显式指定。
+	ServiceURL string `yaml:"service_url"`
+	Container  string `yaml:"container"` // 目标容器（必填）
+	Prefix     string `yaml:"prefix"`    // 对象 key 前缀，可为空
+	// BlockSizeMB / Concurrency 控制分块上传的并行度，用于在 DMZ/跨网络场景下榨干可用带宽。
+	// 未配置（0）时分别回填默认值（见 writer.newAzureBlobStore）。
+	BlockSizeMB int `yaml:"block_size_mb"`
+	Concurrency int `yaml:"concurrency"`
+}
+
+// Validate 校验 azure_blob 存储配置的完整性。
+func (a AzureBlobConfig) Validate() error {
+	if strings.TrimSpace(a.Name) == "" {
+		return fmt.Errorf("azure_blob storage name is required")
+	}
+	if a.Format != "" && a.Format != S3FormatParquet {
+		return fmt.Errorf("unsupported azure_blob format %q for storage %q", a.Format, a.Name)
+	}
+	if strings.TrimSpace(a.Container) == "" {
+		return fmt.Errorf("azure_blob storage %q: container is required", a.Name)
+	}
+	hasConnStr := strings.TrimSpace(a.ConnectionString) != ""
+	hasAccountKey := strings.TrimSpace(a.AccountName) != "" && strings.TrimSpace(a.AccountKey) != ""
+	hasSAS := strings.TrimSpace(a.AccountName) != "" && strings.TrimSpace(a.SASToken) != ""
+	if !hasConnStr && !hasAccountKey && !hasSAS {
+		return fmt.Errorf("azure_blob storage %q: requires connection_string, account_name+sas_token, or account_name+account_key", a.Name)
+	}
+	if a.BlockSizeMB < 0 {
+		return fmt.Errorf("azure_blob storage %q: block_size_mb must be >= 0", a.Name)
+	}
+	if a.Concurrency < 0 {
+		return fmt.Errorf("azure_blob storage %q: concurrency must be >= 0", a.Name)
+	}
+	return nil
+}
+
+// AzureBlobResolver 按 name 解析 AzureBlobConfig。
+type AzureBlobResolver struct {
+	byName map[string]AzureBlobConfig
+}
+
+// NewAzureBlobResolver 基于 azure_blob 列表构建解析器。
+func NewAzureBlobResolver(list []AzureBlobConfig) AzureBlobResolver {
+	r := AzureBlobResolver{byName: make(map[string]AzureBlobConfig, len(list))}
+	for _, a := range list {
+		if name := strings.TrimSpace(a.Name); name != "" {
+			r.byName[name] = a
+		}
+	}
+	return r
+}
+
+// Resolve 按 name 匹配 azure_blob 存储，命中不了时返回 false。
+func (r AzureBlobResolver) Resolve(name string) (AzureBlobConfig, bool) {
+	a, ok := r.byName[strings.TrimSpace(name)]
+	return a, ok
+}
+
 // validateS3 校验 s3 段并构建 S3Resolver。
 func (c *Config) validateS3() (S3Resolver, error) {
 	seen := make(map[string]struct{}, len(c.S3))
@@ -466,6 +549,27 @@ func (c *Config) validateS3() (S3Resolver, error) {
 		seen[name] = struct{}{}
 	}
 	return NewS3Resolver(c.S3), nil
+}
+
+// validateAzureBlob 校验 azure_blob 段并构建 AzureBlobResolver。
+func (c *Config) validateAzureBlob() (AzureBlobResolver, error) {
+	seen := make(map[string]struct{}, len(c.AzureBlob))
+	for i := range c.AzureBlob {
+		a := &c.AzureBlob[i]
+		name := strings.TrimSpace(a.Name)
+		// Format 默认 parquet。
+		if a.Format == "" {
+			a.Format = S3FormatParquet
+		}
+		if err := a.Validate(); err != nil {
+			return AzureBlobResolver{}, err
+		}
+		if _, dup := seen[name]; dup {
+			return AzureBlobResolver{}, fmt.Errorf("duplicate azure_blob storage name %q", name)
+		}
+		seen[name] = struct{}{}
+	}
+	return NewAzureBlobResolver(c.AzureBlob), nil
 }
 
 // ============================================================================
@@ -492,14 +596,14 @@ type TaskConfig struct {
 	Transform []*TransformConfig `yaml:"transform"`
 }
 
-func (c *Config) validateTasks(resolver DBResolver, s3Resolver S3Resolver) error {
+func (c *Config) validateTasks(resolver DBResolver, s3Resolver S3Resolver, azureBlobResolver AzureBlobResolver) error {
 
 	if len(c.Tasks) == 0 && c.MetaDB == "" {
 		return fmt.Errorf("tasks cannot be empty (set 'meta_db' to load tasks from database)")
 	}
 
 	for _, t := range c.Tasks {
-		if err := t.Validate(resolver, s3Resolver); err != nil {
+		if err := t.Validate(resolver, s3Resolver, azureBlobResolver); err != nil {
 			return err
 		}
 	}
@@ -507,7 +611,7 @@ func (c *Config) validateTasks(resolver DBResolver, s3Resolver S3Resolver) error
 	return nil
 }
 
-func (task TaskConfig) Validate(resolver DBResolver, s3Resolver S3Resolver) error {
+func (task TaskConfig) Validate(resolver DBResolver, s3Resolver S3Resolver, azureBlobResolver AzureBlobResolver) error {
 	if task.Target == nil {
 		return fmt.Errorf("target must be specified")
 	}
@@ -524,7 +628,7 @@ func (task TaskConfig) Validate(resolver DBResolver, s3Resolver S3Resolver) erro
 		}
 	}
 
-	if err := task.Target.Validate(resolver, s3Resolver); err != nil {
+	if err := task.Target.Validate(resolver, s3Resolver, azureBlobResolver); err != nil {
 		return err
 	}
 
@@ -641,15 +745,15 @@ func (source *SourceConfig) Validate(resolver DBResolver, target *TargetConfig) 
 
 	// append 写对象存储时，增量对象的 key 同样由起点水位命名（见 incrementalObjectKey），
 	// 缺少 incr_field 会让每次增量都覆盖同一个对象，故此场景 incr_field 必填。
-	if target.Mode == ModeTypeAppend && strings.TrimSpace(target.S3) != "" && strings.TrimSpace(source.IncrField) == "" {
-		return fmt.Errorf("incr_field is required for %s mode when target is s3", target.Mode)
+	if target.Mode == ModeTypeAppend && target.IsObjectStore() && strings.TrimSpace(source.IncrField) == "" {
+		return fmt.Errorf("incr_field is required for %s mode when target is object storage", target.Mode)
 	}
 	// merge 写 DB 时按 pk 做 DELETE + INSERT，重复抽取同一区间是幂等的，
 	// 允许不配 incr_field（由 SQL 自身圈定滚动窗口，如 date >= now() - interval '3 days'）。
 	// 但 merge 写对象存储时，增量对象的 key 由起点水位命名（见 incrementalObjectKey），
 	// 缺少 incr_field 会让每次增量都覆盖同一个对象，故此场景仍必填。
-	if target.Mode == ModeTypeMerge && strings.TrimSpace(target.S3) != "" && strings.TrimSpace(source.IncrField) == "" {
-		return fmt.Errorf("incr_field is required for %s mode when target is s3", target.Mode)
+	if target.Mode == ModeTypeMerge && target.IsObjectStore() && strings.TrimSpace(source.IncrField) == "" {
+		return fmt.Errorf("incr_field is required for %s mode when target is object storage", target.Mode)
 	}
 
 	if target.CommitBatchSize > 0 {
@@ -703,9 +807,10 @@ const defaultTruncateTimeoutSec = 10
 const defaultMaxRowsPerRowGroup = 200000
 
 type TargetConfig struct {
-	ConnID    string   `yaml:"conn_id"`   // 优先按 conn_id 匹配数据源，为空时回退到 conn_name
-	ConnName  string   `yaml:"conn_name"` // 引用 databases[].name
-	S3        string   `yaml:"s3"`        // 引用 s3[].name，与 conn_id/conn_name 互斥
+	ConnID    string   `yaml:"conn_id"`    // 优先按 conn_id 匹配数据源，为空时回退到 conn_name
+	ConnName  string   `yaml:"conn_name"`  // 引用 databases[].name
+	S3        string   `yaml:"s3"`         // 引用 s3[].name，与 conn_id/conn_name/azure_blob 互斥
+	AzureBlob string   `yaml:"azure_blob"` // 引用 azure_blob[].name，与 conn_id/conn_name/s3 互斥
 	Table     string   `yaml:"table"`
 	Mode      ModeType `yaml:"mode"`
 	IncrField string
@@ -725,26 +830,43 @@ type TargetConfig struct {
 	TruncateTimeout int `yaml:"truncate_timeout"`
 }
 
-func (target *TargetConfig) Validate(resolver DBResolver, s3Resolver S3Resolver) error {
+// IsObjectStore 报告目标是否为对象存储（s3 或 azure_blob），二者共用 parquet 落地与水位语义。
+func (target *TargetConfig) IsObjectStore() bool {
+	return strings.TrimSpace(target.S3) != "" || strings.TrimSpace(target.AzureBlob) != ""
+}
+
+func (target *TargetConfig) Validate(resolver DBResolver, s3Resolver S3Resolver, azureBlobResolver AzureBlobResolver) error {
 	hasDB := strings.TrimSpace(target.ConnID) != "" || strings.TrimSpace(target.ConnName) != ""
 	hasS3 := strings.TrimSpace(target.S3) != ""
-	if hasDB && hasS3 {
-		return fmt.Errorf("target cannot set both s3 and conn_id/conn_name")
+	hasAzure := strings.TrimSpace(target.AzureBlob) != ""
+	selected := 0
+	for _, v := range []bool{hasDB, hasS3, hasAzure} {
+		if v {
+			selected++
+		}
 	}
-	if !hasDB && !hasS3 {
-		return fmt.Errorf("target conn_id/conn_name or s3 is required")
+	if selected > 1 {
+		return fmt.Errorf("target must set exactly one of conn_id/conn_name, s3, or azure_blob")
+	}
+	if selected == 0 {
+		return fmt.Errorf("target conn_id/conn_name, s3, or azure_blob is required")
 	}
 	if strings.TrimSpace(target.Table) == "" {
 		return fmt.Errorf("target table is required")
 	}
 
-	// 先解析目标端，拿到 dbType 供表名校验判定段数（s3 目标无 dbType，三段式表名一律非法）。
+	// 先解析目标端，拿到 dbType 供表名校验判定段数（对象存储目标无 dbType，三段式表名一律非法）。
 	var dbType DBType
-	if hasS3 {
+	switch {
+	case hasAzure:
+		if _, ok := azureBlobResolver.Resolve(target.AzureBlob); !ok {
+			return fmt.Errorf("target azure_blob %q not found", target.AzureBlob)
+		}
+	case hasS3:
 		if _, ok := s3Resolver.Resolve(target.S3); !ok {
 			return fmt.Errorf("target s3 %q not found", target.S3)
 		}
-	} else {
+	default:
 		db, ok := resolver.Resolve(target.ConnID, target.ConnName)
 		if !ok {
 			return fmt.Errorf("target db not found (conn_id=%q conn_name=%q)", target.ConnID, target.ConnName)
@@ -752,7 +874,7 @@ func (target *TargetConfig) Validate(resolver DBResolver, s3Resolver S3Resolver)
 		dbType = db.Type
 	}
 
-	// 表名会用于对象 key 拼接（s3，见 writer.defaultObjectKey / incrementalObjectKey）
+	// 表名会用于对象 key 拼接（对象存储，见 writer.defaultObjectKey / incrementalObjectKey）
 	// 及 SQL 标识符引用（DB），非法字符会破坏 key 结构或引发标识符歧义，
 	// 必须在加载阶段 fail-fast，而非在写入端静默替换掩盖配置错误。
 	if err := ValidateTableName(target.Table, dbType); err != nil {
@@ -767,8 +889,8 @@ func (target *TargetConfig) Validate(resolver DBResolver, s3Resolver S3Resolver)
 		return fmt.Errorf("pk is required for merge mode (target table %q)", target.Table)
 	}
 
-	// s3 目标：回填对象存储相关默认值。
-	if hasS3 {
+	// 对象存储目标（s3/azure_blob）：回填对象存储相关默认值。
+	if hasS3 || hasAzure {
 		// row group 行数：未配置（0）回填默认值；显式负值表示关闭切分（归一为 0 交给写入端跳过）。
 		if target.MaxRowsPerRowGroup <= 0 {
 			target.MaxRowsPerRowGroup = defaultMaxRowsPerRowGroup

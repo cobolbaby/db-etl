@@ -10,22 +10,37 @@ import (
 	"github.com/jackc/pgx/v5"
 )
 
-// NewWriter 根据 target 构建 Writer：优先按 target.S3 分发到对象存储（parquet），
+// NewWriter 根据 target 构建 Writer：优先按 target.S3 / target.AzureBlob 分发到对象存储（parquet），
 // 否则按 target 引用的数据库类型分发到对应数据库写入器。
 // metaDB 指向存放 manager.job_data_sync 的 PostgreSQL（meta_db），仅对象存储目标使用，
 // 未配置 meta_db 时传零值。
-func NewWriter(target *config.TargetConfig, dbResolver config.DBResolver, s3Resolver config.S3Resolver, metaDB config.DBConfig, jobName string) (Writer, error) {
+func NewWriter(target *config.TargetConfig, dbResolver config.DBResolver, s3Resolver config.S3Resolver, azureBlobResolver config.AzureBlobResolver, metaDB config.DBConfig, jobName string) (Writer, error) {
 	if target == nil {
 		return nil, util.NonRetryable(fmt.Errorf("target config is required"))
 	}
 
-	// 对象存储目标：走 parquet 序列化 + S3 上传。
+	// 对象存储目标：走 parquet 序列化 + 上传，具体落地协议（S3 / Azure Blob）由 objectStore 实现屏蔽。
+	if strings.TrimSpace(target.AzureBlob) != "" {
+		ab, ok := azureBlobResolver.Resolve(target.AzureBlob)
+		if !ok {
+			return nil, util.NonRetryable(fmt.Errorf("target azure_blob %q not found", target.AzureBlob))
+		}
+		store, err := newAzureBlobStore(ab)
+		if err != nil {
+			return nil, err
+		}
+		return NewParquetWriter(store, metaDB, target, jobName)
+	}
 	if strings.TrimSpace(target.S3) != "" {
 		s3, ok := s3Resolver.Resolve(target.S3)
 		if !ok {
 			return nil, util.NonRetryable(fmt.Errorf("target s3 %q not found", target.S3))
 		}
-		return NewParquetWriter(s3, metaDB, target, jobName)
+		store, err := newS3Store(s3)
+		if err != nil {
+			return nil, err
+		}
+		return NewParquetWriter(store, metaDB, target, jobName)
 	}
 
 	// 数据库目标：Resolve 返回共享 datasource 配置的值副本，下方改写只作用于本副本。

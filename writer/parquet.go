@@ -27,22 +27,18 @@ import (
 // 与 PG writer 不同：对象存储上传没有事务可挂靠，水位只能走这条独立连接写，
 // 因此存在「上传成功但水位写失败」的窗口。
 type parquetWriterDialect struct {
-	store    *s3Store
+	store    objectStore
 	metaConn *pgx.Conn
 	target   *config.TargetConfig
 	jobName  string
 }
 
 // NewParquetWriter 构建写 parquet 到对象存储的 Writer。
-// s3 提供对象存储连接信息；metaDB 提供水位写回连接，为零值（未配置 meta_db）时不建连接。
-func NewParquetWriter(s3 config.S3Config, metaDB config.DBConfig, target *config.TargetConfig, jobName string) (Writer, error) {
+// store 提供对象存储落地端（s3Store 或 azureBlobStore，见 writer/factory.go 的构建逻辑）；
+// metaDB 提供水位写回连接，为零值（未配置 meta_db）时不建连接。
+func NewParquetWriter(store objectStore, metaDB config.DBConfig, target *config.TargetConfig, jobName string) (Writer, error) {
 	if target == nil {
 		return nil, util.NonRetryable(fmt.Errorf("target config is required for parquet writer"))
-	}
-
-	store, err := newS3Store(s3)
-	if err != nil {
-		return nil, err
 	}
 
 	// Database 是每个 datasource 的必填项（见 config.validateDatabases），
@@ -76,9 +72,9 @@ func (d *parquetWriterDialect) close(ctx context.Context) error {
 //
 // best-effort（尽力而为）：last_status 仅供监控/观测，写不回不影响“数据是否已上传”。
 // 下列三种“无处可记”情形均不报错、不阻断主流程：
-//   1. 未配置 meta_db（metaConn 为 nil）：无处存放状态，直接跳过。
-//   2. manager.job_data_sync 表不存在（42P01）：meta_db 未建 DTS 配置表，跳过。
-//   3. 表存在但无匹配行（affected==0）：该 源+目标 组合未被登记进配置表，仅记日志。
+//  1. 未配置 meta_db（metaConn 为 nil）：无处存放状态，直接跳过。
+//  2. manager.job_data_sync 表不存在（42P01）：meta_db 未建 DTS 配置表，跳过。
+//  3. 表存在但无匹配行（affected==0）：该 源+目标 组合未被登记进配置表，仅记日志。
 func (d *parquetWriterDialect) recordSyncResult(ctx context.Context, source *config.SourceConfig, status int) error {
 	if d.metaConn == nil {
 		return nil

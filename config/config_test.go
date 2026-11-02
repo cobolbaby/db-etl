@@ -158,3 +158,71 @@ func TestValidateTableNameRejectsThreePartForNonMSSQL(t *testing.T) {
 		}
 	}
 }
+
+func TestTargetConfigValidateRequiresExactlyOneDestination(t *testing.T) {
+	dbResolver := NewDBResolver([]DBConfig{{Name: "pg", Type: DBTypePG, Database: "d"}})
+	s3Resolver := NewS3Resolver([]S3Config{{Name: "lake", Format: S3FormatParquet, Endpoint: "e", Bucket: "b"}})
+	azureResolver := NewAzureBlobResolver([]AzureBlobConfig{{Name: "azlake", Format: S3FormatParquet, Container: "c", ConnectionString: "cs"}})
+
+	cases := []struct {
+		name    string
+		target  TargetConfig
+		wantErr string
+	}{
+		{
+			name:    "none set",
+			target:  TargetConfig{Table: "t", Mode: ModeTypeFull},
+			wantErr: "is required",
+		},
+		{
+			name:    "s3 and azure_blob both set",
+			target:  TargetConfig{Table: "t", Mode: ModeTypeFull, S3: "lake", AzureBlob: "azlake"},
+			wantErr: "exactly one",
+		},
+		{
+			name:    "db and azure_blob both set",
+			target:  TargetConfig{Table: "t", Mode: ModeTypeFull, ConnName: "pg", AzureBlob: "azlake"},
+			wantErr: "exactly one",
+		},
+		{
+			name:    "unknown azure_blob name",
+			target:  TargetConfig{Table: "t", Mode: ModeTypeFull, AzureBlob: "missing"},
+			wantErr: "not found",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			target := tc.target
+			err := target.Validate(dbResolver, s3Resolver, azureResolver)
+			if err == nil {
+				t.Fatalf("expected error containing %q, got nil", tc.wantErr)
+			}
+			if !strings.Contains(err.Error(), tc.wantErr) {
+				t.Fatalf("expected error containing %q, got %v", tc.wantErr, err)
+			}
+		})
+	}
+}
+
+func TestTargetConfigValidateAcceptsAzureBlob(t *testing.T) {
+	dbResolver := NewDBResolver(nil)
+	s3Resolver := NewS3Resolver(nil)
+	azureResolver := NewAzureBlobResolver([]AzureBlobConfig{{Name: "azlake", Format: S3FormatParquet, Container: "c", ConnectionString: "cs"}})
+
+	target := TargetConfig{Table: "ods.orders", Mode: ModeTypeFull, AzureBlob: "azlake"}
+	if err := target.Validate(dbResolver, s3Resolver, azureResolver); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if target.MaxRowsPerRowGroup != defaultMaxRowsPerRowGroup {
+		t.Fatalf("expected default MaxRowsPerRowGroup to be filled, got %d", target.MaxRowsPerRowGroup)
+	}
+}
+
+func TestAzureBlobConfigValidateRequiresCredential(t *testing.T) {
+	cfg := AzureBlobConfig{Name: "azlake", Container: "c"}
+	err := cfg.Validate()
+	if err == nil || !strings.Contains(err.Error(), "requires connection_string") {
+		t.Fatalf("expected credential-required error, got %v", err)
+	}
+}

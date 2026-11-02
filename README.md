@@ -184,6 +184,53 @@ s3:
 
 其中 `<table>` / `<incr_point>` 会做安全化处理：仅保留字母、数字、`_`、`-`，其余字符（`.`、`/`、空格、`:` 等）替换为 `_`。例如 `ods.orders` → `ods_orders.parquet`。
 
+### `azure_blob`
+
+Azure Blob Storage 落地端定义列表，与 `s3` 平级，二者共用同一套 parquet 序列化与水位语义，仅落地协议不同。`target.s3` / `target.azure_blob` / `target.conn_id`(`conn_name`) 三者互斥，只能选其一。
+
+```yaml
+azure_blob:
+  - name: azlake
+    format: parquet # 目前仅支持 parquet，留空同义
+    # 认证三选一，优先级：connection_string > account_name+sas_token > account_name+account_key
+    connection_string: ${AZURE_STORAGE_CONNECTION_STRING}
+    # account_name: mystorageaccount
+    # sas_token: ${AZURE_SAS_TOKEN}
+    # account_key: ${AZURE_STORAGE_KEY}
+    container: ods
+    prefix: db-etl/ # 可选，对象 key 前缀
+    block_size_mb: 8 # 可选，分块上传块大小（MiB），默认 8
+    concurrency: 4 # 可选，分块上传并发数，默认 4
+
+tasks:
+  - name: orders_to_azure
+    type: query
+    sources:
+      - conn_name: "source-mssql"
+        table: "dbo.orders"
+        batch_size: 20000
+    target:
+      azure_blob: "azlake" # 引用 azure_blob[].name，与 conn_id/conn_name/s3 互斥
+      table: "ods.orders"
+      mode: full
+```
+
+| 字段                 | 必填 | 说明                                                                     |
+| -------------------- | ---- | -------------------------------------------------------------------------- |
+| `name`               | ✅   | 存储别名，供 `target.azure_blob` 引用                                     |
+| `format`             |      | 落地格式，目前仅 `parquet`（空值按 `parquet` 处理）                       |
+| `connection_string`  |      | 完整连接串（支持 `${ENV}`），与 `account_name`+`sas_token`/`account_key` 三选一 |
+| `account_name`       |      | 存储账户名，配合 `sas_token` 或 `account_key` 使用                       |
+| `account_key`        |      | 存储账户密钥（支持 `${ENV}`）                                             |
+| `sas_token`          |      | SAS 令牌（支持 `${ENV}`），推荐最小权限场景使用                          |
+| `service_url`        |      | Blob 服务端点，默认 `https://<account_name>.blob.core.windows.net`；国内版/政务云/私有化部署需显式指定 |
+| `container`          | ✅   | 目标容器                                                                  |
+| `prefix`             |      | 对象 key 前缀                                                             |
+| `block_size_mb`      |      | 分块上传块大小（MiB），默认 8                                             |
+| `concurrency`        |      | 分块上传并发数，默认 4                                                    |
+
+对象 key 的推导规则与 `s3` 完全一致（见上节）。
+
 ### `tasks`
 
 任务定义列表。每个任务将多个 `sources` 的数据写入一个 `target`。
@@ -466,6 +513,28 @@ tasks:
         batch_size: 20000
     target:
       s3: "lake" # 引用 s3[].name，与 conn_name 互斥
+      table: "ods.orders" # 用于推导对象 key：db-etl/ods_orders.parquet
+      mode: full
+```
+
+### 7. Table → Azure Blob Parquet
+
+```yaml
+azure_blob:
+  - name: azlake
+    connection_string: ${AZURE_STORAGE_CONNECTION_STRING}
+    container: ods
+    prefix: db-etl/
+
+tasks:
+  - name: orders_to_azure
+    type: query
+    sources:
+      - conn_name: "source-mssql"
+        table: "dbo.orders"
+        batch_size: 20000
+    target:
+      azure_blob: "azlake" # 引用 azure_blob[].name，与 conn_name/s3 互斥
       table: "ods.orders" # 用于推导对象 key：db-etl/ods_orders.parquet
       mode: full
 ```

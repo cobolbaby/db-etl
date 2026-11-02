@@ -52,6 +52,9 @@ func main() {
 	// 构建 S3 Resolver（对象存储目标按 name 引用）
 	s3Resolver := config.NewS3Resolver(cfg.S3)
 
+	// 构建 Azure Blob Resolver（对象存储目标按 name 引用）
+	azureBlobResolver := config.NewAzureBlobResolver(cfg.AzureBlob)
+
 	// --------------------------------
 	// 2. 确定 Task 列表
 	// --------------------------------
@@ -118,11 +121,12 @@ func main() {
 
 	workers := min(runtime.NumCPU(), 4) // 4 is an empirical value, can be tuned
 	e := &etl{
-		dbResolver: dbResolver,
-		s3Resolver: s3Resolver,
-		metaDB:     metaDB,
-		retryCfg:   retryCfg,
-		jobName:    cfg.Name,
+		dbResolver:        dbResolver,
+		s3Resolver:        s3Resolver,
+		azureBlobResolver: azureBlobResolver,
+		metaDB:            metaDB,
+		retryCfg:          retryCfg,
+		jobName:           cfg.Name,
 	}
 	var wg sync.WaitGroup
 	for i := 0; i < workers; i++ {
@@ -150,11 +154,12 @@ func main() {
 // etl 聚合各 task/pipeline 共享的依赖，避免在 runTask/runPipeline 间层层透传。
 type etl struct {
 	// jobName 为 job 级默认任务名（config.yaml 的 name），task 未指定 name 时取此值。
-	jobName    string
-	dbResolver config.DBResolver
-	s3Resolver config.S3Resolver
-	metaDB     config.DBConfig
-	retryCfg   util.RetryConfig
+	jobName           string
+	dbResolver        config.DBResolver
+	s3Resolver        config.S3Resolver
+	azureBlobResolver config.AzureBlobResolver
+	metaDB            config.DBConfig
+	retryCfg          util.RetryConfig
 }
 
 func (e *etl) runTask(ctx context.Context, task config.TaskConfig) error {
@@ -211,7 +216,7 @@ func (e *etl) runPipeline(ctx context.Context, src *config.SourceConfig, srcDB c
 	// Writer
 	// -----------------------------
 
-	w, err := writer.NewWriter(task.Target, e.dbResolver, e.s3Resolver, e.metaDB, task.Name)
+	w, err := writer.NewWriter(task.Target, e.dbResolver, e.s3Resolver, e.azureBlobResolver, e.metaDB, task.Name)
 	if err != nil {
 		return fmt.Errorf("create writer: %w", err)
 	}
@@ -308,8 +313,11 @@ func (e *etl) runPipeline(ctx context.Context, src *config.SourceConfig, srcDB c
 	return nil
 }
 
-// targetName 返回目标端用于日志的名称：对象存储目标取 s3 名，数据库目标取库名。
+// targetName 返回目标端用于日志的名称：对象存储目标取 s3/azure_blob 名，数据库目标取库名。
 func (e *etl) targetName(target *config.TargetConfig) string {
+	if strings.TrimSpace(target.AzureBlob) != "" {
+		return target.AzureBlob
+	}
 	if strings.TrimSpace(target.S3) != "" {
 		return target.S3
 	}

@@ -11,6 +11,17 @@ import (
 	"github.com/minio/minio-go/v7/pkg/credentials"
 )
 
+// objectStore 是 parquetWriterDialect 落地对象存储的统一抽象：
+// 只关心「把一段字节流上传为某个 key」，不关心具体是 S3 兼容协议还是 Azure Blob REST API。
+// s3Store（本文件）与 azureBlobStore（见 azureblob.go）各自实现协议细节，
+// parquetWriterDialect 面向该接口编程，新增存储后端无需改动 parquet 序列化逻辑。
+type objectStore interface {
+	// put 从 r 流式读取数据并上传为 key 标识的对象（key 相同即覆盖）。
+	put(ctx context.Context, key string, r io.Reader) error
+	// describe 返回 key 对应的人类可读目标位置，用于日志。
+	describe(key string) string
+}
+
 // s3Store 通过 minio-go 将对象流式上传到 S3 / S3 兼容对象存储。
 // 它与 parquet 序列化解耦：dialect 只管往 io.Writer 写，s3Store 从管道另一端流式上传，
 // 免去「先落本地临时文件再上传」的二次写入。
@@ -62,3 +73,5 @@ func (s *s3Store) put(ctx context.Context, key string, r io.Reader) error {
 func (s *s3Store) describe(key string) string {
 	return fmt.Sprintf("s3://%s/%s", s.bucket, s.objectName(key))
 }
+
+var _ objectStore = (*s3Store)(nil)

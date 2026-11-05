@@ -30,8 +30,8 @@ type BaseReader struct {
 	dialect readerDialect
 	// loc 为源库时区（由 config.DBConfig.Location 解析），
 	// 用于把无时区时间列的墙钟解释为该时区；nil 时回退 time.Local。
-	loc     *time.Location
-	err     error // ReadBatch 异步执行期间捕获的错误，通过 Err() 暴露
+	loc *time.Location
+	err error // ReadBatch 异步执行期间捕获的错误，通过 Err() 暴露
 }
 
 // Err 返回 ReadBatch 异步读取期间发生的错误，应在 channel 耗尽后调用。
@@ -97,7 +97,6 @@ func (r *BaseReader) ReadBatch(ctx context.Context, cancel context.CancelFunc) <
 		}
 
 		// 列元数据取自本次查询的结果集描述，随每个批次下发；
-		// 各批次共享同一份切片，下游只读不改。
 		columns := r.columnMeta(colTypes)
 
 		// 驱动层的值表示差异在此归一，使下游只需面对 ColumnKind 约定的 Go 类型。

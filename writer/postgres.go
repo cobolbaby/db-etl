@@ -630,18 +630,18 @@ func (d *pgWriterDialect) getWatermark(source *config.SourceConfig) (string, err
 
 	// 如果 job_data_sync 中没有记录或 incr_point 为空，回退到从目标表查增量字段最大值
 	if wm == "" && source.IncrField != "" {
-		ctx := context.Background()
-		// 目标表列名为映射后的目标名，须用目标列名聚合，否则源字段改名后会报列不存在。
-		incrColumn := source.FieldsMapping.TargetColumn(source.IncrField)
-		fallbackSQL := fmt.Sprintf(`SELECT COALESCE(MAX(%s)::text, '') FROM %s`, incrColumn, target.Table)
-		var fallback string
-		if err := d.conn.QueryRow(ctx, fallbackSQL).Scan(&fallback); err != nil {
-			return "", fmt.Errorf("fallback watermark query failed: %w", err)
-		}
-		if fallback != "" {
-			log.Printf("watermark fallback: using MAX(%s)=%s from table %s", incrColumn, fallback, target.Table)
-			return fallback, nil
-		}
+		// ctx := context.Background()
+		// // 目标表列名为映射后的目标名，须用目标列名聚合，否则源字段改名后会报列不存在。
+		// incrColumn := source.FieldsMapping.TargetColumn(source.IncrField)
+		// fallbackSQL := fmt.Sprintf(`SELECT COALESCE(MAX(%s)::text, '') FROM %s`, incrColumn, target.Table)
+		// var fallback string
+		// if err := d.conn.QueryRow(ctx, fallbackSQL).Scan(&fallback); err != nil {
+		// 	return "", fmt.Errorf("fallback watermark query failed: %w", err)
+		// }
+		// if fallback != "" {
+		// 	log.Printf("watermark fallback: using MAX(%s)=%s from table %s", incrColumn, fallback, target.Table)
+		// 	return fallback, nil
+		// }
 		// 目标表也无数据，根据字段名推算兜底值
 		defaultWM := defaultIncrPoint(source.IncrField)
 		log.Printf("watermark fallback: no data in table %s, using default %s=%s", target.Table, source.IncrField, defaultWM)

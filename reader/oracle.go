@@ -77,5 +77,14 @@ func (oracleDialect) columnKind(dbType string) ColumnKind {
 	return KindString
 }
 
-// valueNormalizer Oracle 驱动返回的值已符合各 ColumnKind 的约定，无需修正。
-func (oracleDialect) valueNormalizer(string, *time.Location) ValueNormalizer { return nil }
+// valueNormalizer Oracle 驱动对 DATE/TIMESTAMP/TIMESTAMP WITH LOCAL TIME ZONE
+// 已按连接时区统一修正，无需再处理。
+// 但 TIMESTAMP WITH TIME ZONE（go-ora 报告为 TimeStampTZ/TimeStampTZ_DTY）
+// 按每行原始写入的时区/偏移原样返回——不同行的 Location 可能互不相同，
+// 需统一换算到 loc，确保落地文本以同一时区为基准（见 TZAwareTimeNormalizer）。
+func (oracleDialect) valueNormalizer(dbType string, loc *time.Location) ValueNormalizer {
+	if strings.Contains(strings.ToUpper(dbType), "TIMESTAMPTZ") {
+		return TZAwareTimeNormalizer(loc)
+	}
+	return nil
+}

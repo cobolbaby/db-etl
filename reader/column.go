@@ -95,6 +95,30 @@ func NaiveTimeNormalizer(loc *time.Location) ValueNormalizer {
 	}
 }
 
+// TZAwareTimeNormalizer 返回一个把「自带时区的时间值」统一换算到 loc 的修正函数。
+//
+// 部分源库对 TIMESTAMP WITH TIME ZONE（Oracle）/ DATETIMEOFFSET（MSSQL）等列，
+// 按每行写入时的原始时区/偏移原样返回——不同行的 Location 可能互不相同。
+// 而 TimestampLayout 不含时区占位符，FormatText 只会照搬该行自身 Location
+// 对应的墙钟数字；若不同行时区不同，落地文本就会以互不一致的时区为基准，
+// 即便每行各自的绝对时刻都正确，文本之间也不再可比。
+//
+// 与 NaiveTimeNormalizer 仅重新贴标签（墙钟数字不变）不同，这里用 .In(loc)
+// 做真正的时区换算：保持绝对时刻不变，但统一转换到 loc 下的墙钟，
+// 使所有行的落地文本都以同一时区为基准。
+func TZAwareTimeNormalizer(loc *time.Location) ValueNormalizer {
+	if loc == nil {
+		loc = time.Local
+	}
+	return func(v any) any {
+		t, ok := v.(time.Time)
+		if !ok {
+			return v
+		}
+		return t.In(loc)
+	}
+}
+
 // FormatText 将值渲染为规范文本形式：只做「Go 值 → 字符串」，
 // 不含任何目标格式的转义或 NULL 表示，那些由各 writer 在此结果之上叠加。
 // nil 返回空串，调用方应先自行区分 NULL。

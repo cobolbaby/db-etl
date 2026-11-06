@@ -309,6 +309,45 @@ buildReadQuery()             → 追加增量条件 + ORDER BY
 
 `make(chan Batch, 8)` — 8 个 batch 的缓冲平衡 Reader（网络 IO 密集）和 Writer（磁盘 IO 密集）的速度差异。
 
+### 4.4 时区处理
+
+`FormatText` 本身是纯渲染：`TimestampLayout` 不含时区占位符，`t.Format()` 只是照搬
+`t.Location()` 当前的墙钟数字，不做任何换算。因此时区的统一必须在渲染之前完成，分两个独立阶段：
+
+**阶段一：Reader 侧修正"绝对时刻"（`dialect.valueNormalizer(dbType, loc)`）**
+
+驱动对两类时间列的处理方式不同：
+
+| 列类型分类         | 覆盖类型                                                                                                                                             | 问题                                                                   | 归一化函数                   |
+| ------------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------- | ---------------------------- |
+| 时区无关           | MSSQL `DATETIME`/`DATETIME2`/`SMALLDATETIME`/`DATE`/`TIME`、PG `TIMESTAMP`/`DATE`/`TIME`、Oracle `DATE`/`TIMESTAMP`/`TIMESTAMP WITH LOCAL TIME ZONE` | 驱动把墙钟数字误贴成 UTC 标签，墙钟数字本身才是真值                    | `NaiveTimeNormalizer(loc)`   |
+| 时区感知，逐行不同 | MSSQL `DATETIMEOFFSET`、Oracle `TIMESTAMPTZ`/`TimeStampTZ_DTY`                                                                                       | 驱动按行从 wire 协议解出偏移量/地区编码，不同行可能携带不同 `Location` | `TZAwareTimeNormalizer(loc)` |
+
+- `NaiveTimeNormalizer(loc)`：用 `time.Date(...)` 重建，墙钟数字不变，只替换错误的 Location 标签。
+- `TZAwareTimeNormalizer(loc)`：用 `t.In(loc)` 做真转换，把每行可能不同的 Location 统一成同一个，
+  使后续 `FormatText`（无 tz 占位符）在所有行上渲染出可比较、可拼接的文本。
+- PG 的 `TIMESTAMPTZ`/`TIMETZ` 两者都不需要：pgx 协议层只传 UTC 微秒数，不保留原始偏移字节，
+  同一连接内所有行共用同一个 `ScanLocation` 解码，行间天然一致（已通过 pgx v5 源码确认）。
+
+**阶段二：Writer 侧换算到目标时区（仅 PG COPY 路径）**
+
+`writer/pgcopy.go` 的 `encodeCopyValue(kind, v, loc)` 在渲染前对 `KindTime` 值做 `t.In(loc)`，
+`loc` 取目标库配置解析出的 `db.Location()`，与 DSN 中注入的 `-c TimeZone=` 是同一个值
+（见 `writer/factory.go` → `NewPGWriter` → `pgWriterDialect.loc`）。这样可以保证
+"写出的无偏移字面量文本"与"PG 用会话 `TimeZone` 解析该文本"两端一致，不会发生二次偏移。
+
+parquet 路径不需要这一步：`parquetValue` 按 `t.UTC().UnixMilli()` 保留原生数值编码，
+不存在文本解析歧义（见 3.6 节）。
+
+> `pgx.Conn` 建连后其实可以通过 `PgConn().ParameterStatus("TimeZone")` 查到服务端确认的会话时区，
+> 但现有实现没有走这条路：`db.Location()` 在建连前就已解析校验，可以在尝试连接前就对非法时区
+> 配置快速失败（`util.NonRetryable`）；配置文件本就是 DSN 的 `TimeZone` 参数与 `loc` 换算两处的
+> 唯一数据源，没必要连接建立后再反查字符串重新解析一遍。
+
+**与比较/编码的区别：**`time.Time` 的 `.After()`/`.Before()`/`.Equal()` 比较的是绝对时刻，
+与 `Location` 无关；水位推进、`parquetValue` 的数值编码都不需要预先统一时区，只有走
+`FormatText` 渲染成文本的路径才依赖上述两个阶段。
+
 ---
 
 ## 5. Transform 层设计

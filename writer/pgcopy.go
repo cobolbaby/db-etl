@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"regexp"
 	"strings"
+	"time"
 )
 
 // nullSentinel 是 COPY 用来识别 SQL NULL 的哨兵文本（见 buildCopySQL 的 NULL 选项）。
@@ -19,7 +20,13 @@ var controlChars = regexp.MustCompile(`[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]`)
 
 // encodeCopyValue 将驱动返回的原始值编码为 COPY ... FORMAT CSV 的字段文本。
 // 这是 PostgreSQL 目标独有的落地格式，因此与 reader / transform 无关。
-func encodeCopyValue(kind reader.ColumnKind, v any) string {
+//
+// loc 为目标库会话时区（见 pgWriterDialect.loc），COPY 写入的时间戳文本不带时区，
+// PostgreSQL 按会话 TimeZone 解析；reader 侧各源库可能配置不同时区，若不统一换算，
+// 不同源的同一批数据落地后文本所代表的时区基准会不一致。因此在渲染文本前，
+// 将 time.Time 统一换算（.In(loc)，不改变其绝对时刻）到目标时区，
+// 使生成的文本恰好是目标会话 TimeZone 下应解析出原始绝对时刻的墙钟。
+func encodeCopyValue(kind reader.ColumnKind, v any, loc *time.Location) string {
 	if v == nil {
 		return nullSentinel
 	}
@@ -28,6 +35,12 @@ func encodeCopyValue(kind reader.ColumnKind, v any) string {
 	if kind == reader.KindBytes {
 		if b, ok := v.([]byte); ok {
 			return `\x` + hex.EncodeToString(b)
+		}
+	}
+
+	if kind == reader.KindTime && loc != nil {
+		if t, ok := v.(time.Time); ok {
+			v = t.In(loc)
 		}
 	}
 

@@ -42,6 +42,14 @@ func NewWriter(target *config.TargetConfig, dbResolver config.DBResolver, s3Reso
 			db.StatementTimeout = config.InitialModeDefaultTimeoutSec
 		}
 
+		// loc 由目标库配置的 timezone 解析而来，供 COPY 写入前把时间值统一换算到
+		// 目标会话 TimeZone（与 db.DSN() 注入的 "-c TimeZone=" 保持一致）。
+		// 解析失败属配置错误，重试无益。
+		loc, err := db.Location()
+		if err != nil {
+			return nil, util.NonRetryable(fmt.Errorf("parse target timezone failed: %w", err))
+		}
+
 		// lock_timeout、statement_timeout、TimeZone 均已由 db.DSN() 注入连接串。
 		pgConn, err := pgx.Connect(context.Background(), db.DSN())
 		if err != nil {
@@ -51,7 +59,7 @@ func NewWriter(target *config.TargetConfig, dbResolver config.DBResolver, s3Reso
 		// 与数据落地同进同退（见 watermark.go 中 pgxExecutor 的说明）；
 		// 换成独立的 metaDB 连接会破坏这个原子性，代价是 manager.job_data_sync 必须与目标库同实例。
 		// 对象存储无事务可挂靠，才需要单独的 metaDB 连接（见 NewParquetWriter）。
-		return NewPGWriter(pgConn, target, jobName), nil
+		return NewPGWriter(pgConn, target, loc, jobName), nil
 	default:
 		// 不支持的类型属配置错误，重试无益。
 		return nil, util.NonRetryable(fmt.Errorf("unsupported target db type: %s", db.Type))

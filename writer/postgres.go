@@ -20,14 +20,18 @@ type pgWriterDialect struct {
 	conn    *pgx.Conn
 	target  *config.TargetConfig
 	jobName string
+	// loc 为目标库配置的时区（config.DBConfig.Location()），COPY 写入的时间戳文本
+	// 不带时区，由目标会话 TimeZone 解析；此处用于在编码前把 time.Time 统一换算到
+	// 同一时区，避免不同源库各自配置的时区导致落地文本基准不一致（见 encodeCopyValue）。
+	loc *time.Location
 }
 
-func NewPGWriter(conn *pgx.Conn, target *config.TargetConfig, jobName string) Writer {
+func NewPGWriter(conn *pgx.Conn, target *config.TargetConfig, loc *time.Location, jobName string) Writer {
 	base := &BaseWriter{
 		Target: target,
 	}
 
-	base.dialect = &pgWriterDialect{conn: conn, target: target, jobName: jobName}
+	base.dialect = &pgWriterDialect{conn: conn, target: target, loc: loc, jobName: jobName}
 
 	return base
 }
@@ -242,7 +246,7 @@ func (d *pgWriterDialect) writeCopyStream(
 				if i > 0 {
 					buf.WriteByte(',')
 				}
-				buf.WriteString(encodeCopyValue(batch.Columns[i].Kind, v))
+				buf.WriteString(encodeCopyValue(batch.Columns[i].Kind, v, d.loc))
 			}
 			buf.WriteByte('\n')
 			if buf.Len() > 3*1024*1024 {

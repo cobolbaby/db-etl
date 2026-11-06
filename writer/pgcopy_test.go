@@ -7,36 +7,46 @@ import (
 )
 
 func TestEncodeCopyValueDistinguishesNullFromEmptyString(t *testing.T) {
-	if got := encodeCopyValue(reader.KindString, nil); got != nullSentinel {
+	if got := encodeCopyValue(reader.KindString, nil, nil); got != nullSentinel {
 		t.Fatalf("expected nil to encode as null sentinel %q, got %q", nullSentinel, got)
 	}
 
-	if got := encodeCopyValue(reader.KindString, ""); got != "" {
+	if got := encodeCopyValue(reader.KindString, "", nil); got != "" {
 		t.Fatalf("expected empty string to stay empty, got %q", got)
 	}
 }
 
 func TestEncodeCopyValueQuotesEmbeddedDelimiters(t *testing.T) {
 	// 含逗号的 PG 数组字面量必须被引号包裹，否则会破坏 COPY 的列分隔。
-	if got := encodeCopyValue(reader.KindString, "{1,2,3}"); got != `"{1,2,3}"` {
+	if got := encodeCopyValue(reader.KindString, "{1,2,3}", nil); got != `"{1,2,3}"` {
 		t.Fatalf("expected quoted array literal, got %q", got)
 	}
 }
 
 func TestEncodeCopyValueUsesHexForBytes(t *testing.T) {
-	if got := encodeCopyValue(reader.KindBytes, []byte{0xDE, 0xAD}); got != `\xdead` {
+	if got := encodeCopyValue(reader.KindBytes, []byte{0xDE, 0xAD}, nil); got != `\xdead` {
 		t.Fatalf("expected bytea hex literal, got %q", got)
 	}
 
-	if got := encodeCopyValue(reader.KindBytes, []byte{}); got != `\x` {
+	if got := encodeCopyValue(reader.KindBytes, []byte{}, nil); got != `\x` {
 		t.Fatalf("expected empty bytea literal, got %q", got)
 	}
 }
 
 func TestEncodeCopyValueFormatsTime(t *testing.T) {
 	ts := time.Date(2024, 3, 1, 9, 8, 7, 123456000, time.UTC)
-	if got := encodeCopyValue(reader.KindTime, ts); got != "2024-03-01 09:08:07.123456" {
+	if got := encodeCopyValue(reader.KindTime, ts, nil); got != "2024-03-01 09:08:07.123456" {
 		t.Fatalf("unexpected timestamp encoding %q", got)
+	}
+}
+
+func TestEncodeCopyValueConvertsTimeToTargetLocation(t *testing.T) {
+	// 输入为 +08 时区的墙钟 17:08:07；目标会话时区为 UTC，
+	// 换算后文本应为同一绝对时刻在 UTC 下的墙钟 09:08:07，而非原样照搬 +08 的墙钟。
+	loc := time.FixedZone("+08", 8*3600)
+	ts := time.Date(2024, 3, 1, 17, 8, 7, 123456000, loc)
+	if got := encodeCopyValue(reader.KindTime, ts, time.UTC); got != "2024-03-01 09:08:07.123456" {
+		t.Fatalf("expected time converted to target location, got %q", got)
 	}
 }
 

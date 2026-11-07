@@ -232,29 +232,50 @@ func (r *BaseReader) resolveProjection() (string, error) {
 	)
 }
 
-// formatProjectionSource 处理源表列名，区分两种情况：
-//  1. 裸标识符（如 "id"、"user_name"）：交给 quoteIdentifier 加上方言特定的引号（PostgreSQL 用 ""，MSSQL 用 []）
-//  2. 其他（已引用标识符或复杂表达式如 "CAST(x AS INT)"、`"ColumnName"`、"schema.table"）：直接返回
-//     - 已引用标识符：quoteIdentifier 内部会幂等处理，与直接返回结果相同，无需单独分支
-//     - 复杂表达式：不能加引号，否则会破坏表达式结构
+// formatProjectionSource 处理源表列名，按序依次判断，命中即原样返回，最后兜底加引号：
+//  1. 已被引号/方括号包裹的标识符（如 `"ColumnName"`、"[Price(USD)]"：直接返回，
+//     quoteIdentifier 内部也会幂等处理，与直接返回结果相同，无需单独分支。
+//  2. 单引号包裹的 SQL 字符串字面量（如 "'tao'"）：用于配置「常量列」（fields_mapping 里
+//     "'tao'": src_region 生成 'tao' AS src_region），原样透传，不当列名处理。
+//  3. 数字常量（如 "1"、"-1"、"1.5"）：原样透传，不支持纯数字列名。
+//  4. SQL 表达式（如 "GETDATE()"、"CAST(x AS INT)"）：不能加引号，否则会破坏表达式结构，
+//     原样透传。
+//  5. 以上均不命中：视为裸标识符（如 "id"、"user_name"），交给 quoteIdentifier 加上
+//     方言特定的引号（PostgreSQL 用 ""，MSSQL 用 []）。
 func formatProjectionSource(sourceField string, quoteIdentifier func(string) string) string {
 	sourceField = strings.TrimSpace(sourceField)
 	if sourceField == "" {
 		return ""
 	}
 
-	// 已被引用的标识符（[x] 或 "x"）直接返回：外层绝不能再套一层引号，
+	// 已被包裹的标识符（[x] 或 "x"）直接返回：外层绝不能再套一层引号，
 	// 否则会产出 [[x]] / ""x"" 这类非法标识符。
 	if isAlreadyQuotedIdentifier(sourceField) {
 		return sourceField
 	}
 
-	if isColumnIdentifier(sourceField) {
-		return quoteIdentifier(sourceField)
+	// 单引号字符串字面量是 SQL 标准的「常量值」语法（跨 PostgreSQL/MSSQL/Oracle 通用），
+	// 必须先于下面的纯列名判断，否则会被当作裸列名误加方言引号
+	// （如 PostgreSQL 下变成 "'tao'"，变成一个不存在的列名而非常量）。
+	if isStringLiteral(sourceField) {
+		return sourceField
 	}
 
-	// SQL 表达式（如 GETDATE()、CAST(...)）或限定名（如 dbo.tbl），保持原样
-	return sourceField
+	// 数字常量（如 "1"、"-1"、"1.5"）不支持作为列名加引号，否则形如 `${SRC_INCR_FIELD} > '${INCR_POINT}'`
+	// 当 incr_field=1 时，1 就会被视为列名，触发 `column "1" does not exist`。
+	// 若顺序颠倒会让小数走到裸标识符分支被错误加引号。
+	if isNumericLiteral(sourceField) {
+		return sourceField
+	}
+
+	// SQL 表达式（如 GETDATE()、CAST(...)）含圆括号，不能加引号，否则会破坏表达式结构，保持原样。
+	if looksLikeExpression(sourceField) {
+		return sourceField
+	}
+
+	// 剩下的纯列名（如 "id"、"user_name"，以及含空格/中文/斜杠等的列名），
+	// 交给 quoteIdentifier 加上方言特定的引号（PostgreSQL 用 ""，MSSQL 用 []）。
+	return quoteIdentifier(sourceField)
 }
 
 // formatProjectionAlias 处理目标列别名。
@@ -268,34 +289,51 @@ func formatProjectionAlias(alias string, quoteIdentifier func(string) string) st
 	return quoteIdentifier(alias)
 }
 
-// isColumnIdentifier 判断 source 字段是否应作为“列标识符”整体加引号。
-// 调用前 formatProjectionSource 已把「已被引用的标识符」提前返回，故此处只需区分
-// 「纯列名」与「SQL 表达式/限定名」。采用保守启发式：只要不含 SQL 表达式特征字符
-// （圆括号、点号），就视为纯列名并加引号——这样即可覆盖含空格、非 ASCII 字符（如中文）、
-// 斜杠等的列名，例如 "Analysis Result Judge"、"故障DC/LC"、"Cost Saving"。
-// 反之：
-//   - 含 "(" 或 ")"：视为函数调用/表达式（如 GETDATE()、CAST(x AS INT)），保持原样不加引号；
-//   - 含 "."：视为限定名（如 dbo.tbl、schema.column），保持原样。
-//   - 整数常量（如 "1"、"-1"）：保持原样不加引号（不支持纯数字列名）。
-//
-// 注意：含圆括号的列名（如 "Price(USD)"、"等級(Level)"）会被当作表达式而不加引号，
-// 这类列名需在配置中预先自行引用（如写成 "[Price(USD)]"）或改用 src_rawsql。
-func isColumnIdentifier(value string) bool {
-	if value == "" {
-		return false
-	}
-	// 整数常量不作为列名加引号，否则形如 `${SRC_INCR_FIELD} > '${INCR_POINT}'`
-	// 当 incr_field=1 时，1 就会被视为列名，触发 `column "1" does not exist`。
-	if _, err := strconv.ParseInt(value, 10, 64); err == nil {
-		return false
-	}
-	return !strings.ContainsAny(value, "().")
+// isStringLiteral 判断字段是否为单引号包裹的 SQL 字符串字面量（如 "'tao'"），
+// 用于在 fields_mapping 中配置常量列：{"'tao'": "src_region"} 生成 'tao' AS src_region。
+// 注意：不处理字面量内部的转义单引号（”），这类取值建议改用 sql / src_rawsql 手写查询。
+func isStringLiteral(value string) bool {
+	return len(value) >= 2 && strings.HasPrefix(value, "'") && strings.HasSuffix(value, "'")
 }
 
-// isAlreadyQuotedIdentifier 判断字符串是否已被引用，防止重复引号。
+// looksLikeExpression 判断字段是否应被当作 SQL 表达式保持原样、不加引号。
+// 采用保守启发式：只要含圆括号就判定为真（如 GETDATE()、CAST(x AS INT)这类函数调用/表达式）。
+//
+// 注意：
+//   - 本心不处理未引用的限定名（如裸 dbo.col）——现实中 fields_mapping 的 key 是投影列，
+//     本质上不存在需要写裸限定名的场景（该写法加上引号会把整个带点号的字符串当成
+//     单一非法标识符）。若确实需要限定引用，请改写成已引用形式（如 "[dbo].[sourceId]"、
+//     `"schema"."column"`），这类写法会被 isAlreadyQuotedIdentifier 识别并原样透传。
+//   - 含圆括号的列名（如 "Price(USD)"、"等級(Level)"）也会被误判为表达式而不加引号，
+//     这类列名需在配置中预先自行包裹（如写成 "[Price(USD)]"）或改用 src_rawsql。
+func looksLikeExpression(value string) bool {
+	return strings.ContainsAny(value, "()")
+}
+
+// isNumericLiteral 判断字段是否为数字常量（如 "1"、"-1"、"1.5"），这类值不支持作为列名加引号，
+// 需保持原样：否则形如 `${SRC_INCR_FIELD} > '${INCR_POINT}'` 当 incr_field=1 时，
+// 1 就会被当作列名加引号，触发 `column "1" does not exist`。
+// 先用 ParseInt 快速命中整数；整数不命中时再用 ParseFloat 补充判断小数/科学记数法，
+// 但排除 ParseFloat 能识别但并非真实数字列名的特殊词（NaN/Inf/Infinity），
+// 避免字面上就是这些词的列名被误判为数字常量而漏掉引号包裹。
+func isNumericLiteral(value string) bool {
+	if _, err := strconv.ParseInt(value, 10, 64); err == nil {
+		return true
+	}
+	if _, err := strconv.ParseFloat(value, 64); err == nil {
+		switch strings.ToLower(value) {
+		case "nan", "inf", "+inf", "-inf", "infinity", "+infinity", "-infinity":
+			return false
+		}
+		return true
+	}
+	return false
+}
+
+// isAlreadyQuotedIdentifier 判断字符串是否已被包裹，防止重复引号。
 // PostgreSQL 风格引号：`"identifier"`
 // MSSQL 风格引号：`[identifier]`
-// 示例：`"UserId"` 或 `[UserId]` 已被引用，无需再加引号。
+// 示例：`"UserId"` 或 `[UserId]` 已被包裹，无需再加引号。
 func isAlreadyQuotedIdentifier(value string) bool {
 	return (strings.HasPrefix(value, `"`) && strings.HasSuffix(value, `"`)) ||
 		(strings.HasPrefix(value, "[") && strings.HasSuffix(value, "]"))

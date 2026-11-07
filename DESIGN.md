@@ -281,6 +281,15 @@ buildReadQuery()             → 追加增量条件 + ORDER BY
 - **占位符模式**：SQL 中包含 `${SRC_INCR_FIELD}` / `${INCR_POINT}` 时，框架仅做字符串替换，不追加额外条件或排序——适合复杂自定义 SQL。
 - **自动模式**：否则框架自动追加 `AND incr_field > 'value'` + `ORDER BY`。
 
+`resolveProjection` 对 `fields_mapping` 的每个 key（源字段）调用 `formatProjectionSource` 做加引号判断，
+按序命中即原样返回，全部不命中才兜底加方言引号（`reader/base.go`）：
+
+1. 已被 `[]` / `""` 包裹的标识符 → 原样返回（防止 `[[x]]` / `""x""` 二次加引号）。
+2. 单引号字符串字面量（如 `'tao'`）→ 原样透传，用于配置常量列（`{"'tao'": "src_region"}` 生成 `'tao' AS src_region`）。
+3. 数字常量（如 `1`、`-1`、`1.5`）→ 原样透传，不支持纯数字列名。
+4. 含圆括号的 SQL 表达式（如 `GETDATE()`、`CAST(x AS INT)`）→ 原样透传。
+5. 其余视为裸列名（含空格/中文/斜杠等）→ 交给 `quoteIdentifier` 按方言加引号。
+
 ### 4.2 类型处理
 
 `Batch` 携带的列元数据直接来自抽取查询自身的结果集描述（`rows.ColumnTypes()`），

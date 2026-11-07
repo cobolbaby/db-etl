@@ -227,10 +227,30 @@ s3:
 `fields_mapping` 的 key（源字段）会按启发式自动加引号：
 
 - **纯列名**（含空格、中文、斜杠等，如 `Analysis Result Judge`、`故障DC/LC`、`Cost Saving`）会自动用方言引号包裹（MSSQL 用 `[]`，PostgreSQL 用 `""`）。
-- **SQL 表达式 / 限定名**（含圆括号或点号，如 `GETDATE()`、`CAST(x AS INT)`、`dbo.sourceId`）会原样透传，不加引号。
-- **已显式引用的标识符**（如 `[Price(USD)]`、`"OrderID"`）会原样保留，不会二次加引号。
+- **SQL 表达式**（含圆括号，如 `GETDATE()`、`CAST(x AS INT)`）会原样透传，不加引号。
+- **已显式引用的标识符**（如 `[Price(USD)]`、`"OrderID"`、`[dbo].[sourceId]`、`"schema"."column"`）会原样保留，不会二次加引号。
+- **单引号字符串字面量**（如 `'tao'`）会原样透传，不当列名处理，用于配置常量列（见下）。
+- **数字常量**（如 `1`、`-1`、`1.5`）会原样透传，不支持纯数字列名。
 
 > ⚠️ **含圆括号的列名需手动引用。** 由于 `Price(USD)`（列名）与 `GETDATE()`（函数）在词法上无法区分，含圆括号的列名（如 `Price(USD)`、`等級(Level)`、`故障原廠MPN(Material MPN)`）会被当作表达式而不加引号，导致 SQL 语法错误。这类列名必须在配置中预先自行引用（MSSQL 写成 `[Price(USD)]`，PostgreSQL 写成 `"Price(USD)"`），或改用 `sql` / `src_rawsql` 手写查询。
+
+### `fields_mapping` 配置常量列
+
+当目标表需要一列固定常量值（如标识数据来源的 `src_region = 'tao'`）而源表并无对应字段时，
+可在 `fields_mapping` 中把 key 写成单引号包裹的字符串字面量，value 仍是目标列名：
+
+```yaml
+fields_mapping:
+  id: order_id
+  "'tao'": src_region # 常量列：生成 'tao' AS src_region，而非把 'tao' 当列名
+```
+
+注意事项：
+
+- YAML 中字符串字面量需要整体加引号（如上例 `"'tao'"`），否则 `'tao'` 会被 YAML 解析成普通字符串 `tao`（外层单引号被 YAML 自身消费掉）。
+- 该写法不支持字面量内部的转义单引号（如 `it's`），遇到这种取值请改用 `sql` / `src_rawsql` 手写查询。
+- 若只是临时想绕开本限制，也可以借助任意返回原值的 SQL 函数达到同样效果（如 `"upper('TAO')"`），
+  但需注意函数会连带改变取值（`upper()` 会转大写），不如直接使用字符串字面量直观可靠。
 
 ### 增量抽取约束
 

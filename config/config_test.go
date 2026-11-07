@@ -75,7 +75,7 @@ func TestFieldsMappingRejectsNonObjectJSON(t *testing.T) {
 
 func TestFieldsMappingValidateReturnsWarnings(t *testing.T) {
 	// 告警只针对「会被 reader 当作限定名/表达式而不加引号」的源字段。
-	// 含空格、连字符等字符的列名仍会被 isColumnIdentifier 识别为纯列名并加引号，
+	// 含空格、连字符等字符的列名仍会被 reader 的列标识符启发式判断为纯列名并加引号，
 	// 属于可正常工作的场景，不应打扰用户。
 	cases := []struct {
 		source   string
@@ -86,7 +86,7 @@ func TestFieldsMappingValidateReturnsWarnings(t *testing.T) {
 		{source: "now()", wantWarn: false, reason: "函数调用，圆括号已表明是表达式"},
 		{source: "price - cost", wantWarn: false, reason: "算术表达式"},
 		{source: "Another-Field", wantWarn: false, reason: "连字符与减号无法区分，reader 会加引号，故不告警"},
-		{source: "source.field", wantWarn: true, reason: "点号会被当作限定名，不会加引号"},
+		{source: "source.field", wantWarn: true, reason: "点号非表达式特征字符，reader 会整体加引号变成字面含点号的列名，很可能不是预期列"},
 		{source: "order#id", wantWarn: true, reason: "特殊字符既非表达式也非合法标识符"},
 	}
 

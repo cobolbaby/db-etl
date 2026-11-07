@@ -25,9 +25,9 @@ func TestBuildWhereClauseDefaultsToAlwaysTrue(t *testing.T) {
 func TestResolveProjectionForMSSQL(t *testing.T) {
 	source := &config.SourceConfig{
 		FieldsMapping: config.FieldsMapping{Items: map[string]string{
-			"CamelCase":    "TargetName",
-			"GETDATE()":    "cdt",
-			"dbo.sourceId": "ID",
+			"CamelCase":        "TargetName",
+			"GETDATE()":        "cdt",
+			"[dbo].[sourceId]": "ID",
 		}},
 	}
 
@@ -40,7 +40,7 @@ func TestResolveProjectionForMSSQL(t *testing.T) {
 	for _, want := range []string{
 		"[CamelCase] AS [TargetName]",
 		"GETDATE() AS [cdt]",
-		"dbo.sourceId AS [ID]",
+		"[dbo].[sourceId] AS [ID]",
 	} {
 		if !strings.Contains(projection, want) {
 			t.Fatalf("projection %q does not contain %q", projection, want)
@@ -55,7 +55,7 @@ func TestResolveProjectionQuotesSpacedAndUnicodeColumns(t *testing.T) {
 			"Cost Saving":           "cost_saving",
 			"故障DC/LC":               "dclc",
 			"GETDATE()":             "cdt",
-			"dbo.sourceId":          "ID",
+			"[dbo].[sourceId]":      "ID",
 		}},
 	}
 
@@ -68,9 +68,9 @@ func TestResolveProjectionQuotesSpacedAndUnicodeColumns(t *testing.T) {
 	for _, want := range []string{
 		"[Analysis Result Judge] AS [analysis_result_judge]", // 含空格的列名须加方括号
 		"[Cost Saving] AS [cost_saving]",
-		"[故障DC/LC] AS [dclc]",  // 含中文与斜杠的列名须加方括号
-		"GETDATE() AS [cdt]",   // 表达式保持原样
-		"dbo.sourceId AS [ID]", // 限定名保持原样
+		"[故障DC/LC] AS [dclc]",      // 含中文与斜杠的列名须加方括号
+		"GETDATE() AS [cdt]",       // 表达式保持原样
+		"[dbo].[sourceId] AS [ID]", // 已显式引用的限定名保持原样
 	} {
 		if !strings.Contains(projection, want) {
 			t.Fatalf("projection %q does not contain %q", projection, want)
@@ -109,9 +109,9 @@ func TestResolveProjectionDoesNotDoubleQuoteAlreadyQuoted(t *testing.T) {
 func TestResolveProjectionForPostgres(t *testing.T) {
 	source := &config.SourceConfig{
 		FieldsMapping: config.FieldsMapping{Items: map[string]string{
-			"CamelCase":      "TargetName",
-			"now()":          "cdt",
-			"public.OrderID": "OrderID",
+			"CamelCase":          "TargetName",
+			"now()":              "cdt",
+			`"public"."OrderID"`: "OrderID",
 		}},
 	}
 
@@ -124,10 +124,86 @@ func TestResolveProjectionForPostgres(t *testing.T) {
 	for _, want := range []string{
 		`"CamelCase" AS "TargetName"`,
 		`now() AS "cdt"`,
-		`public.OrderID AS "OrderID"`,
+		`"public"."OrderID" AS "OrderID"`,
 	} {
 		if !strings.Contains(projection, want) {
 			t.Fatalf("projection %q does not contain %q", projection, want)
+		}
+	}
+}
+
+func TestResolveProjectionQuotesUnquotedDottedFieldAsWholeIdentifier(t *testing.T) {
+	// 未加引用的限定名（如裸写 dbo.sourceId）不再被当作限定名特殊处理——
+	// 现实中 fields_mapping 的 key 是投影列，本就不存在需要裸写限定名的场景；
+	// 整个字符串（含点号）会被当作一个普通列名整体加引号。
+	// 真要表达限定引用，请改用已引用形式（如 "[dbo].[sourceId]"），参见其他用例。
+	source := &config.SourceConfig{
+		FieldsMapping: config.FieldsMapping{Items: map[string]string{
+			"dbo.sourceId": "ID",
+		}},
+	}
+
+	reader := &BaseReader{Source: source, dialect: mssqlDialect{}}
+	projection, err := reader.resolveProjection()
+	if err != nil {
+		t.Fatalf("resolveProjection returned error: %v", err)
+	}
+
+	if want := "[dbo.sourceId] AS [ID]"; !strings.Contains(projection, want) {
+		t.Fatalf("projection %q does not contain %q", projection, want)
+	}
+}
+
+func TestResolveProjectionSupportsStringLiteralConstant(t *testing.T) {
+	// 配置常量列：源字段是单引号包裹的字符串字面量，不是真实列名。
+	source := &config.SourceConfig{
+		FieldsMapping: config.FieldsMapping{Items: map[string]string{
+			"id":    "order_id",
+			"'tao'": "src_region",
+		}},
+	}
+
+	for _, tc := range []struct {
+		name    string
+		dialect readerDialect
+		want    string
+	}{
+		{name: "mssql", dialect: mssqlDialect{}, want: "'tao' AS [src_region]"},
+		{name: "postgres", dialect: pgDialect{}, want: `'tao' AS "src_region"`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			reader := &BaseReader{Source: source, dialect: tc.dialect}
+			projection, err := reader.resolveProjection()
+			if err != nil {
+				t.Fatalf("resolveProjection returned error: %v", err)
+			}
+			if !strings.Contains(projection, tc.want) {
+				t.Fatalf("projection %q does not contain %q", projection, tc.want)
+			}
+			if strings.Contains(projection, `"'tao'"`) || strings.Contains(projection, `['tao']`) {
+				t.Fatalf("projection %q incorrectly quoted string literal as identifier", projection)
+			}
+		})
+	}
+}
+
+func TestIsNumericLiteralSupportsIntegersAndDecimals(t *testing.T) {
+	for _, tc := range []struct {
+		value string
+		want  bool
+	}{
+		{"1", true},
+		{"-1", true},
+		{"1.5", true},
+		{"-1.5", true},
+		{"1e10", true},
+		{"inf", false},
+		{"nan", false},
+		{"id", false},
+		{"dbo.sourceId", false},
+	} {
+		if got := isNumericLiteral(tc.value); got != tc.want {
+			t.Fatalf("isNumericLiteral(%q) = %v, want %v", tc.value, got, tc.want)
 		}
 	}
 }

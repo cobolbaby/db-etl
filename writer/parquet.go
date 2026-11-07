@@ -17,7 +17,7 @@ import (
 )
 
 // parquetWriterDialect 将 Batch 序列化为 parquet 并流式上传到对象存储。
-//   - full/initial：覆盖写单个 <table>.parquet 对象（每次全量刷新，不分卷）。
+//   - full：覆盖写单个 <table>.parquet 对象（每次全量刷新，不分卷）。
 //   - append/merge：每次增量写一个以起点水位命名的对象，并把水位写回 manager.job_data_sync；
 //     当 commit_batch_size>0 且可写回水位时改为分段断点续传，每块独立成对象并逐块提交水位
 //     （见 writeChunkedObjects）。
@@ -72,52 +72,17 @@ func (d *parquetWriterDialect) close(ctx context.Context) error {
 	return d.metaConn.Close(ctx)
 }
 
-// recordSyncResult 登记最近一次同步结果到 manager.job_data_sync.last_status。
-//
-// best-effort（尽力而为）：last_status 仅供监控/观测，写不回不影响“数据是否已上传”。
-// 下列三种“无处可记”情形均不报错、不阻断主流程：
-//   1. 未配置 meta_db（metaConn 为 nil）：无处存放状态，直接跳过。
-//   2. manager.job_data_sync 表不存在（42P01）：meta_db 未建 DTS 配置表，跳过。
-//   3. 表存在但无匹配行（affected==0）：该 源+目标 组合未被登记进配置表，仅记日志。
-func (d *parquetWriterDialect) recordSyncResult(ctx context.Context, source *config.SourceConfig, status int) error {
-	if d.metaConn == nil {
-		return nil
-	}
-	affected, err := execUpdateLastStatus(ctx, d.metaConn, status, d.target, source, d.jobName)
-	if err != nil {
-		if util.IsPgUndefinedTable(err) {
-			return nil
-		}
-		return err
-	}
-	if affected == 0 {
-		log.Printf("no matching job_data_sync row to record last_status=%d (job=%s table=%s)",
-			status, watermarkJobName(d.jobName), d.target.Table)
-	}
-	return nil
-}
-
-func (d *parquetWriterDialect) writeInitial(ctx context.Context, in <-chan reader.Batch, source *config.SourceConfig) error {
+func (d *parquetWriterDialect) writeFull(ctx context.Context, in <-chan reader.Batch, truncate bool) error {
 	target := d.target
-	jobName := d.jobName
-	// initial 视为一次性全量：覆盖写单对象；成功后置 inuse=false，避免下次重复回填。
-	if _, err := d.writeSingleObject(ctx, in, defaultObjectKey(target), source); err != nil {
-		return err
-	}
-	if d.metaConn != nil {
-		if _, err := execDeactivateInitialJob(ctx, d.metaConn, target, source, jobName); err != nil {
-			return err
-		}
-		log.Printf("initial parquet task done, set inuse=false (table=%s)", target.Table)
-	}
-	return nil
-}
-
-func (d *parquetWriterDialect) writeFull(ctx context.Context, in <-chan reader.Batch) error {
-	target := d.target
-	// full 全量刷新：覆盖写单对象。无水位、无 source 依赖。
+	// truncate 参数在 parquet 目标上无意义：每次都是整体覆盖同一个对象 key，因此忽略该参数。
 	_, err := d.writeSingleObject(ctx, in, defaultObjectKey(target), nil)
 	return err
+}
+
+// TODO: 多 source 合并写同一个 s3 目标时，后一个 source 依旧会整体覆盖前一个
+// 写入的对象（与 full 行为一致），该场景目前仅在 DB 目标上得到修复。
+func (d *parquetWriterDialect) truncateTarget(ctx context.Context) error {
+	return nil
 }
 
 func (d *parquetWriterDialect) writeAppend(ctx context.Context, in <-chan reader.Batch, source *config.SourceConfig) error {
@@ -131,7 +96,7 @@ func (d *parquetWriterDialect) writeMerge(ctx context.Context, in <-chan reader.
 	return d.writeIncremental(ctx, in, source)
 }
 
-// writeIncremental 每次增量写一个新对象，并把最大水位写回 manager。
+// writeIncremental 每次增量写一个新对象，并把最大水位写回指针表。
 //
 // 当 target.CommitBatchSize > 0 且可写回水位时切换为分段断点续传（见 writeChunkedObjects）：
 // 每满 CommitBatchSize 个 batch 收尾一个对象并提交其水位，中断后重跑从上次已提交的断点续传，
@@ -259,7 +224,7 @@ func (d *parquetWriterDialect) writeChunkedObjects(ctx context.Context, in <-cha
 // 流式写入对象存储的单个对象（经 io.Pipe 边序列化边上传，不落本地临时文件）。
 // parquet schema 根节点名复用目标表名。
 //
-// full/initial 全量与「不满足断点续传条件」的增量都走这里：整段写完后一次性收尾。
+// full 全量与「不满足断点续传条件」的增量都走这里：整段写完后一次性收尾。
 // 增量的分段断点续传见 writeChunkedObjects。
 //
 // 若 source 非 nil 且含增量字段，返回其最大值作为水位。
@@ -445,6 +410,30 @@ func (e *parquetEncoder) watermark() string {
 	return reader.FormatText(e.incrKind, e.maxVal)
 }
 
+func (d *parquetWriterDialect) finalizeSyncResult(ctx context.Context, source *config.SourceConfig, status int, once bool) error {
+	if d.metaConn == nil {
+		return nil
+	}
+	target := d.target
+	affected, err := execFinalizeSyncResult(ctx, d.metaConn, status, once, target, source, d.jobName)
+	if err != nil {
+		if util.IsPgUndefinedTable(err) {
+			return nil
+		}
+		return err
+	}
+	funcName := watermarkJobName(d.jobName)
+	if affected == 0 {
+		log.Printf("no matching job_data_sync row to record last_status=%d (job=%s table=%s)",
+			status, funcName, target.Table)
+		return nil
+	}
+	if once && status == SyncStatusSuccess {
+		log.Printf("once task done, set inuse=false (job=%s table=%s)", funcName, target.Table)
+	}
+	return nil
+}
+
 // parquetPart 封装单个 parquet 对象的写入生命周期：io.Pipe + 上传协程 + GenericWriter。
 // dialect 往 pw 写行，上传协程从 pipe 读端流式 PUT 到对象存储，避免"先落本地临时文件再上传"的二次写入。
 type parquetPart struct {
@@ -615,7 +604,7 @@ func rawWatermarkGreater(kind reader.ColumnKind, a, cur any) bool {
 	return reader.FormatText(kind, a) > reader.FormatText(kind, cur)
 }
 
-// defaultObjectKey 返回 full/initial 模式覆盖写的单对象 key（<table>.parquet）；前缀由 s3Store 追加。
+// defaultObjectKey 返回 full 模式覆盖写的单对象 key（<table>.parquet）；前缀由 s3Store 追加。
 // 表名已在配置加载阶段校验（见 config.ValidateTableName），仅含字母、数字、'_'、'.'，可直接拼接。
 func defaultObjectKey(target *config.TargetConfig) string {
 	return target.Table + ".parquet"

@@ -218,10 +218,13 @@ const (
 	SyncStatusFailed  = 1
 )
 
-// execUpdateLastStatus 把最近一次同步结果写回 manager.job_data_sync.last_status：
-// 按 (job_name + 源标识 + 目标标识) 定位记录（与 upsertWatermark 一致），命中则更新并返回受影响行数。
+// execFinalizeSyncResult 把最近一次同步结果写回 manager.job_data_sync.last_status，
+// 并在 once=true 且本次同步成功（status==SyncStatusSuccess）时，于同一条 UPDATE 里
+// 顺带将 inuse 置为 false（避免下次调度重复执行该 once 任务）——
+// 两者定位记录的 WHERE 条件完全相同（job_name + 源标识 + 目标标识，与 upsertWatermark 一致），
+// 合并为一条语句既省一次往返，也省去「状态已记但下线失败」或反过来的半成功组合。
 // ex 可传入 pgx.Tx（PG writer）或 *pgx.Conn（parquet writer）。
-func execUpdateLastStatus(ctx context.Context, ex pgxExecutor, status int, target *config.TargetConfig, source *config.SourceConfig, jobName string) (int64, error) {
+func execFinalizeSyncResult(ctx context.Context, ex pgxExecutor, status int, once bool, target *config.TargetConfig, source *config.SourceConfig, jobName string) (int64, error) {
 	funcName := watermarkJobName(jobName)
 	src, err := sourceIdentity(source)
 	if err != nil {
@@ -232,6 +235,9 @@ func execUpdateLastStatus(ctx context.Context, ex pgxExecutor, status int, targe
 		return 0, err
 	}
 
+	// inuse 仅在 once=true 且本次成功时置为 false，否则保持原值不变。
+	deactivate := once && status == SyncStatusSuccess
+
 	// 与 upsertWatermark 保持一致：仅约束本次运行实际携带的连接标识（参数为空则不约束该列）。
 	var tag pgconn.CommandTag
 	if src.RawSQL != "" {
@@ -239,15 +245,16 @@ func execUpdateLastStatus(ctx context.Context, ex pgxExecutor, status int, targe
 			ctx,
 			`UPDATE manager.job_data_sync
 			    SET last_status = $1,
+			        inuse       = CASE WHEN $2 THEN false ELSE inuse END,
 			        udt         = now()
-			  WHERE job_name        = $2
-			    AND src_db_name     = $3
-			    AND src_rawsql      = $4
-			    AND dst_schema_name = $5
-			    AND dst_table_name  = $6
-			    AND ($7::int IS NULL OR src_conn_id = $7::int)
-			    AND ($8::text IS NULL OR src_conn_name = $8::text)`,
-			status, funcName, src.Database, src.RawSQL, dst.Schema, dst.Table,
+			  WHERE job_name        = $3
+			    AND src_db_name     = $4
+			    AND src_rawsql      = $5
+			    AND dst_schema_name = $6
+			    AND dst_table_name  = $7
+			    AND ($8::int IS NULL OR src_conn_id = $8::int)
+			    AND ($9::text IS NULL OR src_conn_name = $9::text)`,
+			status, deactivate, funcName, src.Database, src.RawSQL, dst.Schema, dst.Table,
 			src.ConnID, src.ConnName,
 		)
 	} else {
@@ -255,16 +262,17 @@ func execUpdateLastStatus(ctx context.Context, ex pgxExecutor, status int, targe
 			ctx,
 			`UPDATE manager.job_data_sync
 			    SET last_status = $1,
+			        inuse       = CASE WHEN $2 THEN false ELSE inuse END,
 			        udt         = now()
-			  WHERE job_name        = $2
-			    AND src_db_name     = $3
-			    AND src_schema_name = $4
-			    AND src_table_name  = $5
-			    AND dst_schema_name = $6
-			    AND dst_table_name  = $7
-			    AND ($8::int IS NULL OR src_conn_id = $8::int)
-			    AND ($9::text IS NULL OR src_conn_name = $9::text)`,
-			status, funcName, src.Database, src.Schema, src.Table, dst.Schema, dst.Table,
+			  WHERE job_name        = $3
+			    AND src_db_name     = $4
+			    AND src_schema_name = $5
+			    AND src_table_name  = $6
+			    AND dst_schema_name = $7
+			    AND dst_table_name  = $8
+			    AND ($9::int IS NULL OR src_conn_id = $9::int)
+			    AND ($10::text IS NULL OR src_conn_name = $10::text)`,
+			status, deactivate, funcName, src.Database, src.Schema, src.Table, dst.Schema, dst.Table,
 			src.ConnID, src.ConnName,
 		)
 	}
@@ -337,59 +345,4 @@ func readWatermarkPoint(ctx context.Context, ex pgxExecutor, target *config.Targ
 		return "", err
 	}
 	return wm, nil
-}
-
-// execDeactivateInitialJob 将 manager.job_data_sync 中匹配记录置为 inuse=false，返回受影响行数。
-// initial（首次全量）成功后调用，避免下次重复回填。ex 可为事务或独立连接。
-func execDeactivateInitialJob(ctx context.Context, ex pgxExecutor, target *config.TargetConfig, source *config.SourceConfig, jobName string) (int64, error) {
-	funcName := watermarkJobName(jobName)
-	src, err := sourceIdentity(source)
-	if err != nil {
-		return 0, err
-	}
-	dst, err := targetIdentity(target)
-	if err != nil {
-		return 0, err
-	}
-
-	// 与 upsertWatermark 保持一致：仅约束本次运行实际携带的连接标识（参数为空则不约束该列）。
-	var tag pgconn.CommandTag
-	if src.RawSQL != "" {
-		tag, err = ex.Exec(
-			ctx,
-			`UPDATE manager.job_data_sync
-			    SET inuse = false,
-			        udt   = now()
-			  WHERE job_name        = $1
-			    AND src_db_name     = $2
-			    AND src_rawsql      = $3
-			    AND dst_schema_name = $4
-			    AND dst_table_name  = $5
-			    AND ($6::int IS NULL OR src_conn_id = $6::int)
-			    AND ($7::text IS NULL OR src_conn_name = $7::text)`,
-			funcName, src.Database, src.RawSQL, dst.Schema, dst.Table,
-			src.ConnID, src.ConnName,
-		)
-	} else {
-		tag, err = ex.Exec(
-			ctx,
-			`UPDATE manager.job_data_sync
-			    SET inuse = false,
-			        udt   = now()
-			  WHERE job_name        = $1
-			    AND src_db_name     = $2
-			    AND src_schema_name = $3
-			    AND src_table_name  = $4
-			    AND dst_schema_name = $5
-			    AND dst_table_name  = $6
-			    AND ($7::int IS NULL OR src_conn_id = $7::int)
-			    AND ($8::text IS NULL OR src_conn_name = $8::text)`,
-			funcName, src.Database, src.Schema, src.Table, dst.Schema, dst.Table,
-			src.ConnID, src.ConnName,
-		)
-	}
-	if err != nil {
-		return 0, util.WrapPgError(err)
-	}
-	return tag.RowsAffected(), nil
 }

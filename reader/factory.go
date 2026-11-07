@@ -14,11 +14,11 @@ import (
 )
 
 func NewReader(db config.DBConfig, src *config.SourceConfig) (Reader, error) {
-	// initial（首次全量）模式单次可能回填上亿行，顺扫耗时较长。
+	// once=true 任务单次可能回填上亿行，顺扫耗时较长。
 	// 未显式配置 statement_timeout（0）时，采用 2 小时的宽松默认，避免误触发超时；
-	// 其他模式不覆盖，延用数据库端默认配置。
-	if src != nil && src.Mode == config.ModeTypeInitial && db.StatementTimeout == 0 {
-		db.StatementTimeout = config.InitialModeDefaultTimeoutSec
+	// 其他任务不覆盖，延用数据库端默认配置。
+	if src != nil && src.Once && db.StatementTimeout == 0 {
+		db.StatementTimeout = config.OnceDefaultTimeoutSec
 	}
 
 	// loc 由源库配置的 timezone 解析而来，供把无时区时间列的墙钟解释为源库所在时区。

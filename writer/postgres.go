@@ -55,7 +55,7 @@ func drainFirstBatch(in <-chan reader.Batch) (reader.Batch, bool) {
 	return reader.Batch{}, false
 }
 
-func (d *pgWriterDialect) writeFull(ctx context.Context, in <-chan reader.Batch) error {
+func (d *pgWriterDialect) writeFull(ctx context.Context, in <-chan reader.Batch, truncate bool) error {
 	target := d.target
 
 	firstBatch, foundRows := drainFirstBatch(in)
@@ -71,31 +71,24 @@ func (d *pgWriterDialect) writeFull(ctx context.Context, in <-chan reader.Batch)
 	if err != nil {
 		return err
 	}
-	defer tx.Rollback(ctx)
+	// 用闭包引用 tx 变量本身而非在 defer 语句执行时求值：truncateOrDeleteTarget 可能
+	// 把 tx 重新赋值为退避开出的新事务（newTx）。若在此处像 `defer tx.Rollback(ctx)`
+	// 那样提前求值，一旦退避路径里 newTx 的 DELETE 执行失败并提前 return，
+	// 回滚就仍绑定在旧的 tx 上，newTx 永远不会被回滚/提交，造成事务和锁泄漏。
+	// 闭包延迟到函数实际返回时才读取 tx 的当前值，覆盖所有分支。
+	defer func() { tx.Rollback(ctx) }()
 
-	// 尝试带超时的 TRUNCATE；若锁等待超时则回滚当前事务，开新事务用 DELETE FROM 退避
-	if err := d.tryTruncateWithTimeout(ctx, tx, target); err != nil {
-		if !util.IsPgLockTimeout(err) {
-			return util.WrapPgError(err)
-		}
-
-		log.Printf("table=%s TRUNCATE lock timeout, falling back to DELETE FROM", target.Table)
-
-		_ = tx.Rollback(ctx)
-
-		tx, err = d.conn.Begin(ctx)
+	// truncate=false 时跳过清空：用于一个 task 下多个 source 合并写同一目标表的场景，
+	// 整个 task 只在 source 循环开始前（main.go runTask）单独清空一次，
+	// 每个 source 的 writeFull 调用都只做 COPY，避免后一个 source 把前一个刚写入的数据清掉。
+	if truncate {
+		tx, err = d.truncateOrDeleteTarget(ctx, tx)
 		if err != nil {
 			return err
 		}
-		defer tx.Rollback(ctx)
-
-		if _, err := tx.Exec(ctx, fmt.Sprintf("DELETE FROM %s", target.Table)); err != nil {
-			return util.WrapPgError(err)
-		}
-		log.Printf("table=%s DELETE FROM completed", target.Table)
 	}
 
-	// 使用事务所在连接执行 COPY，确保 COPY 与清表操作在同一事务内原子提交。
+	// 使用事务所在连接执行 COPY；truncate=true 时与清表操作同事务原子提交。
 	if foundRows {
 		if err := d.writeCopyWithFirstBatch(ctx, firstBatch, in, target.Table, tx.Conn()); err != nil {
 			return err
@@ -108,76 +101,71 @@ func (d *pgWriterDialect) writeFull(ctx context.Context, in <-chan reader.Batch)
 	return tx.Commit(ctx)
 }
 
-func (d *pgWriterDialect) writeInitial(ctx context.Context, in <-chan reader.Batch, source *config.SourceConfig) error {
+// truncateOrDeleteTarget 在给定事务内尝试 TRUNCATE，超时退避为 DELETE FROM；
+// 若发生退避会回滚传入的事务并开一个新事务执行 DELETE。返回值是最终真正执行了
+// 清空操作的事务，调用方应基于它继续后续操作并自行提交/回滚。
+func (d *pgWriterDialect) truncateOrDeleteTarget(ctx context.Context, tx pgx.Tx) (pgx.Tx, error) {
 	target := d.target
-	jobName := d.jobName
-	firstBatch, foundRows := drainFirstBatch(in)
 
-	// COPY 与「任务下线」放在同一事务内提交，保证 initial（首次全量）回填成功后
-	// job_data_sync 才被置为 inuse=false，避免下次重复回填上亿行。
+	// 尝试带超时的 TRUNCATE；若锁等待超时则回滚当前事务，开新事务用 DELETE FROM 退避。
+	if err := d.tryTruncateWithTimeout(ctx, tx, target); err != nil {
+		if !util.IsPgLockTimeout(err) {
+			return tx, util.WrapPgError(err)
+		}
+
+		log.Printf("table=%s TRUNCATE lock timeout, falling back to DELETE FROM", target.Table)
+
+		_ = tx.Rollback(ctx)
+
+		newTx, beginErr := d.conn.Begin(ctx)
+		if beginErr != nil {
+			return nil, beginErr
+		}
+
+		if _, err := newTx.Exec(ctx, fmt.Sprintf("DELETE FROM %s", target.Table)); err != nil {
+			return newTx, util.WrapPgError(err)
+		}
+		log.Printf("table=%s DELETE FROM completed", target.Table)
+		return newTx, nil
+	}
+
+	return tx, nil
+}
+
+// tryTruncateWithTimeout 尝试在事务内执行带 lock_timeout 的 TRUNCATE。
+// 若 TRUNCATE 因锁等待超时失败，返回 lock_timeout 错误（55P03），由调用方决定后续退避策略。
+// timeout > 0 时设置 lock_timeout，timeout <= 0 时不设超时直接 TRUNCATE。
+func (d *pgWriterDialect) tryTruncateWithTimeout(ctx context.Context, tx pgx.Tx, target *config.TargetConfig) error {
+	timeout := target.TruncateTimeout
+
+	if timeout > 0 {
+		if _, err := tx.Exec(ctx, fmt.Sprintf("SET LOCAL lock_timeout = '%ds'", timeout)); err != nil {
+			return err
+		}
+	}
+
+	_, err := tx.Exec(ctx, fmt.Sprintf("TRUNCATE TABLE %s", target.Table))
+	return err
+}
+
+// truncateTarget 独立执行一次清空（不写入任何数据），供多 source 的 full 任务在
+// source 循环开始前调用一次：整个 task 只清空一次目标表，随后每个 source 的
+// writeFull 都以 truncate=false 调用，只做 COPY，避免互相清空对方写入的数据。
+func (d *pgWriterDialect) truncateTarget(ctx context.Context) error {
 	tx, err := d.conn.Begin(ctx)
 	if err != nil {
 		return err
 	}
-	defer tx.Rollback(ctx)
+	// 原因同 writeFull：闭包延迟读取 tx，避免 truncateOrDeleteTarget 把 tx 重新赋值为
+	// newTx 后、因错误提前 return 导致 newTx 未被回滚而泄漏事务/锁。
+	defer func() { tx.Rollback(ctx) }()
 
-	if foundRows {
-		if err := d.writeCopyWithFirstBatch(ctx, firstBatch, in, target.Table, tx.Conn()); err != nil {
-			return err
-		}
-	} else {
-		log.Printf("table=%s no rows to copy, skip", target.Table)
-	}
-
-	if err := d.deactivateInitialJob(ctx, tx, target, source, jobName); err != nil {
+	tx, err = d.truncateOrDeleteTarget(ctx, tx)
+	if err != nil {
 		return err
 	}
 
 	return tx.Commit(ctx)
-}
-
-// deactivateInitialJob 在 initial 模式成功后，将 manager.job_data_sync 中对应记录置为
-// inuse=false，避免下次运行重复执行首次全量回填。
-//
-// 与 updateWatermark 一致，按 (job_name + 源标识 + 目标标识) 定位记录，无需外层透传 job_id。
-// 若没有匹配到记录（如纯 config.yaml 任务），RowsAffected 为 0，视为无操作。
-func (d *pgWriterDialect) deactivateInitialJob(ctx context.Context, tx pgx.Tx, target *config.TargetConfig, source *config.SourceConfig, jobName string) error {
-	affected, err := execDeactivateInitialJob(ctx, tx, target, source, jobName)
-	if err != nil {
-		return err
-	}
-	funcName := watermarkJobName(jobName)
-	if affected == 0 {
-		log.Printf("initial task done but no matching job_data_sync row (job=%s table=%s), inuse unchanged", funcName, target.Table)
-		return nil
-	}
-	log.Printf("initial task done, set inuse=false (job=%s table=%s)", funcName, target.Table)
-	return nil
-}
-
-// recordSyncResult 登记最近一次同步结果到 manager.job_data_sync.last_status。
-// PG/GP 目标要求 manager.job_data_sync 与目标表在同一数据库实例，故直接复用目标连接
-// （d.conn）执行独立 UPDATE，无需像 parquet writer 那样另建 meta_db 连接。
-//
-// best-effort（尽力而为）：last_status 仅供监控/观测，写不写得进去不影响“数据是否已同步”
-// 这个事实，因此下列两种“无处可记”情形均不报错、不阻断主流程：
-//  1. 表本身不存在（42P01）：任务完全定义在 config.yaml、且目标库未建 manager.job_data_sync
-//     这张 DTS 配置表（纯 config 任务，不依赖 meta_db）——根本无配置表可写，跳过。
-//  2. 表存在但无匹配行（affected==0）：该 源+目标 组合未被登记进 DTS 配置表
-//     （例如仅在 yaml 里配了任务、未往配置表插记录），无行可更新，仅记日志。
-func (d *pgWriterDialect) recordSyncResult(ctx context.Context, source *config.SourceConfig, status int) error {
-	affected, err := execUpdateLastStatus(ctx, d.conn, status, d.target, source, d.jobName)
-	if err != nil {
-		if util.IsPgUndefinedTable(err) {
-			return nil
-		}
-		return err
-	}
-	if affected == 0 {
-		log.Printf("no matching job_data_sync row to record last_status=%d (job=%s table=%s)",
-			status, watermarkJobName(d.jobName), d.target.Table)
-	}
-	return nil
 }
 
 func (d *pgWriterDialect) writeCopyWithFirstBatch(ctx context.Context, firstBatch reader.Batch, in <-chan reader.Batch, table string, conn *pgx.Conn) error {
@@ -547,22 +535,6 @@ func (d *pgWriterDialect) createTempTable(ctx context.Context, tx pgx.Tx, stagin
 	return util.WrapPgError(err)
 }
 
-// tryTruncateWithTimeout 尝试在事务内执行带 lock_timeout 的 TRUNCATE。
-// 若 TRUNCATE 因锁等待超时失败，返回 lock_timeout 错误（55P03），由调用方决定后续退避策略。
-// timeout > 0 时设置 lock_timeout，timeout <= 0 时不设超时直接 TRUNCATE。
-func (d *pgWriterDialect) tryTruncateWithTimeout(ctx context.Context, tx pgx.Tx, target *config.TargetConfig) error {
-	timeout := target.TruncateTimeout
-
-	if timeout > 0 {
-		if _, err := tx.Exec(ctx, fmt.Sprintf("SET LOCAL lock_timeout = '%ds'", timeout)); err != nil {
-			return err
-		}
-	}
-
-	_, err := tx.Exec(ctx, fmt.Sprintf("TRUNCATE TABLE %s", target.Table))
-	return err
-}
-
 func (d *pgWriterDialect) deleteTarget(
 	ctx context.Context,
 	tx pgx.Tx,
@@ -653,6 +625,32 @@ func (d *pgWriterDialect) getWatermark(source *config.SourceConfig) (string, err
 	}
 
 	return wm, nil
+}
+
+// finalizeSyncResult 登记最近一次同步结果到 job_data_sync.last_status；
+// once=true 且本次成功时顺带把 inuse 置为 false，避免下次调度重复执行。PG/GP 数据表与
+// job_data_sync 同实例，故直接复用目标连接（d.conn），无需像 parquet writer
+// 那样另建 meta_db 连接。
+func (d *pgWriterDialect) finalizeSyncResult(ctx context.Context, source *config.SourceConfig, status int, once bool) error {
+	target := d.target
+	jobName := d.jobName
+	affected, err := execFinalizeSyncResult(ctx, d.conn, status, once, target, source, jobName)
+	if err != nil {
+		if util.IsPgUndefinedTable(err) {
+			return nil
+		}
+		return err
+	}
+	funcName := watermarkJobName(jobName)
+	if affected == 0 {
+		log.Printf("no matching job_data_sync row to record last_status=%d (job=%s table=%s)",
+			status, funcName, target.Table)
+		return nil
+	}
+	if once && status == SyncStatusSuccess {
+		log.Printf("once task done, set inuse=false (job=%s table=%s)", funcName, target.Table)
+	}
+	return nil
 }
 
 // defaultIncrPoint 根据字段名推断兜底的增量起点：

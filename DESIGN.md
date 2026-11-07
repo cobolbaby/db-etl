@@ -72,7 +72,7 @@ BaseReader { conn, Source, dialect readerDialect }
   └── oracleDialect  → ...
 
 BaseWriter { Target, JobName, dialect writerDialect }
-  ├── pgWriterDialect      → writeInitial / writeFull / writeAppend / writeMerge / getWatermark
+  ├── pgWriterDialect      → writeFull / writeAppend / writeMerge / getWatermark / finalizeSyncResult
   └── parquetWriterDialect → 同上，落地到 S3 对象存储
 ```
 
@@ -107,43 +107,15 @@ BaseWriter { Target, JobName, dialect writerDialect }
 
 ## 3. 同步模式实现详解
 
-### 3.1 Copy 模式
+### 3.1 Full 模式
 
-最简单的写入路径，适合一次性导入或外部保证幂等的场景。
-
-```
-Reader → Transformer → [io.Pipe] → PgConn.CopyFrom(STDIN)
-```
-
-**实现技巧：**
-
-| 技巧                | 原理                                                                          |
-| ------------------- | ----------------------------------------------------------------------------- |
-| `io.Pipe` 流式传输  | 生产端（CSV 编码）和消费端（COPY 协议）通过 pipe 连接，数据不落盘、不缓存全量 |
-| 4MB 写缓冲          | `bytes.Buffer` 初始 4MB，累积到 3MB flush 一次，减少 `write()` 系统调用       |
-| COPY goroutine 异步 | COPY 消费在独立 goroutine，生产阻塞即为背压信号                               |
-| NULL 哨兵           | COPY 的 CSV 格式无法区分「空字符串」与「NULL」，故改用哨兵文本（见下）        |
-
-**CSV 编码位置：**`writer/pgcopy.go` 集中了 COPY 格式的全部知识（`encodeCopyValue` / `sanitizeCSV`），
-在 COPY 写入时才把 `any` 编码为字段文本；`reader` 与 `transform` 对此一无所知。
-
-| 环节            | 处理                                                                      |
-| --------------- | ------------------------------------------------------------------------- |
-| NULL            | 编码为 `__DB_ETL_NULL__` 哨兵，`COPY ... NULL '__DB_ETL_NULL__'` 据此识别 |
-| 空字符串        | 仍编码为空字段，与 NULL 彻底分开（能正确触发 NOT NULL 约束）              |
-| 二进制（bytea） | 输出 `\x` 十六进制字面量                                                  |
-| 控制字符        | 剔除会破坏 CSV 结构的不可见字符（保留 \t \n \r 交由引号包裹）             |
-| 哨兵撞车        | 源数据恰好等于哨兵文本时强制加引号，确保作为普通文本入库                  |
-
----
-
-### 3.2 Full 模式
-
-全量覆盖，保证目标表数据与源完全一致。
+全量同步：默认先清空目标表再写入，保证目标表数据与源完全一致；`skip_truncate: true` 时跳过
+清空，写入退化为纯 COPY（无清空、无去重、无水位追踪）。`skip_truncate` 与 `mode` 是两个独立的
+配置维度：`skip_truncate` 只管清空与否，`once`（见 3.2 节）只管下线与否，两者可任意组合。
 
 ```
 BEGIN
-  TRUNCATE target_table        -- 尝试，带 lock_timeout
+  TRUNCATE target_table        -- 仅 skip_truncate=false（默认）时执行，带 lock_timeout
   ↓ 超时？
   DELETE FROM target_table     -- 退避
   COPY INTO target_table       -- 在同一事务连接上执行
@@ -158,12 +130,68 @@ COMMIT
 | Lock Timeout 退避                      | `SET LOCAL lock_timeout = '10s'`（默认，可由 `truncate_timeout` 覆盖）；TRUNCATE 需要 ACCESS EXCLUSIVE 锁，若被阻塞则超时后退化为 `DELETE FROM`（仅需 ROW EXCLUSIVE 锁），避免长时间阻塞其他会话 |
 | 延迟启动 `drainFirstBatch()`           | 先从 channel 取第一个非空 batch；源头无数据同样是有效状态（数据被清空/过滤），仍需清表提交以同步清空下游残留数据                                                                                 |
 | `CREATE TEMP TABLE ... ON COMMIT DROP` | Full 模式不需要 staging 表，但 Merge/Append 需要——临时表随事务结束自动清理                                                                                                                       |
+| `io.Pipe` 流式传输                     | 生产端（CSV 编码）和消费端（COPY 协议）通过 pipe 连接，数据不落盘、不缓存全量                                                                                                                    |
+| 4MB 写缓冲                             | `bytes.Buffer` 初始 4MB，累积到 3MB flush 一次，减少 `write()` 系统调用                                                                                                                          |
+| COPY goroutine 异步                    | COPY 消费在独立 goroutine，生产阻塞即为背压信号                                                                                                                                                  |
+| NULL 哨兵                              | COPY 的 CSV 格式无法区分「空字符串」与「NULL」，故改用哨兵文本（见下）                                                                                                                           |
+
+**CSV 编码位置：**`writer/pgcopy.go` 集中了 COPY 格式的全部知识（`encodeCopyValue` / `sanitizeCSV`），
+在 COPY 写入时才把 `any` 编码为字段文本；`reader` 与 `transform` 对此一无所知。
+
+| 环节            | 处理                                                                      |
+| --------------- | ------------------------------------------------------------------------- |
+| NULL            | 编码为 `__DB_ETL_NULL__` 哨兵，`COPY ... NULL '__DB_ETL_NULL__'` 据此识别 |
+| 空字符串        | 仍编码为空字段，与 NULL 彻底分开（能正确触发 NOT NULL 约束）              |
+| 二进制（bytea） | 输出 `\x` 十六进制字面量                                                  |
+| 控制字符        | 剔除会破坏 CSV 结构的不可见字符（保留 \t \n \r 交由引号包裹）             |
+| 哨兵撞车        | 源数据恰好等于哨兵文本时强制加引号，确保作为普通文本入库                  |
+
+多 source 行为：一个任务若配置了多个 `sources` 且 `skip_truncate` 为默认的 `false`，清空只在所有
+source 开始同步前执行一次（`main.go runTask` 调用 `BaseWriter.TruncateTarget`），之后每个
+source 的 `writeFull` 都会被传入 `truncate=false`（通过 `SourceConfig.SkipTargetTruncate`
+运行时标记），只做 COPY，避免后一个 source 把前一个刚写入的数据清空；单 source 时清空与
+写入仍在同一事务内原子提交。若 `skip_truncate` 显式配置为 `true`，则从一开始就不会触发这套
+「预清空一次」的编排——每个 source 全程只做纯 COPY。
+
+---
+
+### 3.2 Once：一次性任务下线
+
+`once` 与 `mode` 正交，可搭配 `full` / `append` / `merge` 任意模式使用：整条 pipeline
+（reader 读取 + transform 转换 + writer 写入）结束后，`main.go runPipeline` 调用
+`Writer.FinalizeSyncResult(source, status, task.Target.Once)`，在登记本次同步结果
+（`last_status`）的同一条 UPDATE 里，若 `once=true` 且本次成功则顺带把
+`manager.job_data_sync` 中对应记录置为 `inuse=false`，避免下次调度重复执行（纯
+`config.yaml` 静态任务通常无匹配行，视为空操作）。典型场景是「一次性全量回填，回填完即
+下线」——对应配置是 `full` + `once: true`。
+
+```
+pipeline 结束（成功或失败）
+  ↓
+UPDATE manager.job_data_sync
+  SET last_status = ?,
+      inuse = CASE WHEN once AND 本次成功 THEN false ELSE inuse END,
+      udt = now()
+  WHERE job/source/target 匹配
+```
+
+**实现要点：**
+
+| 要点                     | 原理                                                                                                                                                                                                           |
+| ------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| 与下线动作合并为一条语句 | `finalizeSyncResult` 同时承担「记录同步结果」与「once 成功后下线」两件事：两者按完全相同的 `(job_name + 源标识 + 目标标识)` 定位记录，合并成一条 UPDATE 省一次往返，也避免两次独立调用各自失败导致的半成功组合 |
+| 与主写入事务独立         | 由 `main.go` 在 `pipeline.RunPipeline` 返回之后单独调用（best-effort），不嵌套在写入事务里；其失败只记日志，不传播为 pipeline 失败、不触发 `util.Retry` 重跑整条 pipeline                                      |
+| 按身份定位记录           | 与 `updateWatermark` 一致，按 `(job_name + 源标识 + 目标标识)` 匹配记录，无需外层透传 `job_id`                                                                                                                 |
+| 会话超时放宽             | `once=true` 时源端查询与目标端写入的 `statement_timeout` 默认放宽至 2 小时（`config.OnceDefaultTimeoutSec`），应对一次性大批量回填                                                                             |
+| 两个 dialect 各自实现    | PG 直接在 `d.conn` 上执行 UPDATE；parquet 在 `d.metaConn`（若配置了 meta_db）上执行，二者共用 `writer/watermark.go` 的 `execFinalizeSyncResult` SQL 逻辑                                                       |
 
 ---
 
 ### 3.3 Append 模式
 
-追加写入 + Watermark 更新，适合只增不改的流水表。
+追加写入 + Watermark 更新，适合只增不改的流水表。`incr_field` 必填（[config/config.go](config/config.go#L649) 加载阶段校验）：
+不配置时无法按水位圈定增量范围，重跑会把同一批数据重复插入；若确有需要反复执行、多个 source
+合并写同一目标表的场景，应改用 `full` 模式（见 3.1 节的多 source 行为），而非 append。
 
 ```
 BEGIN
@@ -463,7 +491,7 @@ main goroutine
 并发度上限为 `最大 4 个 task × 4 = 16` 个（不含 runtime 内部）。
 
 错误优先级：reader 出错时会 `cancel(ctx)`，令 writer 的事务以 `context.Canceled` 中止并回滚，
-避免 full/initial 模式下提交被截断的部分数据；`RunPipeline` 返回时 reader 错误优先于 writer 错误，
+避免 full 模式下提交被截断的部分数据；`RunPipeline` 返回时 reader 错误优先于 writer 错误，
 因为前者是根因。
 
 ---

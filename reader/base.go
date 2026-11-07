@@ -167,7 +167,7 @@ func (r *BaseReader) buildReadQuery() (string, error) {
 
 	// 仅增量模式（append/merge）才需要有序读取：
 	// 增量小批次依赖 ORDER BY 才能按水位/断点续传稳定推进，table 与 sql（rawsql）源都需要；
-	// 全量模式（full/initial）无需排序，避免大表顺扫叠加排序开销。
+	// 全量模式（full）无需排序，避免大表顺扫叠加排序开销。
 	// ORDER BY 在占位符替换之前拼接，使 order_by 中的 ${SRC_INCR_FIELD} 与 WHERE 中的占位符共用同一套方言加引号逻辑。
 	if (r.Source.Mode == config.ModeTypeAppend || r.Source.Mode == config.ModeTypeMerge) &&
 		r.Source.OrderBy != "" {
@@ -175,7 +175,7 @@ func (r *BaseReader) buildReadQuery() (string, error) {
 	}
 
 	// 占位符一旦出现就必须替换，否则残留的 ${...} 会被数据库当成非法语法（syntax error at or near "$"）。
-	// 这与同步模式无关：即便是 full/initial 模式，只要 SQL/where 里写了占位符也要替换掉；
+	// 这与同步模式无关：即便是 full 模式，只要 SQL/where 里写了占位符也要替换掉；
 	hasPlaceholder := strings.Contains(query, "${SRC_INCR_FIELD}") ||
 		strings.Contains(query, "${INCR_POINT}")
 	if hasPlaceholder {

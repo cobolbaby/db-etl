@@ -25,6 +25,12 @@ type JobDataSyncRow struct {
 	DstSchemaName     string
 	DstTableName      string
 	DstPK             string
+	// Once 对应 once 列：true 表示该任务只需成功同步一次，写入成功后把本行置为
+	// inuse=false（见 TargetConfig.Once）。列不存在/为 NULL 时按 false 处理。
+	Once bool
+	// Truncate 对应 truncate 列：仅 full 模式消费，写入前是否先清空目标表。
+	// 默认按 true 处理，与历史行为（full 模式总是先清空）保持一致。
+	Truncate bool
 }
 
 // LoadTasksFromDB 连接 metaDB 所指定的 PostgreSQL 数据库，
@@ -55,11 +61,13 @@ func LoadTasksFromDB(ctx context.Context, metaDB DBConfig, jobName string, resol
 			COALESCE(sync_mode, '')           AS sync_mode,
 			COALESCE(dst_schema_name, '')     AS dst_schema_name,
 			COALESCE(dst_table_name, '')      AS dst_table_name,
-			COALESCE(dst_pk, '')              AS dst_pk
+			COALESCE(dst_pk, '')              AS dst_pk,
+			COALESCE(once, false)             AS once,
+			COALESCE(truncate, true)          AS truncate
 		FROM manager.job_data_sync
 		WHERE job_name = $1
 		  AND inuse = true
-		  AND sync_mode IN ('full', 'append', 'merge', 'initial')
+		  AND sync_mode IN ('full', 'append', 'merge')
 		ORDER BY job_id
 	`
 
@@ -88,6 +96,8 @@ func LoadTasksFromDB(ctx context.Context, metaDB DBConfig, jobName string, resol
 			&r.DstSchemaName,
 			&r.DstTableName,
 			&r.DstPK,
+			&r.Once,
+			&r.Truncate,
 		); err != nil {
 			return nil, fmt.Errorf("scan job_data_sync row failed: %w", err)
 		}
@@ -179,13 +189,17 @@ func rowToTaskConfig(r JobDataSyncRow, metaDB DBConfig, resolver DBResolver) (Ta
 		}
 	}
 
+	// truncate 列语义是“是否清空”（true=清空，SQL 侧已 COALESCE 为非 NULL），
+	// 与 TargetConfig.SkipTruncate（true=跳过清空）极性相反，这里取反传递。
 	target := &TargetConfig{
 		// job_data_sync 表暂无 dst_instance 字段，默认使用 meta_db 作为目标库
-		ConnID:   metaDB.ID,
-		ConnName: metaDB.Name,
-		Table:    r.DstSchemaName + "." + r.DstTableName,
-		Mode:     ModeType(r.SyncMode),
-		PK:       r.DstPK,
+		ConnID:       metaDB.ID,
+		ConnName:     metaDB.Name,
+		Table:        r.DstSchemaName + "." + r.DstTableName,
+		Mode:         ModeType(r.SyncMode),
+		PK:           r.DstPK,
+		Once:         r.Once,
+		SkipTruncate: !r.Truncate,
 		// TruncateTimeout 未配置时使用默认值（DB 加载路径不走 validateTarget）
 		TruncateTimeout: defaultTruncateTimeoutSec,
 	}

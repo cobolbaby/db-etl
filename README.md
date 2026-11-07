@@ -38,6 +38,8 @@ CREATE TABLE IF NOT EXISTS manager.job_data_sync
     src_rawsql text COLLATE pg_catalog."default",
     last_status integer,
     weight numeric,
+    once boolean NOT NULL DEFAULT false,
+    truncate boolean NOT NULL DEFAULT true,
     CONSTRAINT chk_src_conn_not_both_null
         CHECK (src_conn_id IS NOT NULL OR src_conn_name IS NOT NULL)
 )
@@ -68,6 +70,12 @@ COMMENT ON COLUMN manager.job_data_sync.last_status
 
 COMMENT ON COLUMN manager.job_data_sync.weight
     IS '该表在近期一段时间窗口内的平均同步速度，作为调度权重的参考。';
+
+COMMENT ON COLUMN manager.job_data_sync.once
+    IS '为 true 时该任务只需成功同步一次，写入成功后把本行置为 inuse=false，避免下次调度重复执行；与 sync_mode 正交，可配合任意模式使用。默认 false。';
+
+COMMENT ON COLUMN manager.job_data_sync.truncate
+    IS '仅 sync_mode=full 时生效：写入前是否先清空目标表。默认 true；设为 false 时写入退化为纯追加 COPY，适用于多个 source 合并写同一目标表且不应互相清空的场景。';
 
 ```
 
@@ -300,29 +308,32 @@ tasks:
 
 ## `target` 配置
 
-| 字段                | 必填         | 说明                                                                                                                       |
-| ------------------- | ------------ | -------------------------------------------------------------------------------------------------------------------------- |
-| `conn_id`           | 三选一       | 引用 `databases[].id`；与 `conn_name` 至少填一个，优先级高于 `conn_name`                                                   |
-| `conn_name`         | 三选一       | 引用 `databases[].name`                                                                                                    |
-| `s3`                | 三选一       | 引用 `s3[].name`，写入对象存储（parquet）；与 `conn_id` / `conn_name` 互斥                                                 |
-| `table`             | ✅           | 目标表，建议使用 `schema.table` 格式；写 S3 时用于推导对象 key                                                             |
-| `mode`              | ✅           | 写入模式，见下节                                                                                                           |
-| `pk`                | merge 时必填 | 主键列列表，多列用逗号分隔，如 `id` 或 `id,tenant_id`                                                                      |
-| `commit_batch_size` |              | 分段提交粒度（批次数），`0` 表示整个任务在单个事务中完成（默认）；设置后每 N 个 batch 提交一次事务并更新水位，适用于超大表 |
-| `truncate_timeout`  |              | full 模式下 TRUNCATE 等锁超时（秒），默认 10 秒；超时后自动退避为 DELETE FROM                                              |
+| 字段                | 必填         | 说明                                                                                                                                                                                                                                                                                                                                                                              |
+| ------------------- | ------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `conn_id`           | 三选一       | 引用 `databases[].id`；与 `conn_name` 至少填一个，优先级高于 `conn_name`                                                                                                                                                                                                                                                                                                          |
+| `conn_name`         | 三选一       | 引用 `databases[].name`                                                                                                                                                                                                                                                                                                                                                           |
+| `s3`                | 三选一       | 引用 `s3[].name`，写入对象存储（parquet）；与 `conn_id` / `conn_name` 互斥                                                                                                                                                                                                                                                                                                        |
+| `table`             | ✅           | 目标表，建议使用 `schema.table` 格式；写 S3 时用于推导对象 key                                                                                                                                                                                                                                                                                                                    |
+| `mode`              | ✅           | 写入模式，见下节                                                                                                                                                                                                                                                                                                                                                                  |
+| `pk`                | merge 时必填 | 主键列列表，多列用逗号分隔，如 `id` 或 `id,tenant_id`                                                                                                                                                                                                                                                                                                                             |
+| `commit_batch_size` |              | 分段提交粒度（批次数），`0` 表示整个任务在单个事务中完成（默认）；设置后每 N 个 batch 提交一次事务并更新水位，适用于超大表                                                                                                                                                                                                                                                        |
+| `truncate_timeout`  |              | full 模式下 TRUNCATE 等锁超时（秒），默认 10 秒；超时后自动退避为 DELETE FROM                                                                                                                                                                                                                                                                                                     |
+| `skip_truncate`     |              | 仅 `full` 模式消费：写入前是否跳过清空目标表。默认 `false`（先清空再写入）；显式设为 `true` 时跳过清空，写入退化为纯追加 COPY，适用于多个 `sources` 需反复合并写同一目标表且不应互相清空的场景                                                                                                                                                                                    |
+| `once`              |              | 与 `mode` 正交：为 `true` 时该任务只需成功同步一次，写入成功后尝试把 `manager.job_data_sync` 中对应记录置为 `inuse=false`，避免下次调度重复执行（纯 `config.yaml` 静态任务无匹配记录时为空操作）。可配合任意 `mode` 使用，典型场景是「一次性全量回填，回填完即下线」。设为 `true` 时上下游会话超时默认放宽至 2 小时（约可覆盖 2 亿行以内的同步），可通过 `statement_timeout` 覆盖 |
 
 ### 支持的 `mode`
 
-| 值        | 说明                                                                                                                                                             |
-| --------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `initial` | 首次全量回填：直接 COPY 到目标表，不清空已有数据，仅执行追加写入；上下游会话超时默认放宽至 2 小时（约可覆盖 2 亿行以内的同步），可通过 `statement_timeout` 覆盖  |
-| `full`    | 先清空目标表，再将本次抽取结果全量覆盖写入                                                                                                                       |
-| `append`  | 与 `initial` 一样追加写入；`incr_field` 可选，配置后按水位增量抽取并在写入后更新水位，不配则每次按 SQL 自身圈定的范围抽取追加                                    |
-| `merge`   | 先写入临时表，再按 `pk` 做 DELETE + INSERT（支持增量 upsert）；`incr_field` 可选，配置后按水位增量抽取并更新水位，不配则每次按 SQL 自身圈定的范围全量重抽 upsert |
+| 值       | 说明                                                                                                                                                                                                                                                                                                                                                                                |
+| -------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `full`   | 全量同步：默认先清空目标表（见 `skip_truncate` 字段），再将本次抽取结果写入；`skip_truncate: true` 时跳过清空，退化为纯 COPY。一个任务若配置了多个 `sources` 且 `skip_truncate` 为默认的 `false`，清空只在所有 source 开始同步前执行一次，之后每个 source 只做 COPY（追加写入同一目标表），避免后一个 source 把前一个刚写入的数据清空；单 source 时清空与写入仍在同一事务内原子提交 |
+| `append` | 增量追加写入，按水位抽取并在写入后更新水位；`incr_field` 必填                                                                                                                                                                                                                                                                                                                       |
+| `merge`  | 先写入临时表，再按 `pk` 做 DELETE + INSERT（支持增量 upsert）；`incr_field` 可选，配置后按水位增量抽取并更新水位，不配则每次按 SQL 自身圈定的范围全量重抽 upsert                                                                                                                                                                                                                    |
 
-> `append` 只追加不去重。不配 `incr_field` 时，重跑会产生重复行，需自行在 `sql` 里圈定不重叠的窗口，或由下游查询去重。
+> `merge` 不配 `incr_field` 时每次全量重抽再按 pk upsert，天然幂等；`append` 必须配置 `incr_field` 才能按水位增量抽取，避免重跑产生重复行。
 
-> 目标为 `s3` 时，`initial` / `full` 写入单个覆盖式对象，`append` / `merge` 按本次起点水位写入独立对象。
+> 「回填一次就不再重跑」不是某个 `mode` 的专属行为，而是通过独立的 `once: true` 字段表达，可搭配任意 `mode` 使用（最常见的是 `full` + `once: true`）。
+
+> 目标为 `s3` 时，`full` 写入单个覆盖式对象，`append` / `merge` 按本次起点水位写入独立对象；对象存储目标忽略 `skip_truncate` 字段（parquet full 本就整体覆盖单个对象，无清空概念）。
 > 对象存储无法按 pk 原地删除/更新，故 `merge` 行为与 `append` 一致，**去重需由下游查询处理**；
 > 幂等性由确定性对象 key 覆盖保证。因增量对象 key 取自起点水位，`s3` 目标的 `merge` 同样要求 `incr_field`。
 
@@ -373,7 +384,8 @@ tasks:
     target:
       conn_name: target-pg
       table: target_schema.target_table_1
-      mode: initial
+      mode: full
+      once: true
 ```
 
 ### 2. Table → Target Copy
@@ -394,7 +406,8 @@ tasks:
     target:
       conn_name: target-pg
       table: target_schema.target_table_2
-      mode: initial
+      mode: full
+      once: true
 ```
 
 ### 3. Table → Target Merge（增量）

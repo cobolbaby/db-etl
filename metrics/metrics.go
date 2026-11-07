@@ -16,11 +16,11 @@ type PipelineMetrics struct {
 	StartedAt  time.Time
 	FinishedAt time.Time
 
-	RowsRead    atomic.Int64
-	RowsWritten atomic.Int64
-	BatchesRead atomic.Int64
+	RowsRead     atomic.Int64
+	RowsWritten  atomic.Int64
+	BatchesRead  atomic.Int64
 	BytesWritten atomic.Int64
-	Err         error
+	Err          error
 }
 
 // Duration returns the pipeline execution duration.

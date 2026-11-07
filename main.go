@@ -169,9 +169,28 @@ func (e *etl) runTask(ctx context.Context, task config.TaskConfig) error {
 		}
 	}
 
+	// full 模式下，一个 task 若有多个 source，各 source 会各自建立独立连接/独立事务写入
+	// 同一目标表；若每个 source 的 writeFull 都各自清空，后一个 source 会把前一个刚写入的
+	// 数据清掉。故在 source 循环开始前单独清空一次目标表，随后每个 source 的写入都跳过
+	// 清空、只做 COPY（见 writer.BaseWriter.WriteBatch 对 SkipTargetTruncate 的处理）。
+	// target.SkipTruncate 显式设为 true 时本就不清空，不需要这套预清空编排。
+	multiSourceFull := task.Target.Mode == config.ModeTypeFull && len(task.Sources) > 1 && task.Target.ShouldTruncate()
+	if multiSourceFull {
+		dstName := e.targetName(task.Target)
+		label := fmt.Sprintf("truncate %s (%s) before multi-source full sync", dstName, task.Target.Table)
+		if err := util.Retry(label, e.retryCfg, func() error {
+			return e.truncateFullTarget(ctx, task)
+		}); err != nil {
+			return fmt.Errorf("truncate target before multi-source full sync failed: %w", err)
+		}
+	}
+
 	// 执行数据同步
 	var lastErr error
 	for _, src := range task.Sources {
+		if multiSourceFull {
+			src.SkipTargetTruncate = true
+		}
 
 		srcDB, ok := e.dbResolver.Resolve(src.ConnID, src.ConnName)
 		if !ok {
@@ -200,6 +219,18 @@ func (e *etl) runTask(ctx context.Context, task config.TaskConfig) error {
 	return lastErr
 }
 
+// truncateFullTarget 为多 source 的 full 任务在 source 循环开始前单独清空一次目标表，
+// 之后每个 source 的 writeFull 都会跳过清空、只做 COPY（见 runTask 中 SkipTargetTruncate 的设置）。
+func (e *etl) truncateFullTarget(ctx context.Context, task config.TaskConfig) error {
+	w, err := writer.NewWriter(task.Target, e.dbResolver, e.s3Resolver, e.metaDB, task.Name)
+	if err != nil {
+		return fmt.Errorf("create writer: %w", err)
+	}
+	defer w.Close()
+
+	return w.TruncateTarget(ctx)
+}
+
 func (e *etl) runPipeline(ctx context.Context, src *config.SourceConfig, srcDB config.DBConfig, task config.TaskConfig) error {
 
 	// mc := metrics.Default()
@@ -219,13 +250,14 @@ func (e *etl) runPipeline(ctx context.Context, src *config.SourceConfig, srcDB c
 	defer w.Close()
 
 	// 同步方式定义在 Writer 端，但又会影响 Reader 端的抽取逻辑（增量抽取需要从目标端获取上次抽取的 Watermark 位置），
-	// 所以在这里把 Mode 同步到 SourceConfig 里，Reader 和 Writer 都可以访问到
+	// 所以在这里把 Mode/Once 同步到 SourceConfig 里，Reader 和 Writer 都可以访问到。
 	src.Mode = task.Target.Mode
+	src.Once = task.Target.Once
 
 	// 增量抽取需要知道上次抽取的 Watermark 位置。
 	// IncrPoint 非空说明启动时已从 job_data_sync（db_loader）或配置文件加载到水位，直接复用，省一次查询；
 	// 仅当为空（首次运行、尚无水位）时才查库，走 job_data_sync → MAX(incr_field) → 默认值 的兜底链。
-	// 仅增量模式（append/merge）需要水位；全量模式（full/initial）为一次性覆盖/回填，不做水位追踪。
+	// 仅增量模式（append/merge）需要水位；full 为一次性覆盖/回填，不做水位追踪。
 	if (src.Mode == config.ModeTypeAppend || src.Mode == config.ModeTypeMerge) && src.IncrField != "" {
 
 		if src.IncrPoint == "" {
@@ -270,14 +302,13 @@ func (e *etl) runPipeline(ctx context.Context, src *config.SourceConfig, srcDB c
 	err = pipeline.RunPipeline(ctx, src, r, t, w)
 	// mc.Finish(pm, err)
 
-	// 登记本次同步结果到 manager.job_data_sync.last_status（成功 0 / 失败 1）。
-	// best-effort（尽力而为）：last_status 仅供监控/观测，状态写不写得回都不改变
-	// “数据是否已同步成功”这个事实，故回写失败仅记日志，绝不覆盖/掩盖真实的同步结果。
+	// 登记本次同步结果到 last_status（成功 0 / 失败 1），
+	// 并在 once=true 且本次成功时顺带把 inuse 置为 false（避免下次调度重复执行）。
 	syncStatus := writer.SyncStatusSuccess
 	if err != nil {
 		syncStatus = writer.SyncStatusFailed
 	}
-	if serr := w.RecordSyncResult(src, syncStatus); serr != nil {
+	if serr := w.FinalizeSyncResult(src, syncStatus, task.Target.Once); serr != nil {
 		log.Printf(
 			"record last_status=%d failed %s (%s) -> %s (%s): %v",
 			syncStatus, srcDB.Name, src.Table, dstName, task.Target.Table, serr,

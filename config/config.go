@@ -551,9 +551,17 @@ type SourceConfig struct {
 	DBType         DBType        `yaml:"-"`
 	Database       string        `yaml:"-"` // 解析数据源后填充，作为 watermark 的 src_db_name
 	Mode           ModeType      `yaml:"-"`
-	IncrField      string        `yaml:"incr_field"` // 用于增量抽取，指定一个日期/时间字段，配合 Watermark 实现增量抽取
-	IncrPoint      string        `yaml:"incr_point"` // 增量抽取的起点
-	OrderBy        string        `yaml:"order_by"`   // OrderBy 指定查询排序字段。当 target.commit_batch_size > 0 时必须有序，框架会自动设为 src_incr_field，也可手动指定其他表达式（如 "id ASC"）。
+	// SkipTargetTruncate 为 true 时，full 模式写入跳过本次 TRUNCATE/DELETE，只做 COPY。
+	// 由 main.go runTask 在「同一 task 下有多个 source」时设置：整个 task 只在 source
+	// 循环开始前清空一次目标表，避免每个 source 各自清空、互相冲掉对方刚写入的数据。
+	// 仅运行时使用，不支持在 YAML 中配置。
+	SkipTargetTruncate bool `yaml:"-"`
+	// Once 由 main.go runPipeline 从 TargetConfig.Once 同步而来，供 reader（见
+	// reader/factory.go）判断是否放宽会话超时默认值。仅运行时使用，不支持在 YAML 中配置。
+	Once      bool   `yaml:"-"`
+	IncrField string `yaml:"incr_field"` // 用于增量抽取，指定一个日期/时间字段，配合 Watermark 实现增量抽取
+	IncrPoint string `yaml:"incr_point"` // 增量抽取的起点
+	OrderBy   string `yaml:"order_by"`   // OrderBy 指定查询排序字段。当 target.commit_batch_size > 0 时必须有序，框架会自动设为 src_incr_field，也可手动指定其他表达式（如 "id ASC"）。
 }
 
 func (s *SourceConfig) normalize() {
@@ -633,17 +641,11 @@ func (source *SourceConfig) Validate(resolver DBResolver, target *TargetConfig) 
 		source.BatchSize = 10000
 	}
 
-	// TODO: 待讨论，暂时将该验证注释掉，允许用户在 append 模式下不配置 incr_field，使用全量抽取的方式。
-	// append 写 DB 只追加不去重：未配置 incr_field 时重复执行会把同一批数据反复插入造成重复行，故建议必填。
-	// if target.Mode == ModeTypeAppend && strings.TrimSpace(source.IncrField) == "" {
-	// 	return fmt.Errorf("incr_field is required for %s mode", target.Mode)
-	// }
-
-	// append 写对象存储时，增量对象的 key 同样由起点水位命名（见 incrementalObjectKey），
-	// 缺少 incr_field 会让每次增量都覆盖同一个对象，故此场景 incr_field 必填。
-	if target.Mode == ModeTypeAppend && strings.TrimSpace(target.S3) != "" && strings.TrimSpace(source.IncrField) == "" {
-		return fmt.Errorf("incr_field is required for %s mode when target is s3", target.Mode)
+	// append 只追加不去重：未配置 incr_field 时重复执行会把同一批数据反复插入造成重复行，必填。
+	if target.Mode == ModeTypeAppend && strings.TrimSpace(source.IncrField) == "" {
+		return fmt.Errorf("incr_field is required for %s mode", target.Mode)
 	}
+
 	// merge 写 DB 时按 pk 做 DELETE + INSERT，重复抽取同一区间是幂等的，
 	// 允许不配 incr_field（由 SQL 自身圈定滚动窗口，如 date >= now() - interval '3 days'）。
 	// 但 merge 写对象存储时，增量对象的 key 由起点水位命名（见 incrementalObjectKey），
@@ -675,24 +677,22 @@ func (source *SourceConfig) Validate(resolver DBResolver, target *TargetConfig) 
 type ModeType string
 
 const (
-	ModeTypeInitial ModeType = "initial"
-	ModeTypeFull    ModeType = "full"
-	ModeTypeAppend  ModeType = "append"
-	ModeTypeMerge   ModeType = "merge"
+	ModeTypeFull   ModeType = "full"
+	ModeTypeAppend ModeType = "append"
+	ModeTypeMerge  ModeType = "merge"
 )
 
 var supportedTargetModes = map[ModeType]struct{}{
-	ModeTypeInitial: {},
-	ModeTypeFull:    {},
-	ModeTypeAppend:  {},
-	ModeTypeMerge:   {},
+	ModeTypeFull:   {},
+	ModeTypeAppend: {},
+	ModeTypeMerge:  {},
 }
 
-// InitialModeDefaultTimeoutSec 是 initial（首次全量）模式下，源端查询与目标端写入
-// 会话超时的默认秒数（2 小时）。该模式用于一次性回填历史数据，单次可能同步上亿行，
-// 顺扫与 COPY 写入耗时较长，因此在未显式配置 statement_timeout 时
-// 采用较宽松的默认，避免误触发超时中断。经验上 2 小时可覆盖 2 亿行以内的同步。
-const InitialModeDefaultTimeoutSec = 7200
+// OnceDefaultTimeoutSec 是 once=true 任务下，源端查询与目标端写入会话超时的默认秒数
+// （2 小时）。once 任务通常是一次性全量回填历史数据，单次可能同步上亿行，顺扫与 COPY
+// 写入耗时较长，因此在未显式配置 statement_timeout 时采用较宽松的默认，避免误触发超时
+// 中断。经验上 2 小时可覆盖 2 亿行以内的同步。
+const OnceDefaultTimeoutSec = 7200
 
 // defaultTruncateTimeoutSec 是 full 模式下 TRUNCATE 等锁超时的默认值（秒）。
 const defaultTruncateTimeoutSec = 10
@@ -703,13 +703,26 @@ const defaultTruncateTimeoutSec = 10
 const defaultMaxRowsPerRowGroup = 200000
 
 type TargetConfig struct {
-	ConnID    string   `yaml:"conn_id"`   // 优先按 conn_id 匹配数据源，为空时回退到 conn_name
-	ConnName  string   `yaml:"conn_name"` // 引用 databases[].name
-	S3        string   `yaml:"s3"`        // 引用 s3[].name，与 conn_id/conn_name 互斥
-	Table     string   `yaml:"table"`
-	Mode      ModeType `yaml:"mode"`
-	IncrField string
-	PK        string `yaml:"pk"`
+	ConnID   string   `yaml:"conn_id"`   // 优先按 conn_id 匹配数据源，为空时回退到 conn_name
+	ConnName string   `yaml:"conn_name"` // 引用 databases[].name
+	S3       string   `yaml:"s3"`        // 引用 s3[].name，与 conn_id/conn_name 互斥
+	Table    string   `yaml:"table"`
+	Mode     ModeType `yaml:"mode"`
+	// SkipTruncate 仅 full 模式消费：为 true 时写入前跳过清空目标表，写入退化为纯 COPY——
+	// 适用于多个 source 需要反复合并追加写同一目标表、清空与否交由调用方
+	// 自行决定的场景（如仅首次建表后要保留历史数据）。
+	// 零值（false）即默认行为——写入前先清空（TRUNCATE，超时退避 DELETE，
+	// 与写入同事务原子提交），与历史行为保持一致，因此不需要区分
+	// “未配置”与“显式设为 false”，普通 bool 即可，无需 *bool。
+	// 对象存储目标忽略该字段（parquet full 本就整体覆盖单个对象，无清空概念）。
+	// 统一通过 ShouldTruncate() 读取，不直接访问本字段。
+	SkipTruncate bool `yaml:"skip_truncate"`
+	// Once 与 Mode 正交：true 表示该任务只需成功同步一次，写入成功后尝试把
+	// job配置表 中对应记录置为 inuse=false，避免下次调度重复执行
+	// （纯 config.yaml 静态任务通常无匹配行，视为空操作）。可配合 full/append/merge
+	// 任意模式使用，典型场景是「一次性全量回填，回填完即下线」。
+	Once bool   `yaml:"once"`
+	PK   string `yaml:"pk"`
 	// CommitBatchSize 控制 merge 模式下每隔多少个 batch 提交一次事务并更新水位。
 	// 0 表示不分段，整个任务在单个事务中完成（原有行为）。
 	// 适用于超大表，设置后可在中断重启后从上次水位断点续传。
@@ -782,7 +795,14 @@ func (target *TargetConfig) Validate(resolver DBResolver, s3Resolver S3Resolver)
 			target.TruncateTimeout = defaultTruncateTimeoutSec
 		}
 	}
+
 	return nil
+}
+
+// ShouldTruncate 返回 full 模式写入前是否应先清空目标表：未配置（零值 false）时默认清空，
+// 显式设置 skip_truncate: true 时跳过清空。仅 full 模式消费该值，其他模式忽略。
+func (target *TargetConfig) ShouldTruncate() bool {
+	return !target.SkipTruncate
 }
 
 // ============================================================================

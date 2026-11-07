@@ -36,10 +36,10 @@ func NewWriter(target *config.TargetConfig, dbResolver config.DBResolver, s3Reso
 
 	switch db.Type {
 	case config.DBTypePG, config.DBTypeGP:
-		// initial（首次全量）模式单次可能写入上亿行，COPY 耗时较长。
+		// once=true 任务单次可能写入上亿行，COPY 耗时较长。
 		// 未显式配置 statement_timeout（0）时，采用 2 小时的宽松默认，避免误触发超时。
-		if target.Mode == config.ModeTypeInitial && db.StatementTimeout == 0 {
-			db.StatementTimeout = config.InitialModeDefaultTimeoutSec
+		if target.Once && db.StatementTimeout == 0 {
+			db.StatementTimeout = config.OnceDefaultTimeoutSec
 		}
 
 		// loc 由目标库配置的 timezone 解析而来，供 COPY 写入前把时间值统一换算到
